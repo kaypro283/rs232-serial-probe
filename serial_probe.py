@@ -1733,7 +1733,7 @@ def default_scan_options() -> ScanOptions:
         pre_drain_quiet=DEFAULT_PRE_DRAIN_QUIET,
         max_drain_bytes=DEFAULT_MAX_DRAIN_BYTES,
         ask_on_top_match=False,
-        auto_validate_top_matches=False,
+        auto_validate_top_matches=True,
         validate_size_1_bytes=8 * 1024,
         validate_size_2_tie_bytes=16 * 1024,
     )
