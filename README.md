@@ -21,7 +21,7 @@ Usage screen:
 python serial_probe.py --help
 ```
 
-The first screen is the command menu. Use `9. Show current settings` to view ports, baud range, number of settings to test, test message size, repeat count, timing, old-output clearing, report files, and estimated scan time. Use `M. Memory test` after you have a likely switch setting. The scan tests every selected combination.
+The first screen is the command menu. Use `9 CURRENT SETTINGS` to view ports, baud range, number of settings to test, test message size, repeat count, timing, old-output clearing, report files, and estimated scan time. Use `11 MEMORY TEST` after you have a likely switch setting. The scan tests every selected combination.
 
 The terminal UI uses bright green text when the console supports ANSI color, matching the look of an early monochrome CRT. PyCharm runs are treated as color-capable. Set `NO_COLOR=1` before running if you want plain console text.
 
@@ -127,7 +127,7 @@ The report paths are configured from the menu.
 
 ## Memory Test
 
-The memory test is a separate menu command: `M. Memory test`.
+The memory test is a separate menu command: `11 MEMORY TEST`.
 
 Run it after the scan has found a likely switch setting. Enter the recommended baud rate, data bits, parity, stop bits, and flow control from the final scan report.
 

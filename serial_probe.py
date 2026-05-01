@@ -1630,7 +1630,7 @@ def print_menu_help() -> None:
     print("  It reads what comes out of the output port.")
     print("  It tries every selected serial setting.")
     print("  It ranks the settings by how cleanly the message came through.")
-    print("  After the scan, use MEMORY TEST to check 16K, 32K, or 64K transfers.")
+    print("  After the scan, use 11 MEMORY TEST to check 16K, 32K, or 64K transfers.")
     print()
     print("OPERATOR NOTES:")
     print("  Test message size: how much known text is sent for each setting.")
@@ -1638,7 +1638,7 @@ def print_menu_help() -> None:
     print("  Clear old output: discard old buffer data before sending a new test.")
     print("  Max clear: default is 32768 bytes, enough for a 16K buffer plus margin.")
     print("  Top matches: the best-scoring settings shown at the end.")
-    print("  Memory test: use the switch setting recommended by the scan report.")
+    print("  Memory test: command 11, using the setting recommended by the scan report.")
 
 
 def print_setting(label: str, value: object) -> None:
@@ -1691,7 +1691,7 @@ def print_configuration(options: ScanOptions) -> None:
         )
     )
     print_setting("Top matches shown:", options.top)
-    print_setting("Memory test:", "use M after scan; enter the recommended switch setting")
+    print_setting("Memory test:", "use 11 after scan; enter the recommended switch setting")
     print_setting("Detailed report:", options.json_report)
     print_setting("Spreadsheet report:", options.csv_report)
     print_setting("Diagnostic log:", options.log_file)
@@ -2484,18 +2484,12 @@ def print_commands() -> None:
     print()
     print_banner()
     print("MAIN MENU")
-    print("  1. Start scan")
-    print("  2. Set input/output COM ports")
-    print("  3. Set baud range")
-    print("  4. Set test message size and repeat count")
-    print("  5. Set timing")
-    print("  6. Set old-output clearing")
-    print("  7. Set report files and top matches")
-    print("  8. Make new report file names")
-    print("  9. Show current settings")
-    print("  M. Memory test")
-    print("  H. Help")
-    print("  0. Quit")
+    print("  1 START SCAN                 7 SET REPORT FILES")
+    print("  2 SET COM PORTS              8 MAKE REPORT NAMES")
+    print("  3 SET BAUD RANGE             9 CURRENT SETTINGS")
+    print("  4 SET TEST SIZE/COUNT       10 HELP")
+    print("  5 SET TIMING                11 MEMORY TEST")
+    print("  6 CLEAR OLD OUTPUT           0 QUIT")
 
 
 def interactive_menu() -> ScanOptions | None:
@@ -2541,14 +2535,14 @@ def interactive_menu() -> ScanOptions | None:
             )
         elif choice == "9":
             print_configuration(options)
-        elif choice in {"m", "memory"}:
-            run_memory_test(options)
-        elif choice in {"h", "help", "?"}:
+        elif choice == "10":
             print_menu_help()
+        elif choice == "11":
+            run_memory_test(options)
         elif choice in {"0", "q", "quit", "exit"}:
             return None
         else:
-            print("Choose a menu number, M, H, or 0.")
+            print("Enter a number from 0 to 11.")
 
 
 def metadata_for_scan(
