@@ -450,6 +450,11 @@ def available_bauds(min_baud: int, max_baud: int) -> list[int]:
     return selected
 
 
+def scan_bauds(min_baud: int, max_baud: int) -> list[int]:
+    """Return baud rates in the order used by the scan."""
+    return list(reversed(available_bauds(min_baud, max_baud)))
+
+
 def exhaustive_candidates(bauds: Sequence[int]) -> list[SerialSettings]:
     """Return the full Cartesian candidate list in the documented order."""
     return [
@@ -467,7 +472,7 @@ def generate_candidates(
     max_baud: int,
 ) -> list[SerialSettings]:
     """Generate the full Cartesian candidate list for a scan."""
-    bauds = available_bauds(min_baud, max_baud)
+    bauds = scan_bauds(min_baud, max_baud)
     return exhaustive_candidates(bauds)
 
 
@@ -1754,12 +1759,14 @@ def print_configuration(options: ScanOptions) -> None:
     """Print the current interactive menu configuration."""
     try:
         bauds = available_bauds(options.min_baud, options.max_baud)
+        baud_order = scan_bauds(options.min_baud, options.max_baud)
         candidates = generate_candidates(options.min_baud, options.max_baud)
         wire = estimate_scan_wire_seconds(options)
         overhead = estimate_scan_overhead_seconds(options)
         range_error: str | None = None
     except ValueError as exc:
         bauds = []
+        baud_order = []
         candidates = []
         wire = 0.0
         overhead = 0.0
@@ -1770,6 +1777,8 @@ def print_configuration(options: ScanOptions) -> None:
     print_setting("Ports:", f"{options.in_port} -> {options.out_port}")
     print_setting("Baud range:", f"{options.min_baud}..{options.max_baud}")
     print_setting("Settings to test:", len(candidates))
+    if baud_order:
+        print_setting("Baud test order:", f"{baud_order[0]} down to {baud_order[-1]}")
     if range_error:
         print_setting("Range problem:", range_error)
     print_setting(
@@ -1808,6 +1817,7 @@ def configure_baud_range(options: ScanOptions) -> ScanOptions:
     """Prompt for the baud range."""
     print("Available baud rates:")
     print(", ".join(str(baud) for baud in BAUD_RATES))
+    print("Scan order: fastest selected baud first, then downward.")
     min_baud = prompt_int("Minimum baud", options.min_baud)
     max_baud = prompt_int("Maximum baud", options.max_baud)
     return dataclasses.replace(options, min_baud=min_baud, max_baud=max_baud)
@@ -2675,7 +2685,8 @@ def metadata_for_scan(
         "top": options.top,
         "payload": dataclass_to_jsonable(payload),
         "options": dataclass_to_jsonable(options),
-        "baud_order": BAUD_RATES,
+        "baud_list": BAUD_RATES,
+        "baud_order": scan_bauds(options.min_baud, options.max_baud),
         "data_bits": DATA_BITS,
         "parities": PARITIES,
         "stop_bits": STOP_BITS,

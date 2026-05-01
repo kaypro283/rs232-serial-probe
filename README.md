@@ -50,6 +50,8 @@ The default baud list is:
 38400, 57600, 115200
 ```
 
+The scan tries the fastest selected baud rate first, then works downward. With the default range, it starts at `115200` and ends at `110`. It still tests every data-bit, parity, stop-bit, and flow-control combination.
+
 The menu still allows raising the maximum baud rate to include `230400`, `460800`, and `921600` if needed.
 
 ## Speed
