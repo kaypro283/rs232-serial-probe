@@ -1994,21 +1994,6 @@ def group_candidates_by_baud(
     return baud_order, grouped
 
 
-def balanced_baud_candidates(
-    candidates: Sequence[SerialSettings],
-) -> list[SerialSettings]:
-    """Return a round-robin candidate order that samples every baud early."""
-    baud_order, grouped = group_candidates_by_baud(candidates)
-    max_group_size = max((len(group) for group in grouped.values()), default=0)
-    ordered: list[SerialSettings] = []
-    for offset in range(max_group_size):
-        for baud in baud_order:
-            group = grouped[baud]
-            if offset < len(group):
-                ordered.append(group[offset])
-    return ordered
-
-
 def next_unseen_candidate(
     candidates: Sequence[SerialSettings],
     tested: set[SerialSettings],
@@ -2026,15 +2011,6 @@ def result_blocks_baud_focus(result: CandidateResult) -> str | None:
         return "STALE OUTPUT SEEN"
     if result.error or result.status in {"error", "partial-write"}:
         return "ERROR SEEN"
-    return None
-
-
-def baud_focus_block_reason(results: Sequence[CandidateResult]) -> str | None:
-    """Return the first stale/error reason that blocks baud focus."""
-    for result in results:
-        reason = result_blocks_baud_focus(result)
-        if reason is not None:
-            return reason
     return None
 
 
@@ -2070,27 +2046,6 @@ def baud_focus_stats(
     ]
 
 
-def baud_focus_sample_floor_met(
-    results: Sequence[CandidateResult],
-    baud_order: Sequence[int],
-    grouped_candidates: dict[int, list[SerialSettings]],
-    options: ScanOptions,
-) -> bool:
-    """Return True after each baud has enough early samples."""
-    stats = baud_focus_stats(
-        results,
-        baud_order,
-        options.baud_focus_strong_score_threshold,
-    )
-    return all(
-        stat.samples >= min(
-            options.baud_focus_min_samples,
-            len(grouped_candidates.get(stat.baud, [])),
-        )
-        for stat in stats
-    )
-
-
 def select_baud_focus(
     results: Sequence[CandidateResult],
     baud_order: Sequence[int],
@@ -2103,18 +2058,11 @@ def select_baud_focus(
     if len(baud_order) < 2:
         return BaudFocusDecision(None, None, "ONLY ONE BAUD SELECTED")
 
-    blocked = baud_focus_block_reason(results)
-    if blocked is not None:
-        return BaudFocusDecision(None, None, blocked)
-
     stats = baud_focus_stats(
         results,
         baud_order,
         options.baud_focus_strong_score_threshold,
     )
-    if not baud_focus_sample_floor_met(results, baud_order, grouped_candidates, options):
-        return BaudFocusDecision(None, None, None)
-
     eligible = [
         stat
         for stat in stats
@@ -2478,7 +2426,6 @@ def run_exploratory_scan(
     results: list[CandidateResult] = []
     tested: set[SerialSettings] = set()
     baud_order, grouped = group_candidates_by_baud(candidates)
-    balanced_candidates = balanced_baud_candidates(candidates)
     focus_enabled = options.baud_focus_enabled and len(baud_order) > 1
     focus_active = False
     focus_engaged = False
@@ -2493,7 +2440,6 @@ def run_exploratory_scan(
     tested_before_engage: int | None = None
     deferred_candidate_count = 0
     deferred_bauds: list[int] = []
-    full_sweep_mode = not focus_enabled
 
     while True:
         if focus_active and focused_baud is not None:
@@ -2519,12 +2465,8 @@ def run_exploratory_scan(
                         deferred_bauds,
                     )
                 break
-        elif full_sweep_mode:
-            settings = next_unseen_candidate(candidates, tested)
-            if settings is None:
-                break
         else:
-            settings = next_unseen_candidate(balanced_candidates, tested)
+            settings = next_unseen_candidate(candidates, tested)
             if settings is None:
                 break
 
@@ -2545,32 +2487,50 @@ def run_exploratory_scan(
         print(format_scan_eta(len(results), len(candidates), started), flush=True)
 
         if focus_enabled:
-            decision = select_baud_focus(results, baud_order, grouped, options)
+            block_reason = result_blocks_baud_focus(result)
             if focus_active:
-                if decision.disabled_reason:
+                if block_reason:
                     focus_active = False
-                    full_sweep_mode = True
-                    focus_release_reason = decision.disabled_reason
-                    print(f"BAUD FOCUS CANCELED: {decision.disabled_reason}")
+                    focus_release_reason = block_reason
+                    print(f"BAUD FOCUS CANCELED: {block_reason}")
                     print("RETURNING TO FULL BAUD SWEEP")
                     logger.info(
                         "baud focus canceled for %s: %s",
                         focused_baud,
-                        decision.disabled_reason,
+                        block_reason,
                     )
-                elif decision.baud != focused_baud:
-                    focus_active = False
-                    full_sweep_mode = True
-                    focus_release_reason = "CONFIDENCE DROPPED"
-                    print("BAUD FOCUS CANCELED: CONFIDENCE DROPPED")
-                    print("RETURNING TO FULL BAUD SWEEP")
-                    logger.info("baud focus canceled for %s: confidence dropped", focused_baud)
-            elif not full_sweep_mode:
+                else:
+                    decision = select_baud_focus(results, baud_order, grouped, options)
+                    if decision.disabled_reason:
+                        focus_active = False
+                        focus_release_reason = decision.disabled_reason
+                        print(f"BAUD FOCUS CANCELED: {decision.disabled_reason}")
+                        print("RETURNING TO FULL BAUD SWEEP")
+                        logger.info(
+                            "baud focus canceled for %s: %s",
+                            focused_baud,
+                            decision.disabled_reason,
+                        )
+                    elif decision.baud != focused_baud:
+                        focus_active = False
+                        focus_release_reason = "CONFIDENCE DROPPED"
+                        print("BAUD FOCUS CANCELED: CONFIDENCE DROPPED")
+                        print("RETURNING TO FULL BAUD SWEEP")
+                        logger.info(
+                            "baud focus canceled for %s: confidence dropped",
+                            focused_baud,
+                        )
+            elif block_reason:
+                logger.info(
+                    "baud focus waiting; %s before focus on %s",
+                    block_reason,
+                    result.settings.label(),
+                )
+            else:
+                decision = select_baud_focus(results, baud_order, grouped, options)
                 if decision.disabled_reason:
-                    full_sweep_mode = True
                     focus_disabled_reason = decision.disabled_reason
                     print(f"BAUD FOCUS DISABLED: {decision.disabled_reason}")
-                    print("RETURNING TO FULL BAUD SWEEP")
                     logger.info("baud focus disabled: %s", decision.disabled_reason)
                 elif decision.baud is not None:
                     focus_active = True
@@ -2587,17 +2547,6 @@ def run_exploratory_scan(
                         focused_baud,
                         focus_engage_reason,
                     )
-                elif baud_focus_sample_floor_met(
-                    results,
-                    baud_order,
-                    grouped,
-                    options,
-                ):
-                    full_sweep_mode = True
-                    focus_disabled_reason = "CONFIDENCE LOW"
-                    print("BAUD FOCUS NOT ENGAGED: CONFIDENCE LOW")
-                    print("RETURNING TO FULL BAUD SWEEP")
-                    logger.info("baud focus not engaged: confidence low")
 
     elapsed_sec = time.monotonic() - started
     baud_focus_report = BaudFocusReport(

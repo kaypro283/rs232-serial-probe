@@ -87,7 +87,7 @@ If quick exploratory mode finds no usable signal, produces only low-confidence r
 
 ## Baud Focus
 
-Quick exploratory mode has a cautious baud-focus rule. It looks for a strong pattern at one baud across multiple framing and flow-control variants. When the configured confidence gates pass, it finishes the remaining quick tests at that baud first and may defer the other bauds from the quick pass.
+Quick exploratory mode has a cautious baud-focus rule. It looks for a strong clean pattern at one baud across multiple framing and flow-control variants. When the configured confidence gates pass, it stays at that baud, finishes the remaining quick tests there, and may defer the other bauds from the quick pass.
 
 Default gates:
 
@@ -97,7 +97,7 @@ Default gates:
 - Minimum strong results at the baud: `3`.
 - Minimum early samples per baud: `8`.
 
-Focus is disabled or canceled if stale output, partial writes, or driver errors appear. If the lead is not strong enough, the quick pass returns to the normal full baud sweep. The full brute-force scan still exists: choose `MANUAL`, answer `N` to quick mode, or decline quick narrowing; the tool then tests every selected baud/data/parity/stop/flow combination. If `AUTO` accepts a narrowed phase 2, the report records that choice.
+Stale output, partial writes, or driver errors before a clean hit pattern do not permanently block focus; they are treated as noise until a baud proves itself. Once focus is engaged, any stale output, partial write, driver error, or confidence drop cancels focus and returns to the normal full baud sweep. The full brute-force scan still exists: choose `MANUAL`, answer `N` to quick mode, or decline quick narrowing; the tool then tests every selected baud/data/parity/stop/flow combination. If `AUTO` accepts a narrowed phase 2, the report records that choice.
 
 Use menu command `12 BAUD FOCUS` to change the focus thresholds. Use `9 CURRENT SETTINGS` to view the active values.
 
