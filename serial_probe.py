@@ -3001,6 +3001,9 @@ def run_scan(options: ScanOptions) -> int:
     logger.info("json_report=%s", options.json_report)
     logger.info("csv_report=%s", options.csv_report)
 
+    print()
+    print_report_title("PHASE 1 RESULTS")
+    print("BASE SCAN RANKING AND SUMMARY.")
     print_ranked_table(results, options.top)
     print_scan_summary(
         results=results,
@@ -3016,7 +3019,7 @@ def run_scan(options: ScanOptions) -> int:
         shortlist = shortlist[: options.top]
         if shortlist:
             print()
-            print_report_title("STAGE 2 VALIDATION")
+            print_report_title("PHASE 2 VALIDATION")
             print(
                 f"SHORTLIST: {len(shortlist)} TOP-SCORE SETTING(S) "
                 f"FROM SCORE={top_score:.2f}."
