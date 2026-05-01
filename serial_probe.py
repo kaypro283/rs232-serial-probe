@@ -1414,12 +1414,17 @@ def format_scan_eta(
     )
 
 
-def print_ranked_table(results: Sequence[CandidateResult], top: int) -> None:
-    """Print the final ranked table to stdout."""
-    ranked = sorted(results, key=result_sort_key, reverse=True)[:top]
+def print_ranked_table(
+    results: Sequence[CandidateResult],
+    top: int,
+    report_title: str = "SERIAL PROBE FINAL REPORT",
+) -> None:
+    """Print a ranked table to stdout, excluding zero-score rows."""
+    ranked_all = sorted(results, key=result_sort_key, reverse=True)
+    ranked = [result for result in ranked_all if result.score > 0.0][:top]
     print()
-    print_report_title("SERIAL PROBE FINAL REPORT")
-    print("TOP OBSERVED RESULTS")
+    print_report_title(report_title)
+    print("TOP OBSERVED RESULTS (NON-ZERO SCORES)")
     print(border_line(REPORT_WIDTH))
     print(
         "RK SCORE   BAUD MODE FLOW       SENT   READ  CLR  EXCT LINE RESULT"
@@ -2992,7 +2997,7 @@ def run_scan(options: ScanOptions) -> int:
     print()
     print_report_title("PHASE 1 RESULTS")
     print("BASE SCAN RANKING AND SUMMARY.")
-    print_ranked_table(results, options.top)
+    print_ranked_table(results, options.top, report_title="PHASE 1 FINAL REPORT")
     print_scan_summary(
         results=results,
         total_candidates=len(candidates),
@@ -3072,7 +3077,11 @@ def run_scan(options: ScanOptions) -> int:
                 print("TIE REMAINS AFTER PASS 1. PASS 2 IS OFF.")
 
             print("STAGE 2 FINAL RANKING:")
-            print_ranked_table(final_stage2_results, min(options.top, len(final_stage2_results)))
+            print_ranked_table(
+                final_stage2_results,
+                min(options.top, len(final_stage2_results)),
+                report_title="PHASE 2 FINAL REPORT",
+            )
     print()
     print_report_title("REPORT FILES")
     print(f"  JSON FILE: {options.json_report}")
