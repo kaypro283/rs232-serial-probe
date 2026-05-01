@@ -40,16 +40,16 @@ Use the default settings, then select `1. Start scan`.
 With the default printer-buffer baud range, the scan tests:
 
 ```text
-3 baud rates x 2 data-bit choices x 5 parity choices x 2 stop-bit choices x 2 flow-control choices = 120 combinations
+10 baud rates x 2 data-bit choices x 5 parity choices x 2 stop-bit choices x 2 flow-control choices = 400 combinations
 ```
 
 The default baud list is:
 
 ```text
-9600, 19200, 38400
+110, 150, 300, 600, 1200, 2400, 4800, 9600, 19200, 38400
 ```
 
-The scan tries the fastest selected baud rate first, then works downward. With the default range, it starts at `38400` and ends at `9600`. It still tests every data-bit, parity, stop-bit, and flow-control combination.
+The scan tries the fastest selected baud rate first, then works downward. With the default range, it starts at `38400` and ends at `110`. It still tests every data-bit, parity, stop-bit, and flow-control combination.
 
 ## Speed
 
@@ -91,10 +91,10 @@ The console shows:
 Example:
 
 ```text
-22:10:02 *              SETTING 1/120  38400 8N1 FLOW=NONE            *
-22:10:02 [0001/0120 38400 8N1 FLOW=NONE] TEST 1/1: SEND 180 BYTES
-22:10:03 [0001/0120 38400 8N1 FLOW=NONE] TEST 1/1: RESULT FAIL SCORE=0.00
-SCAN TIME 0001/0120: ELAPSED=1S AVG=1S/SET LEFT=1M59S FINISH=22:12:02
+22:10:02 *              SETTING 1/400  38400 8N1 FLOW=NONE            *
+22:10:02 [0001/0400 38400 8N1 FLOW=NONE] TEST 1/1: SEND 180 BYTES
+22:10:03 [0001/0400 38400 8N1 FLOW=NONE] TEST 1/1: RESULT FAIL SCORE=0.00
+SCAN TIME 0001/0400: ELAPSED=1S AVG=1S/SET LEFT=6M39S FINISH=22:16:42
 ```
 
 ## Stale Output
