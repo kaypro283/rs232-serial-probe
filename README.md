@@ -84,6 +84,7 @@ The console shows:
 - Old bytes cleared before sending.
 - Result indicator: `PASS`, `GOOD`, `PARTIAL`, `FAIL`, `STALE`, or `ERROR`.
 - Score from `0` to `100`.
+- A `SCAN TIME` line with elapsed time, average time per setting, remaining time, and approximate finish clock.
 
 Example:
 
@@ -91,6 +92,7 @@ Example:
 22:10:02 SETTINGS CHANGE: setting 1/960 -> 110 8N1 flow=none
 22:10:02 [0001/0960 110 8N1 flow=none] test 1/1: sending 180 bytes
 22:10:18 [0001/0960 110 8N1 flow=none] test 1/1: RESULT FAIL score=0.00
+SCAN TIME 0001/0960: elapsed=16s avg=16s/set left=4h15m44s finish=02:26:02
 ```
 
 ## Stale Output

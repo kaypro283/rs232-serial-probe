@@ -659,6 +659,15 @@ def format_duration(seconds: float) -> str:
     return f"{secs}s"
 
 
+def format_finish_clock(remaining_seconds: float, now: dt.datetime | None = None) -> str:
+    """Return an approximate local clock time for scan completion."""
+    current = now if now is not None else dt.datetime.now().astimezone()
+    finish = current + dt.timedelta(seconds=max(0.0, remaining_seconds))
+    if finish.date() == current.date():
+        return finish.strftime("%H:%M:%S")
+    return finish.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def byte_size_label(byte_count: int) -> str:
     """Return an early-terminal-friendly byte count label."""
     if byte_count % 1024 == 0:
@@ -706,6 +715,7 @@ def print_progress_legend() -> None:
     print("  quiet=S/T means no new output bytes for S seconds; T is the wait limit.")
     print("  PASS/GOOD/PARTIAL/FAIL/STALE/ERROR is the quick result indicator.")
     print("  score is 0-100 confidence for that test or setting.")
+    print("  SCAN TIME shows elapsed time, remaining time, and approximate finish.")
 
 
 def received_length(received: bytearray, lock: threading.Lock) -> int:
@@ -1322,6 +1332,36 @@ def format_progress(result: CandidateResult) -> str:
         f"sent={result.bytes_sent:7d} recv={result.bytes_received:7d} "
         f"cleared={result.bytes_drained_before:7d} "
         f"score={result.score:6.2f} {status}"
+    )
+
+
+def format_scan_eta(
+    completed: int,
+    total: int,
+    started_monotonic: float,
+    now_monotonic: float | None = None,
+    clock_now: dt.datetime | None = None,
+) -> str:
+    """Return a live elapsed/remaining/finish estimate for the scan."""
+    now = time.monotonic() if now_monotonic is None else now_monotonic
+    elapsed = max(0.0, now - started_monotonic)
+    completed = max(0, min(completed, total))
+    remaining_count = max(total - completed, 0)
+    if completed <= 0:
+        return (
+            f"SCAN TIME {completed:04d}/{total:04d}: "
+            f"elapsed={format_duration(elapsed)} left=unknown finish=unknown"
+        )
+
+    average = elapsed / completed
+    remaining_seconds = average * remaining_count
+    finish = format_finish_clock(remaining_seconds, clock_now)
+    return (
+        f"SCAN TIME {completed:04d}/{total:04d}: "
+        f"elapsed={format_duration(elapsed)} "
+        f"avg={format_duration(average)}/set "
+        f"left={format_duration(remaining_seconds)} "
+        f"finish={finish}"
     )
 
 
@@ -2676,6 +2716,11 @@ def run_scan(options: ScanOptions) -> int:
     print(f"Live progress: updates every {options.progress_interval:.1f}s while a candidate is running.")
     print_progress_legend()
     print(f"Reports: {options.json_report}, {options.csv_report}, {options.log_file}")
+    rough_total = estimate_scan_wire_seconds(options) + estimate_scan_overhead_seconds(options)
+    print(
+        f"Rough starting estimate: {format_duration(rough_total)}; "
+        f"finish about {format_finish_clock(rough_total)}"
+    )
 
     results: list[CandidateResult] = []
     early_stopped = False
@@ -2692,6 +2737,7 @@ def run_scan(options: ScanOptions) -> int:
         )
         results.append(result)
         print(format_progress(result), flush=True)
+        print(format_scan_eta(len(results), len(candidates), scan_started), flush=True)
 
     completed_at = dt.datetime.now(dt.timezone.utc).isoformat()
     elapsed_sec = time.monotonic() - scan_started
