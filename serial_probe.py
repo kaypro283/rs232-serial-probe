@@ -70,6 +70,7 @@ PROGRESS_WIDTH = 70
 RECOMMENDATION_MIN_SCORE = 90.0
 TOP_MATCH_MIN_SCORE = 99.0
 TIE_SCORE_TOLERANCE = 0.5
+PERFECT_SCORE = 100.0
 
 
 @dataclass(frozen=True)
@@ -1247,6 +1248,17 @@ def result_sort_key(result: CandidateResult) -> tuple[float, float, float, int]:
     )
 
 
+def ranked_top_results(
+    results: Sequence[CandidateResult],
+    top: int,
+) -> list[CandidateResult]:
+    """Return top-ranked results, including all perfect scores when tied."""
+    ranked = sorted(results, key=result_sort_key, reverse=True)
+    perfect_count = sum(1 for result in ranked if result.score >= PERFECT_SCORE)
+    display_count = max(top, perfect_count)
+    return ranked[:display_count]
+
+
 def setup_logging(log_file: Path) -> logging.Logger:
     """Configure file logging and return the scan logger."""
     log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1303,10 +1315,10 @@ def write_json_report(
 ) -> None:
     """Write the full JSON scan report."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    ranked = sorted(results, key=result_sort_key, reverse=True)
+    top_results = ranked_top_results(results, metadata["top"])
     payload = {
         "metadata": dataclass_to_jsonable(metadata),
-        "top_results": [dataclass_to_jsonable(result) for result in ranked[: metadata["top"]]],
+        "top_results": [dataclass_to_jsonable(result) for result in top_results],
         "candidates": [dataclass_to_jsonable(result) for result in results],
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -1413,7 +1425,7 @@ def format_scan_eta(
 
 def print_ranked_table(results: Sequence[CandidateResult], top: int) -> None:
     """Print the final ranked table to stdout."""
-    ranked = sorted(results, key=result_sort_key, reverse=True)[:top]
+    ranked = ranked_top_results(results, top)
     print()
     print_report_title("SERIAL PROBE FINAL REPORT")
     print("TOP OBSERVED RESULTS")
@@ -1629,7 +1641,7 @@ def print_scan_summary(
             for name in ("PASS", "GOOD", "PARTIAL", "FAIL", "STALE", "ERROR")
         )
     )
-    print(f"  TOP ROWS:             {min(top, len(ranked))}")
+    print(f"  TOP ROWS:             {len(ranked_top_results(results, top))}")
     print(f"  FINDING:              {confidence_summary(best, len(tied))}")
     if early_stopped:
         print("  NOTE:                 OPERATOR ENDED AFTER TOP MATCH.")
@@ -1650,7 +1662,7 @@ def print_scan_summary(
         print("    DO NOT TREAT ROW 1 AS THE ONLY POSSIBLE SWITCH SETTING.")
         print("    USE A LARGER TEST MESSAGE OR REPEAT THESE SETTINGS.")
         print()
-        print_tied_results(tied[:top])
+        print_tied_results(ranked_top_results(tied, top))
         print(border_line(REPORT_WIDTH))
         return
 
