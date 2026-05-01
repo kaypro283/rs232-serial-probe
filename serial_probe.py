@@ -203,6 +203,9 @@ class ScanOptions:
     pre_drain_quiet: float
     max_drain_bytes: int
     ask_on_top_match: bool
+    auto_validate_top_matches: bool
+    validate_size_1_bytes: int
+    validate_size_2_tie_bytes: int
 
 
 @dataclass(frozen=True)
@@ -1718,6 +1721,9 @@ def default_scan_options() -> ScanOptions:
         pre_drain_quiet=DEFAULT_PRE_DRAIN_QUIET,
         max_drain_bytes=DEFAULT_MAX_DRAIN_BYTES,
         ask_on_top_match=False,
+        auto_validate_top_matches=False,
+        validate_size_1_bytes=8 * 1024,
+        validate_size_2_tie_bytes=16 * 1024,
     )
 
 
@@ -1742,6 +1748,15 @@ def validate_options(options: ScanOptions) -> None:
         raise ValueError("QUIET TIME MUST BE POSITIVE")
     if options.max_drain_bytes <= 0:
         raise ValueError("MAX CLEAR BYTES MUST BE POSITIVE")
+    if options.validate_size_1_bytes < minimum_payload_size():
+        raise ValueError(f"VALIDATE SIZE 1 MUST BE AT LEAST {minimum_payload_size()} BYTES")
+    if options.validate_size_2_tie_bytes < 0:
+        raise ValueError("VALIDATE SIZE 2 ON TIE CANNOT BE NEGATIVE")
+    if (
+        options.validate_size_2_tie_bytes > 0
+        and options.validate_size_2_tie_bytes < minimum_payload_size()
+    ):
+        raise ValueError(f"VALIDATE SIZE 2 MUST BE 0 OR AT LEAST {minimum_payload_size()} BYTES")
     available_bauds(options.min_baud, options.max_baud)
 
 
@@ -1912,6 +1927,19 @@ def print_configuration(options: ScanOptions) -> None:
     print_setting("TEST BYTES:", f"{options.payload_bytes} BYTES")
     print_setting("TEST COUNT:", options.bursts)
     print_setting("ASK ON MATCH:", "YES" if options.ask_on_top_match else "NO")
+    print_setting(
+        "AUTO VALIDATE:",
+        (
+            "OFF"
+            if not options.auto_validate_top_matches
+            else (
+                f"ON, SIZE1={options.validate_size_1_bytes} BYTES, "
+                f"SIZE2={options.validate_size_2_tie_bytes} BYTES"
+                if options.validate_size_2_tie_bytes > 0
+                else f"ON, SIZE1={options.validate_size_1_bytes} BYTES, SIZE2=OFF"
+            )
+        ),
+    )
     print_setting("READ WAIT:", f"{options.read_timeout:.2f}S")
     print_setting("OPEN PAUSE:", f"{options.settle_ms} MS")
     print_setting(
@@ -1959,11 +1987,34 @@ def configure_payload(options: ScanOptions) -> ScanOptions:
         "ASK WHETHER TO CONTINUE AFTER TOP MATCH",
         options.ask_on_top_match,
     )
+    auto_validate = prompt_yes_no(
+        "AUTO VALIDATE TOP MATCHES AFTER SCAN",
+        options.auto_validate_top_matches,
+    )
+    validate_size_1 = options.validate_size_1_bytes
+    validate_size_2 = options.validate_size_2_tie_bytes
+    if auto_validate:
+        validate_size_1 = prompt_int(
+            "VALIDATE SIZE 1 BYTES",
+            options.validate_size_1_bytes,
+            minimum=minimum_payload_size(),
+        )
+        validate_size_2 = prompt_int(
+            "VALIDATE SIZE 2 ON TIE (0=OFF)",
+            options.validate_size_2_tie_bytes,
+            minimum=0,
+        )
+        if 0 < validate_size_2 < minimum_payload_size():
+            print(f"VALUE {validate_size_2} TOO SMALL. USING {minimum_payload_size()}.")
+            validate_size_2 = minimum_payload_size()
     return dataclasses.replace(
         options,
         payload_bytes=payload_bytes,
         bursts=bursts,
         ask_on_top_match=ask_on_top_match,
+        auto_validate_top_matches=auto_validate,
+        validate_size_1_bytes=validate_size_1,
+        validate_size_2_tie_bytes=validate_size_2,
     )
 
 
@@ -2858,6 +2909,18 @@ def run_scan(options: ScanOptions) -> int:
         print("TOP MATCH PROMPT: ON; PASS ASKS WHETHER TO CONTINUE.")
     else:
         print("TOP MATCH PROMPT: OFF.")
+    if options.auto_validate_top_matches:
+        size2 = (
+            f"{options.validate_size_2_tie_bytes} BYTES"
+            if options.validate_size_2_tie_bytes > 0
+            else "OFF"
+        )
+        print(
+            "STAGE 2 VALIDATION: ON; "
+            f"SIZE1={options.validate_size_1_bytes} BYTES SIZE2={size2}."
+        )
+    else:
+        print("STAGE 2 VALIDATION: OFF.")
     print(f"SCREEN UPDATE: {options.progress_interval:.1f}S WHILE SETTING RUNS.")
     print_progress_legend()
     print(f"REPORTS: {options.json_report}, {options.csv_report}, {options.log_file}")
@@ -2926,6 +2989,9 @@ def run_scan(options: ScanOptions) -> int:
     logger.info("json_report=%s", options.json_report)
     logger.info("csv_report=%s", options.csv_report)
 
+    print()
+    print_report_title("PHASE 1 RESULTS")
+    print("BASE SCAN RANKING AND SUMMARY.")
     print_ranked_table(results, options.top)
     print_scan_summary(
         results=results,
@@ -2934,6 +3000,79 @@ def run_scan(options: ScanOptions) -> int:
         early_stopped=early_stopped,
         top=options.top,
     )
+    if options.auto_validate_top_matches and results:
+        ranked = sorted(results, key=result_sort_key, reverse=True)
+        top_score = ranked[0].score
+        shortlist = [result for result in ranked if abs(result.score - top_score) <= 0.0001]
+        shortlist = shortlist[: options.top]
+        if shortlist:
+            print()
+            print_report_title("PHASE 2 VALIDATION")
+            print(
+                f"SHORTLIST: {len(shortlist)} TOP-SCORE SETTING(S) "
+                f"FROM SCORE={top_score:.2f}."
+            )
+            stage2_options = dataclasses.replace(
+                options,
+                payload_bytes=options.validate_size_1_bytes,
+                bursts=1,
+                ask_on_top_match=False,
+            )
+            stage2_payload = generate_payload(options.validate_size_1_bytes)
+            stage2_results: list[CandidateResult] = []
+            for index, candidate in enumerate(shortlist, start=1):
+                print(
+                    f"VALIDATION PASS 1: {stage2_payload.byte_count} BYTES "
+                    f"{index}/{len(shortlist)} {candidate.settings.label()}"
+                )
+                stage2_result = run_candidate(
+                    serial_module=serial_module,
+                    index=index,
+                    total=len(shortlist),
+                    settings=candidate.settings,
+                    options=stage2_options,
+                    payload=stage2_payload,
+                    logger=logger,
+                    progress=console_progress,
+                )
+                stage2_results.append(stage2_result)
+                print(format_progress(stage2_result), flush=True)
+            tied_after_1 = top_tied_results(stage2_results)
+            final_stage2_results = stage2_results
+            if len(tied_after_1) > 1 and options.validate_size_2_tie_bytes > 0:
+                print(
+                    f"TIE REMAINS ({len(tied_after_1)}). "
+                    f"RUNNING PASS 2 AT {options.validate_size_2_tie_bytes} BYTES."
+                )
+                stage2_options = dataclasses.replace(
+                    stage2_options,
+                    payload_bytes=options.validate_size_2_tie_bytes,
+                )
+                stage2_payload = generate_payload(options.validate_size_2_tie_bytes)
+                tie_results: list[CandidateResult] = []
+                for index, candidate in enumerate(tied_after_1, start=1):
+                    print(
+                        f"VALIDATION PASS 2: {stage2_payload.byte_count} BYTES "
+                        f"{index}/{len(tied_after_1)} {candidate.settings.label()}"
+                    )
+                    tie_result = run_candidate(
+                        serial_module=serial_module,
+                        index=index,
+                        total=len(tied_after_1),
+                        settings=candidate.settings,
+                        options=stage2_options,
+                        payload=stage2_payload,
+                        logger=logger,
+                        progress=console_progress,
+                    )
+                    tie_results.append(tie_result)
+                    print(format_progress(tie_result), flush=True)
+                final_stage2_results = tie_results
+            elif len(tied_after_1) > 1:
+                print("TIE REMAINS AFTER PASS 1. PASS 2 IS OFF.")
+
+            print("STAGE 2 FINAL RANKING:")
+            print_ranked_table(final_stage2_results, min(options.top, len(final_stage2_results)))
     print()
     print_report_title("REPORT FILES")
     print(f"  JSON FILE: {options.json_report}")
