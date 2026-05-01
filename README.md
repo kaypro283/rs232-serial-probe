@@ -21,11 +21,19 @@ Usage screen:
 python serial_probe.py --help
 ```
 
-The first screen is the command menu. Use `9. Show current settings` to view ports, baud range, number of settings to test, test message size, repeat count, timing, old-output clearing, report files, and estimated scan time. The scan tests every selected combination.
+The first screen is the command menu. Use `9. Show current settings` to view ports, baud range, number of settings to test, test message size, repeat count, timing, old-output clearing, report files, and estimated scan time. Use `M. Memory test` after you have a likely switch setting. The scan tests every selected combination.
 
 The terminal UI uses bright green text when the console supports ANSI color, matching the look of an early monochrome CRT. PyCharm runs are treated as color-capable. Set `NO_COLOR=1` before running if you want plain console text.
 
 Status screens, setting-change notices, and the final report use `*` borders to match the style of terminal reports from early printer and communications utilities.
+
+Suggested first run for this COM1-to-COM5 setup:
+
+```powershell
+python serial_probe.py
+```
+
+Use the default settings, then select `1. Start scan`.
 
 ## How Many Combinations?
 
@@ -116,6 +124,25 @@ It also writes:
 - Debug log.
 
 The report paths are configured from the menu.
+
+## Memory Test
+
+The memory test is a separate menu command: `M. Memory test`.
+
+Run it after the scan has found a likely switch setting. Enter the recommended baud rate, data bits, parity, stop bits, and flow control from the final scan report.
+
+The memory test can check `16K`, `32K`, and `64K` transfers. It reports:
+
+- The serial setting used.
+- The largest clean transfer.
+- Bytes sent and read.
+- Old bytes cleared before the test.
+- Bytes that appeared before the buffer was released.
+- Missing and extra bytes.
+
+For a real buffer-size check, use `Hold output, then release` if the printer buffer has an `OFF LINE`, `HOLD`, or `PAUSE` control. The program sends the test message while the output is held, then asks you to release the buffer so it can read the stored data.
+
+If the buffer cannot be held, use `Read while sending`. That checks whether a large transfer passes cleanly, but it does not prove the installed RAM size because the buffer may be passing data straight through instead of storing it.
 
 ## Safety Notes
 
