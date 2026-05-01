@@ -30,25 +30,17 @@ from typing import Any, Callable, Sequence
 
 BAUD_RATES: list[int] = [
     110,
+    150,
     300,
     600,
     1200,
     2400,
     4800,
-    9600,
-    14400,
-    19200,
-    38400,
-    57600,
-    115200,
-    230400,
-    460800,
-    921600,
 ]
 DATA_BITS: list[int] = [8, 7]
 PARITIES: list[str] = ["none", "even", "odd", "mark", "space"]
 STOP_BITS: list[int] = [1, 2]
-FLOW_CONTROLS: list[str] = ["none", "xon/xoff", "rts/cts", "dsr/dtr"]
+FLOW_CONTROLS: list[str] = ["none", "xon/xoff"]
 DEFAULT_BURSTS = 1
 DEFAULT_PAYLOAD_BYTES = 180
 DEFAULT_READ_TIMEOUT = 0.25
