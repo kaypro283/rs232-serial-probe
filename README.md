@@ -37,22 +37,19 @@ Use the default settings, then select `1. Start scan`.
 
 ## How Many Combinations?
 
-With the default early-80s printer-buffer baud range, the scan tests:
+With the default printer-buffer baud range, the scan tests:
 
 ```text
-12 baud rates x 2 data-bit choices x 5 parity choices x 2 stop-bit choices x 4 flow-control choices = 960 combinations
+3 baud rates x 2 data-bit choices x 5 parity choices x 2 stop-bit choices x 2 flow-control choices = 120 combinations
 ```
 
 The default baud list is:
 
 ```text
-110, 300, 600, 1200, 2400, 4800, 9600, 14400, 19200,
-38400, 57600, 115200
+9600, 19200, 38400
 ```
 
-The scan tries the fastest selected baud rate first, then works downward. With the default range, it starts at `115200` and ends at `110`. It still tests every data-bit, parity, stop-bit, and flow-control combination.
-
-The menu still allows raising the maximum baud rate to include `230400`, `460800`, and `921600` if needed.
+The scan tries the fastest selected baud rate first, then works downward. With the default range, it starts at `38400` and ends at `9600`. It still tests every data-bit, parity, stop-bit, and flow-control combination.
 
 ## Speed
 
@@ -68,7 +65,7 @@ The default menu settings are tuned for a practical scan:
 
 Three repeated tests are not required for the first scan. One test is enough to rank settings. If you want more certainty afterward, rerun with a larger test message or more tests around the suspected setting range.
 
-Very low baud rates are still physically slow. At `110` baud, even a small test message takes real time because the serial line can only move a small number of bytes per second.
+Lower baud rates are still physically slower because the serial line can only move a limited number of bytes per second.
 
 The menu estimates scan time in plain terms:
 
@@ -81,7 +78,7 @@ The menu estimates scan time in plain terms:
 The console shows:
 
 - A `SETTING` banner for each new setting.
-- The active setting, such as `110 8N1 FLOW=NONE`.
+- The active setting, such as `9600 8N1 FLOW=NONE`.
 - Test number.
 - Write progress.
 - Bytes received.
@@ -94,10 +91,10 @@ The console shows:
 Example:
 
 ```text
-22:10:02 *              SETTING 1/960  110 8N1 FLOW=NONE              *
-22:10:02 [0001/0960 110 8N1 FLOW=NONE] TEST 1/1: SEND 180 BYTES
-22:10:18 [0001/0960 110 8N1 FLOW=NONE] TEST 1/1: RESULT FAIL SCORE=0.00
-SCAN TIME 0001/0960: ELAPSED=16S AVG=16S/SET LEFT=4H15M44S FINISH=02:26:02
+22:10:02 *              SETTING 1/120  38400 8N1 FLOW=NONE            *
+22:10:02 [0001/0120 38400 8N1 FLOW=NONE] TEST 1/1: SEND 180 BYTES
+22:10:03 [0001/0120 38400 8N1 FLOW=NONE] TEST 1/1: RESULT FAIL SCORE=0.00
+SCAN TIME 0001/0120: ELAPSED=1S AVG=1S/SET LEFT=1M59S FINISH=22:12:02
 ```
 
 ## Stale Output
@@ -172,8 +169,8 @@ Gibberish data:
 
 Flow-control problems:
 
-- If hardware flow control stalls, inspect `rts/cts` and `dsr/dtr` matches.
-- If the device does not assert those lines, `none` or `xon/xoff` may work better.
+- Compare `none` and `xon/xoff`; those are the flow-control modes in the scan.
+- If hardware flow control is required, this scan range would need to be expanded again.
 
 Stale data:
 
