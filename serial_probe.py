@@ -9,6 +9,7 @@ received, and reports ranked candidates.
 from __future__ import annotations
 
 import atexit
+import base64
 import csv
 import ctypes
 import dataclasses
@@ -1261,16 +1262,34 @@ def setup_logging(log_file: Path) -> logging.Logger:
     return logger
 
 
+def bytes_to_jsonable(value: bytes | bytearray | memoryview) -> str | dict[str, Any]:
+    """Return a JSON-safe representation of raw bytes."""
+    data = bytes(value)
+    try:
+        text = data.decode("ascii")
+    except UnicodeDecodeError:
+        text = ""
+    if text and all(char in "\r\n\t" or 32 <= ord(char) <= 126 for char in text):
+        return text
+    return {
+        "encoding": "base64",
+        "byte_count": len(data),
+        "data": base64.b64encode(data).decode("ascii"),
+    }
+
+
 def dataclass_to_jsonable(value: Any) -> Any:
-    """Convert dataclasses and Paths into JSON-serializable plain objects."""
+    """Convert values into JSON-serializable plain objects."""
     if dataclasses.is_dataclass(value):
         return {
             key: dataclass_to_jsonable(item)
             for key, item in dataclasses.asdict(value).items()
         }
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes_to_jsonable(value)
     if isinstance(value, Path):
         return str(value)
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return [dataclass_to_jsonable(item) for item in value]
     if isinstance(value, dict):
         return {key: dataclass_to_jsonable(item) for key, item in value.items()}
@@ -2947,4 +2966,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print()
+        print("INTERRUPTED BY OPERATOR.")
+        raise SystemExit(130)
