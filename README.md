@@ -40,7 +40,7 @@ Use the default settings, then select `1. Start scan`.
 With the default printer-buffer baud range, the scan tests:
 
 ```text
-10 baud rates x 2 data-bit choices x 5 parity choices x 2 stop-bit choices x 2 flow-control choices = 400 combinations
+10 baud rates x 2 data-bit choices x 5 parity choices x 2 stop-bit choices x 4 flow-control choices = 800 combinations
 ```
 
 The default baud list is:
@@ -58,6 +58,7 @@ The default menu settings are tuned for a practical scan:
 - `180` bytes per setting.
 - `1` test per setting.
 - Every selected serial setting is tested.
+- Output wait after send is `2.0` seconds by default.
 - `Ask on top match` is off by default. If enabled, a `PASS` result pauses the scan and asks whether to continue looking for possible ties.
 - `Auto validate top matches after scan` is on by default. It retests the top-score setting or settings with an 8K payload, then uses a 16K payload if a tie remains. The menu can turn this off or change the sizes.
 - Old-output clearing stops after `32768` bytes by default, which is enough for a 16K buffer plus margin.
@@ -91,10 +92,10 @@ The console shows:
 Example:
 
 ```text
-22:10:02 *              SETTING 1/400  38400 8N1 FLOW=NONE            *
-22:10:02 [0001/0400 38400 8N1 FLOW=NONE] TEST 1/1: SEND 180 BYTES
-22:10:03 [0001/0400 38400 8N1 FLOW=NONE] TEST 1/1: RESULT FAIL SCORE=0.00
-SCAN TIME 0001/0400: ELAPSED=1S AVG=1S/SET LEFT=6M39S FINISH=22:16:42
+22:10:02 *              SETTING 1/800  38400 8N1 FLOW=NONE            *
+22:10:02 [0001/0800 38400 8N1 FLOW=NONE] TEST 1/1: SEND 180 BYTES
+22:10:04 [0001/0800 38400 8N1 FLOW=NONE] TEST 1/1: RESULT FAIL SCORE=0.00
+SCAN TIME 0001/0800: ELAPSED=2S AVG=2S/SET LEFT=26M38S FINISH=22:36:42
 ```
 
 ## Stale Output
@@ -169,8 +170,7 @@ Gibberish data:
 
 Flow-control problems:
 
-- Compare `none` and `xon/xoff`; those are the flow-control modes in the scan.
-- If hardware flow control is required, this scan range would need to be expanded again.
+- Compare `none`, `xon/xoff`, `rts/cts`, and `dsr/dtr`; those are the flow-control modes in the scan.
 
 Stale data:
 

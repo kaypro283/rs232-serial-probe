@@ -43,10 +43,10 @@ BAUD_RATES: list[int] = [
 DATA_BITS: list[int] = [8, 7]
 PARITIES: list[str] = ["none", "even", "odd", "mark", "space"]
 STOP_BITS: list[int] = [1, 2]
-FLOW_CONTROLS: list[str] = ["none", "xon/xoff"]
+FLOW_CONTROLS: list[str] = ["none", "xon/xoff", "rts/cts", "dsr/dtr"]
 DEFAULT_BURSTS = 1
 DEFAULT_PAYLOAD_BYTES = 180
-DEFAULT_READ_TIMEOUT = 0.25
+DEFAULT_READ_TIMEOUT = 2.0
 DEFAULT_SETTLE_MS = 50
 DEFAULT_PROGRESS_INTERVAL = 1.0
 DEFAULT_PRE_DRAIN_TIMEOUT = 0.5
@@ -951,6 +951,9 @@ def execute_burst(
                     f"CLEARED={drain.bytes_drained}"
                 )
                 next_progress_at = now + progress_interval
+        if progress:
+            progress(f"{prefix}: FLUSH OUTPUT BYTES")
+        in_serial.flush()
     except Exception as exc:  # pyserial raises driver-specific subclasses.
         write_error = str(exc)
         logger.debug("burst %s write failed: %s", burst_index, write_error)
