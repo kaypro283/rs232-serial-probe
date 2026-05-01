@@ -52,6 +52,22 @@ DEFAULT_PROGRESS_INTERVAL = 1.0
 DEFAULT_PRE_DRAIN_TIMEOUT = 0.5
 DEFAULT_PRE_DRAIN_QUIET = 0.1
 DEFAULT_MAX_DRAIN_BYTES = 32_768
+PHASE0_PAYLOAD_BYTES = 128
+PHASE0_READ_TIMEOUT = 0.25
+PHASE0_SETTLE_MS = 10
+PHASE0_BURSTS = 1
+PHASE0_PROGRESS_INTERVAL = 1.0
+PHASE0_PRE_DRAIN_TIMEOUT = 0.25
+PHASE0_PRE_DRAIN_QUIET = 0.05
+PHASE0_MAX_DRAIN_BYTES = DEFAULT_MAX_DRAIN_BYTES
+PHASE0_MIN_ALIVE_SCORE = 90.0
+PHASE0_MIN_LINE_INTEGRITY = 1.0
+PHASE0_MAX_EXTRA_BYTES = 16
+PHASE0_MAX_EXTRA_BYTES_RATIO = 0.25
+PHASE0_BASELINE_DATA_BITS = 8
+PHASE0_BASELINE_PARITY = "none"
+PHASE0_BASELINE_STOP_BITS = 1
+PHASE0_BASELINE_FLOW_CONTROL = "none"
 EXPLORATORY_PAYLOAD_BYTES = 160
 EXPLORATORY_READ_TIMEOUT = 0.4
 EXPLORATORY_SETTLE_MS = 20
@@ -262,6 +278,47 @@ class BaudFocusReport:
 
 
 @dataclass(frozen=True)
+class Phase0LivenessDecision:
+    """Boolean liveness decision for one Phase 0 baud probe."""
+
+    alive: bool
+    reason: str
+
+
+@dataclass(frozen=True)
+class BaudLivenessResult:
+    """Phase 0 result for one baseline baud probe."""
+
+    baud: int
+    alive: bool
+    reason: str
+    settings: SerialSettings
+    score: float
+    status: str
+    error: str | None
+    bytes_sent: int
+    bytes_received: int
+    bytes_drained_before: int
+    elapsed_sec: float
+    metrics: ScoreMetrics
+
+
+@dataclass(frozen=True)
+class BaudLivenessReport:
+    """Run summary for the Phase 0 baud liveness sweep."""
+
+    ran: bool
+    tested_bauds: list[int]
+    alive_bauds: list[int]
+    fallback_to_all_bauds: bool
+    fallback_reason: str | None
+    candidate_count_before: int
+    candidate_count_after: int
+    elapsed_sec: float
+    results: list[BaudLivenessResult]
+
+
+@dataclass(frozen=True)
 class ExploratorySelection:
     """Ranked exploratory findings and the optional full-scan candidate subset."""
 
@@ -275,6 +332,7 @@ class ExploratorySelection:
     cutoff_score: float | None
     truncated: bool
     baud_focus: BaudFocusReport
+    phase0_liveness: BaudLivenessReport
 
 
 @dataclass(frozen=True)
@@ -1413,6 +1471,7 @@ def write_csv_report(
     path.parent.mkdir(parents=True, exist_ok=True)
     ranked = sorted(results, key=result_sort_key, reverse=True)
     exploratory = (metadata or {}).get("exploratory_mode", {})
+    phase0 = exploratory.get("phase0_baud_liveness", {})
     baud_focus = exploratory.get("baud_focus", {})
     scan_mode = (metadata or {}).get("scan_mode", "")
     fieldnames = [
@@ -1437,6 +1496,10 @@ def write_csv_report(
         "elapsed_sec",
         "error",
         "scan_mode",
+        "phase0_ran",
+        "phase0_alive_bauds",
+        "phase0_fallback",
+        "phase0_candidate_count_after",
         "baud_focus_engaged",
         "baud_focus_baud",
         "baud_focus_deferred",
@@ -1471,6 +1534,16 @@ def write_csv_report(
                     "elapsed_sec": f"{result.elapsed_sec:.3f}",
                     "error": result.error or "",
                     "scan_mode": str(scan_mode).upper(),
+                    "phase0_ran": "YES" if phase0.get("ran") else "NO",
+                    "phase0_alive_bauds": ",".join(
+                        str(baud) for baud in phase0.get("alive_bauds", [])
+                    ),
+                    "phase0_fallback": (
+                        "YES" if phase0.get("fallback_to_all_bauds") else "NO"
+                    ),
+                    "phase0_candidate_count_after": (
+                        phase0.get("candidate_count_after") or ""
+                    ),
                     "baud_focus_engaged": (
                         "YES" if baud_focus.get("engaged") else "NO"
                     ),
@@ -1915,6 +1988,169 @@ def estimate_scan_overhead_seconds(options: ScanOptions) -> float:
     return len(candidates) * options.bursts * per_burst
 
 
+def phase0_baseline_settings(baud: int) -> SerialSettings:
+    """Return the fixed baseline settings used by the baud liveness sweep."""
+    return SerialSettings(
+        baud=baud,
+        data_bits=PHASE0_BASELINE_DATA_BITS,
+        parity=PHASE0_BASELINE_PARITY,
+        stop_bits=PHASE0_BASELINE_STOP_BITS,
+        flow_control=PHASE0_BASELINE_FLOW_CONTROL,
+    )
+
+
+def phase0_minimum_payload_size() -> int:
+    """Return the smallest structural payload usable by Phase 0."""
+    start = b"<<<SERIAL_PROBE_BEGIN PHASE0>>>\r\n"
+    end = b"<<<SERIAL_PROBE_END PHASE0>>>\r\n"
+    return len(start) + len(make_probe_line(1, "LIVE", "")) + len(end)
+
+
+def phase0_payload_bytes() -> int:
+    """Return the fixed internal Phase 0 liveness payload size."""
+    return max(PHASE0_PAYLOAD_BYTES, phase0_minimum_payload_size())
+
+
+def generate_phase0_payload(payload_bytes: int | None = None) -> ProbePayload:
+    """Generate a compact structural probe payload for baud liveness."""
+    byte_count = phase0_payload_bytes() if payload_bytes is None else payload_bytes
+    byte_count = max(byte_count, phase0_minimum_payload_size())
+    start = b"<<<SERIAL_PROBE_BEGIN PHASE0>>>\r\n"
+    end = b"<<<SERIAL_PROBE_END PHASE0>>>\r\n"
+    empty_line = make_probe_line(1, "LIVE", "")
+    data_len = byte_count - len(start) - len(empty_line) - len(end)
+    if data_len < 0:
+        raise ValueError("PHASE 0 PAYLOAD IS TOO SMALL")
+    line = make_probe_line(1, "LIVE", repeated_ascii_pattern(1, data_len))
+    body = start + line
+    payload = body + end
+    if len(payload) != byte_count:
+        raise AssertionError(
+            f"phase 0 payload produced {len(payload)} bytes, expected {byte_count}"
+        )
+    body_hash = fnv1a32(body)
+    return ProbePayload(
+        data=payload,
+        line_count=1,
+        byte_count=len(payload),
+        body_hash=f"{body_hash:08X}",
+    )
+
+
+def phase0_fixed_settings_label() -> str:
+    """Return a compact description of fixed Phase 0 liveness settings."""
+    return (
+        f"{phase0_payload_bytes()} BYTES X {PHASE0_BURSTS}, "
+        "8N1 FLOW=NONE, "
+        f"READ={PHASE0_READ_TIMEOUT:.2f}S, "
+        f"PAUSE={PHASE0_SETTLE_MS}MS, "
+        f"CLEAR={PHASE0_PRE_DRAIN_TIMEOUT:.2f}S/"
+        f"{PHASE0_PRE_DRAIN_QUIET:.2f}S"
+    )
+
+
+def phase0_scan_options(options: ScanOptions) -> ScanOptions:
+    """Return fixed internal options for the Phase 0 baud liveness sweep."""
+    return dataclasses.replace(
+        options,
+        payload_bytes=phase0_payload_bytes(),
+        read_timeout=PHASE0_READ_TIMEOUT,
+        settle_ms=PHASE0_SETTLE_MS,
+        bursts=PHASE0_BURSTS,
+        progress_interval=PHASE0_PROGRESS_INTERVAL,
+        no_pre_drain=False,
+        pre_drain_timeout=PHASE0_PRE_DRAIN_TIMEOUT,
+        pre_drain_quiet=PHASE0_PRE_DRAIN_QUIET,
+        max_drain_bytes=PHASE0_MAX_DRAIN_BYTES,
+        ask_on_top_match=False,
+    )
+
+
+def phase0_extra_byte_limit(expected_byte_count: int) -> int:
+    """Return the tolerated extra-byte limit for Phase 0 liveness."""
+    ratio_limit = int(expected_byte_count * PHASE0_MAX_EXTRA_BYTES_RATIO)
+    return max(PHASE0_MAX_EXTRA_BYTES, ratio_limit)
+
+
+def classify_phase0_liveness(
+    result: CandidateResult,
+    expected_byte_count: int,
+) -> Phase0LivenessDecision:
+    """Return a conservative boolean liveness decision for one baud result."""
+    if result.error or result.status == "error":
+        return Phase0LivenessDecision(False, "SERIAL ERROR")
+    if result.status == "partial-write":
+        return Phase0LivenessDecision(False, "PARTIAL WRITE")
+    if result.status == "stale-output":
+        return Phase0LivenessDecision(False, "OUTPUT NOT QUIET")
+    if result.status == "no-data" or result.bytes_received <= 0:
+        return Phase0LivenessDecision(False, "NO DATA")
+    if result.bytes_sent < expected_byte_count:
+        return Phase0LivenessDecision(False, "INCOMPLETE SEND")
+    if result.metrics.extra_bytes > phase0_extra_byte_limit(expected_byte_count):
+        return Phase0LivenessDecision(False, "EXTRA OUTPUT")
+    if result.metrics.line_integrity_ratio < PHASE0_MIN_LINE_INTEGRITY:
+        return Phase0LivenessDecision(False, "NO VALID PROBE LINE")
+    if not (
+        result.metrics.start_marker_present
+        or result.metrics.end_marker_present
+    ):
+        return Phase0LivenessDecision(False, "NO PROBE MARKER")
+    if result.score < PHASE0_MIN_ALIVE_SCORE:
+        return Phase0LivenessDecision(False, f"LOW SCORE {result.score:.1f}")
+    return Phase0LivenessDecision(True, "VALID PROBE STRUCTURE")
+
+
+def baud_liveness_result_from_candidate(
+    result: CandidateResult,
+    decision: Phase0LivenessDecision,
+) -> BaudLivenessResult:
+    """Return the compact Phase 0 report row for one candidate result."""
+    return BaudLivenessResult(
+        baud=result.settings.baud,
+        alive=decision.alive,
+        reason=decision.reason,
+        settings=result.settings,
+        score=result.score,
+        status=result.status,
+        error=result.error,
+        bytes_sent=result.bytes_sent,
+        bytes_received=result.bytes_received,
+        bytes_drained_before=result.bytes_drained_before,
+        elapsed_sec=result.elapsed_sec,
+        metrics=result.metrics,
+    )
+
+
+def empty_baud_liveness_report(
+    candidate_count: int,
+    fallback_reason: str | None = None,
+) -> BaudLivenessReport:
+    """Return a not-run Phase 0 liveness report for metadata."""
+    return BaudLivenessReport(
+        ran=False,
+        tested_bauds=[],
+        alive_bauds=[],
+        fallback_to_all_bauds=True,
+        fallback_reason=fallback_reason,
+        candidate_count_before=candidate_count,
+        candidate_count_after=candidate_count,
+        elapsed_sec=0.0,
+        results=[],
+    )
+
+
+def candidates_after_phase0_liveness(
+    candidates: Sequence[SerialSettings],
+    report: BaudLivenessReport,
+) -> list[SerialSettings]:
+    """Return quick exploratory candidates after the Phase 0 baud gate."""
+    if report.fallback_to_all_bauds:
+        return list(candidates)
+    alive = set(report.alive_bauds)
+    return [candidate for candidate in candidates if candidate.baud in alive]
+
+
 def exploratory_payload_bytes() -> int:
     """Return the fixed internal exploratory payload size."""
     return max(EXPLORATORY_PAYLOAD_BYTES, minimum_payload_size())
@@ -2110,6 +2346,7 @@ def select_exploratory_candidates(
     all_candidates: Sequence[SerialSettings],
     elapsed_sec: float,
     baud_focus: BaudFocusReport,
+    phase0_liveness: BaudLivenessReport,
 ) -> ExploratorySelection:
     """Select a conservative full-scan shortlist from exploratory results."""
     ranked_results = sorted(results, key=result_sort_key, reverse=True)
@@ -2207,7 +2444,76 @@ def select_exploratory_candidates(
         cutoff_score=cutoff_score,
         truncated=truncated,
         baud_focus=baud_focus,
+        phase0_liveness=phase0_liveness,
     )
+
+
+def print_phase0_start(
+    options: ScanOptions,
+    phase0_options: ScanOptions,
+    bauds: Sequence[int],
+    candidate_count: int,
+    payload: ProbePayload,
+) -> None:
+    """Print the Phase 0 liveness sweep start banner."""
+    print()
+    print_report_title("PHASE 0 BAUD LIVENESS SWEEP")
+    print("MODE: FIXED 8N1 FLOW=NONE; BAUD GATE FOR QUICK EXPLORATORY.")
+    print(
+        f"PORTS: {options.in_port} -> {options.out_port}; "
+        f"TEST={payload.byte_count} BYTES X {phase0_options.bursts}"
+    )
+    print(
+        f"TIMING: READ={phase0_options.read_timeout:.2f}S, "
+        f"PAUSE={phase0_options.settle_ms}MS."
+    )
+    print(
+        f"CLEAR OUTPUT: ON; QUIET={phase0_options.pre_drain_quiet:.2f}S "
+        f"LIMIT={phase0_options.pre_drain_timeout:.2f}S "
+        f"MAX={phase0_options.max_drain_bytes} BYTES."
+    )
+    print(f"BAUDS: {len(bauds)}; SETTINGS BEFORE GATE: {candidate_count}.")
+    print("ALIVE REQUIRES VALID PROBE LINE AND MARKER; NOISE IS NOT ENOUGH.")
+    print(border_line(REPORT_WIDTH))
+
+
+def format_phase0_progress(
+    result: BaudLivenessResult,
+    index: int,
+    total: int,
+) -> str:
+    """Return one Phase 0 console progress line."""
+    state = "ALIVE" if result.alive else "NOT ALIVE"
+    return (
+        f"PHASE0 [{index:04d}/{total:04d}] {state:<9} "
+        f"{result.settings.label():32s} "
+        f"READ={result.bytes_received:6d} CLR={result.bytes_drained_before:6d} "
+        f"SCORE={result.score:6.2f} {result.reason}"
+    )
+
+
+def print_phase0_summary(report: BaudLivenessReport) -> None:
+    """Print a concise Phase 0 liveness summary."""
+    print()
+    print_report_title("PHASE 0 RESULTS")
+    print(f"  RUN TIME:             {format_duration(report.elapsed_sec)}")
+    print(f"  BAUDS TESTED:         {len(report.tested_bauds)}")
+    print(f"  ALIVE BAUDS:          {len(report.alive_bauds)}")
+    print(f"  FIXED SETTINGS:       {phase0_fixed_settings_label()}")
+    if report.alive_bauds:
+        print(
+            "  ALIVE LIST:           "
+            + ", ".join(str(baud) for baud in report.alive_bauds)
+        )
+        print(
+            "  QUICK CANDIDATES:     "
+            f"{report.candidate_count_after}/{report.candidate_count_before}"
+        )
+    if report.fallback_to_all_bauds:
+        print("  QUICK CANDIDATES:     ALL SELECTED SETTINGS")
+        if report.fallback_reason:
+            print(f"  FALLBACK:             {report.fallback_reason}")
+    print(border_line(REPORT_WIDTH))
 
 
 def print_exploratory_start(
@@ -2270,6 +2576,18 @@ def print_exploratory_summary(selection: ExploratorySelection) -> None:
     print(f"  RUN TIME:             {format_duration(selection.elapsed_sec)}")
     print(f"  SETTINGS TESTED:      {len(selection.results)}")
     print(f"  FIXED SETTINGS:       {exploratory_fixed_settings_label()}")
+    phase0 = selection.phase0_liveness
+    print(
+        "  PHASE 0 ALIVE:        "
+        f"{len(phase0.alive_bauds)}/{len(phase0.tested_bauds)} BAUDS"
+    )
+    if phase0.fallback_to_all_bauds:
+        print("  PHASE 0 GATE:         FALLBACK TO ALL BAUDS")
+    else:
+        print(
+            "  PHASE 0 GATE:         "
+            f"{phase0.candidate_count_after}/{phase0.candidate_count_before} SETTINGS"
+        )
     print_baud_focus_report(selection.baud_focus)
     if selection.fallback_reason:
         print(f"  FINDING:              {selection.fallback_reason}")
@@ -2332,6 +2650,25 @@ def exploratory_metadata(
     options: ScanOptions,
 ) -> dict[str, Any]:
     """Return JSON metadata for exploratory mode and candidate narrowing."""
+    phase0_fixed_settings = {
+        "payload_bytes": phase0_payload_bytes(),
+        "read_timeout": PHASE0_READ_TIMEOUT,
+        "settle_ms": PHASE0_SETTLE_MS,
+        "bursts": PHASE0_BURSTS,
+        "progress_interval": PHASE0_PROGRESS_INTERVAL,
+        "pre_drain_enabled": True,
+        "pre_drain_timeout": PHASE0_PRE_DRAIN_TIMEOUT,
+        "pre_drain_quiet": PHASE0_PRE_DRAIN_QUIET,
+        "max_drain_bytes": PHASE0_MAX_DRAIN_BYTES,
+        "baseline_data_bits": PHASE0_BASELINE_DATA_BITS,
+        "baseline_parity": PHASE0_BASELINE_PARITY,
+        "baseline_stop_bits": PHASE0_BASELINE_STOP_BITS,
+        "baseline_flow_control": PHASE0_BASELINE_FLOW_CONTROL,
+        "min_alive_score": PHASE0_MIN_ALIVE_SCORE,
+        "min_line_integrity": PHASE0_MIN_LINE_INTEGRITY,
+        "max_extra_bytes": PHASE0_MAX_EXTRA_BYTES,
+        "max_extra_bytes_ratio": PHASE0_MAX_EXTRA_BYTES_RATIO,
+    }
     fixed_settings = {
         "payload_bytes": exploratory_payload_bytes(),
         "read_timeout": EXPLORATORY_READ_TIMEOUT,
@@ -2355,6 +2692,7 @@ def exploratory_metadata(
     }
     metadata: dict[str, Any] = {
         "requested": requested,
+        "phase0_fixed_internal_settings": phase0_fixed_settings,
         "fixed_internal_settings": fixed_settings,
         "narrowing_accepted": narrowing_accepted,
         "original_candidate_count": original_candidate_count,
@@ -2373,6 +2711,12 @@ def exploratory_metadata(
                 "EXPLORATORY NOT RUN",
             )
         )
+        metadata["phase0_baud_liveness"] = dataclass_to_jsonable(
+            empty_baud_liveness_report(
+                original_candidate_count,
+                "EXPLORATORY NOT RUN",
+            )
+        )
         return metadata
 
     metadata.update(
@@ -2384,6 +2728,9 @@ def exploratory_metadata(
             "cutoff_score": selection.cutoff_score,
             "truncated": selection.truncated,
             "notes": selection.notes,
+            "phase0_baud_liveness": dataclass_to_jsonable(
+                selection.phase0_liveness
+            ),
             "baud_focus": dataclass_to_jsonable(selection.baud_focus),
             "shortlist_count": len(selection.shortlist_results),
             "narrowed_candidate_count": len(selection.narrowed_candidates),
@@ -2404,6 +2751,110 @@ def exploratory_metadata(
     return metadata
 
 
+def run_phase0_baud_liveness(
+    serial_module: Any,
+    options: ScanOptions,
+    candidates: Sequence[SerialSettings],
+    logger: logging.Logger,
+) -> BaudLivenessReport:
+    """Run the fixed 8N1 baud liveness sweep used before quick mode."""
+    phase0_options = phase0_scan_options(options)
+    phase0_payload = generate_phase0_payload(phase0_options.payload_bytes)
+    baud_order, _ = group_candidates_by_baud(candidates)
+    if not baud_order:
+        return empty_baud_liveness_report(
+            len(candidates),
+            "NO BAUDS SELECTED",
+        )
+
+    print_phase0_start(
+        options=options,
+        phase0_options=phase0_options,
+        bauds=baud_order,
+        candidate_count=len(candidates),
+        payload=phase0_payload,
+    )
+    logger.info("phase 0 baud liveness sweep started")
+    logger.info("phase 0 options: %s", phase0_options)
+    logger.info(
+        "phase 0 payload: %s bytes, %s lines",
+        phase0_payload.byte_count,
+        phase0_payload.line_count,
+    )
+
+    started = time.monotonic()
+    results: list[BaudLivenessResult] = []
+    expected_byte_count = phase0_payload.byte_count * phase0_options.bursts
+    for index, baud in enumerate(baud_order, start=1):
+        candidate_result = run_candidate(
+            serial_module=serial_module,
+            index=index,
+            total=len(baud_order),
+            settings=phase0_baseline_settings(baud),
+            options=phase0_options,
+            payload=phase0_payload,
+            logger=logger,
+            progress=None,
+        )
+        decision = classify_phase0_liveness(candidate_result, expected_byte_count)
+        liveness_result = baud_liveness_result_from_candidate(
+            candidate_result,
+            decision,
+        )
+        results.append(liveness_result)
+        print(
+            format_phase0_progress(liveness_result, index, len(baud_order)),
+            flush=True,
+        )
+        print(format_scan_eta(len(results), len(baud_order), started), flush=True)
+        logger.info(
+            "phase 0 baud %s: %s score=%.2f status=%s reason=%s read=%s cleared=%s error=%s",
+            baud,
+            "alive" if decision.alive else "not-alive",
+            candidate_result.score,
+            candidate_result.status,
+            decision.reason,
+            candidate_result.bytes_received,
+            candidate_result.bytes_drained_before,
+            candidate_result.error,
+        )
+
+    elapsed_sec = time.monotonic() - started
+    alive_bauds = [result.baud for result in results if result.alive]
+    fallback_reason = None
+    fallback_to_all = False
+    if not alive_bauds:
+        fallback_to_all = True
+        fallback_reason = "NO ALIVE BAUDS; QUICK MODE WILL USE ALL SELECTED BAUDS."
+    alive = set(alive_bauds)
+    candidate_count_after = (
+        len(candidates)
+        if fallback_to_all
+        else sum(1 for candidate in candidates if candidate.baud in alive)
+    )
+    report = BaudLivenessReport(
+        ran=True,
+        tested_bauds=list(baud_order),
+        alive_bauds=alive_bauds,
+        fallback_to_all_bauds=fallback_to_all,
+        fallback_reason=fallback_reason,
+        candidate_count_before=len(candidates),
+        candidate_count_after=candidate_count_after,
+        elapsed_sec=elapsed_sec,
+        results=results,
+    )
+    print_phase0_summary(report)
+    logger.info(
+        "phase 0 completed; alive=%s/%s fallback=%s quick_candidates=%s/%s",
+        len(alive_bauds),
+        len(baud_order),
+        fallback_to_all,
+        candidate_count_after,
+        len(candidates),
+    )
+    return report
+
+
 def run_exploratory_scan(
     serial_module: Any,
     options: ScanOptions,
@@ -2411,11 +2862,28 @@ def run_exploratory_scan(
     logger: logging.Logger,
 ) -> ExploratorySelection:
     """Run quick exploratory mode and return candidate narrowing findings."""
+    phase0_liveness = run_phase0_baud_liveness(
+        serial_module=serial_module,
+        options=options,
+        candidates=candidates,
+        logger=logger,
+    )
+    quick_candidates = candidates_after_phase0_liveness(candidates, phase0_liveness)
     quick_options = exploratory_scan_options(options)
     quick_payload = generate_payload(quick_options.payload_bytes)
-    print_exploratory_start(options, quick_options, len(candidates), quick_payload)
+    print_exploratory_start(
+        options,
+        quick_options,
+        len(quick_candidates),
+        quick_payload,
+    )
     logger.info("quick exploratory mode started")
     logger.info("quick options: %s", quick_options)
+    logger.info(
+        "quick candidates after phase 0: %s/%s",
+        len(quick_candidates),
+        len(candidates),
+    )
     logger.info(
         "quick payload: %s bytes, %s lines",
         quick_payload.byte_count,
@@ -2425,7 +2893,7 @@ def run_exploratory_scan(
     started = time.monotonic()
     results: list[CandidateResult] = []
     tested: set[SerialSettings] = set()
-    baud_order, grouped = group_candidates_by_baud(candidates)
+    baud_order, grouped = group_candidates_by_baud(quick_candidates)
     focus_enabled = options.baud_focus_enabled and len(baud_order) > 1
     focus_active = False
     focus_engaged = False
@@ -2447,7 +2915,7 @@ def run_exploratory_scan(
             if settings is None:
                 deferred = [
                     candidate
-                    for candidate in candidates
+                    for candidate in quick_candidates
                     if candidate not in tested and candidate.baud != focused_baud
                 ]
                 deferred_candidate_count = len(deferred)
@@ -2466,7 +2934,7 @@ def run_exploratory_scan(
                     )
                 break
         else:
-            settings = next_unseen_candidate(candidates, tested)
+            settings = next_unseen_candidate(quick_candidates, tested)
             if settings is None:
                 break
 
@@ -2474,7 +2942,7 @@ def run_exploratory_scan(
         result = run_candidate(
             serial_module=serial_module,
             index=index,
-            total=len(candidates),
+            total=len(quick_candidates),
             settings=settings,
             options=quick_options,
             payload=quick_payload,
@@ -2484,7 +2952,7 @@ def run_exploratory_scan(
         results.append(result)
         tested.add(settings)
         print("QUICK " + format_progress(result), flush=True)
-        print(format_scan_eta(len(results), len(candidates), started), flush=True)
+        print(format_scan_eta(len(results), len(quick_candidates), started), flush=True)
 
         if focus_enabled:
             block_reason = result_blocks_baud_focus(result)
@@ -2566,6 +3034,7 @@ def run_exploratory_scan(
         candidates,
         elapsed_sec,
         baud_focus_report,
+        phase0_liveness,
     )
     print_exploratory_summary(selection)
     logger.info(
@@ -2709,6 +3178,7 @@ def print_menu_help() -> None:
     print("  TEST SIZE:       BYTES SENT FOR EACH SETTING.")
     print("  TEST COUNT:      NUMBER OF TRIES PER SETTING.")
     print("  QUICK MODE:      AUTO=YES; MANUAL ASKS; FIXED INTERNAL SETTINGS.")
+    print("  PHASE 0:         QUICK MODE FIRST TESTS EACH BAUD AT 8N1 FLOW=NONE.")
     print("  BAUD FOCUS:      QUICK MODE MAY DEFER OTHER BAUDS WHEN CONFIDENT.")
     print("  ASK ON MATCH:    PAUSE AFTER PASS; ASK CONTINUE.")
     print("  CLEAR OUTPUT:    DISCARD OLD BUFFER DATA FIRST.")
@@ -2766,6 +3236,7 @@ def print_configuration(options: ScanOptions) -> None:
         "QUICK MODE:",
         f"ASK AT START; FIXED INTERNAL {exploratory_fixed_settings_label()}",
     )
+    print_setting("PHASE 0:", phase0_fixed_settings_label())
     print_setting("BAUD FOCUS:", baud_focus_settings_label(options))
     print_setting("ASK ON MATCH:", "YES" if options.ask_on_top_match else "NO")
     print_setting(
@@ -3981,6 +4452,14 @@ def run_scan(options: ScanOptions) -> int:
         )
     elif exploratory_requested:
         print("  NOTE:                 QUICK EXPLORATORY DID NOT NARROW FULL ANALYSIS.")
+    if exploratory_selection is not None:
+        phase0 = exploratory_selection.phase0_liveness
+        print(
+            "  NOTE:                 PHASE 0 BAUD LIVENESS "
+            f"{len(phase0.alive_bauds)}/{len(phase0.tested_bauds)}."
+        )
+        if phase0.fallback_to_all_bauds and phase0.fallback_reason:
+            print(f"  NOTE:                 PHASE 0 FALLBACK: {phase0.fallback_reason}")
     if exploratory_selection is not None and exploratory_selection.baud_focus.engaged:
         report = exploratory_selection.baud_focus
         print(
