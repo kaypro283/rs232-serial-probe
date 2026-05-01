@@ -1255,8 +1255,12 @@ def ranked_top_results(
     results: Sequence[CandidateResult],
     top: int,
 ) -> list[CandidateResult]:
-    """Return top-ranked results, including all perfect scores when tied."""
-    ranked = sorted(results, key=result_sort_key, reverse=True)
+    """Return top non-zero results, including all perfect scores when tied."""
+    ranked = [
+        result
+        for result in sorted(results, key=result_sort_key, reverse=True)
+        if result.score > 0.0
+    ]
     perfect_count = sum(1 for result in ranked if result.score >= PERFECT_SCORE)
     display_count = max(top, perfect_count)
     return ranked[:display_count]
@@ -1426,12 +1430,16 @@ def format_scan_eta(
     )
 
 
-def print_ranked_table(results: Sequence[CandidateResult], top: int) -> None:
-    """Print the final ranked table to stdout."""
+def print_ranked_table(
+    results: Sequence[CandidateResult],
+    top: int,
+    report_title: str = "SERIAL PROBE FINAL REPORT",
+) -> None:
+    """Print a ranked non-zero table to stdout."""
     ranked = ranked_top_results(results, top)
     print()
-    print_report_title("SERIAL PROBE FINAL REPORT")
-    print("TOP OBSERVED RESULTS")
+    print_report_title(report_title)
+    print("TOP OBSERVED RESULTS (NON-ZERO SCORES)")
     print(border_line(REPORT_WIDTH))
     print(
         "RK SCORE   BAUD MODE FLOW       SENT   READ  CLR  EXCT LINE RESULT"
@@ -3004,7 +3012,7 @@ def run_scan(options: ScanOptions) -> int:
     print()
     print_report_title("PHASE 1 RESULTS")
     print("BASE SCAN RANKING AND SUMMARY.")
-    print_ranked_table(results, options.top)
+    print_ranked_table(results, options.top, report_title="PHASE 1 FINAL REPORT")
     print_scan_summary(
         results=results,
         total_candidates=len(candidates),
@@ -3013,10 +3021,9 @@ def run_scan(options: ScanOptions) -> int:
         top=options.top,
     )
     if options.auto_validate_top_matches and results:
-        ranked = sorted(results, key=result_sort_key, reverse=True)
-        top_score = ranked[0].score
+        ranked = ranked_top_results(results, options.top)
+        top_score = ranked[0].score if ranked else 0.0
         shortlist = [result for result in ranked if abs(result.score - top_score) <= 0.0001]
-        shortlist = shortlist[: options.top]
         if shortlist:
             print()
             print_report_title("PHASE 2 VALIDATION")
@@ -3084,7 +3091,11 @@ def run_scan(options: ScanOptions) -> int:
                 print("TIE REMAINS AFTER PASS 1. PASS 2 IS OFF.")
 
             print("STAGE 2 FINAL RANKING:")
-            print_ranked_table(final_stage2_results, min(options.top, len(final_stage2_results)))
+            print_ranked_table(
+                final_stage2_results,
+                min(options.top, len(final_stage2_results)),
+                report_title="PHASE 2 FINAL REPORT",
+            )
     print()
     print_report_title("REPORT FILES")
     print(f"  JSON FILE: {options.json_report}")
