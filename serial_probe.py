@@ -64,6 +64,7 @@ STD_OUTPUT_HANDLE = -11
 ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
 SCREEN_WIDTH = 72
 REPORT_WIDTH = 104
+RECOMMENDATION_MIN_SCORE = 90.0
 
 
 @dataclass(frozen=True)
@@ -1329,7 +1330,7 @@ def print_ranked_table(results: Sequence[CandidateResult], top: int) -> None:
     ranked = sorted(results, key=result_sort_key, reverse=True)[:top]
     print()
     print_report_title("SERIAL PROBE FINAL REPORT")
-    print("TOP MATCHES")
+    print("TOP OBSERVED RESULTS")
     print(border_line(REPORT_WIDTH))
     print(
         "Rank  Score  Baud    Mode   Flow      Sent     Recv  Cleared   Exact   Lines   Print   Status"
@@ -1358,6 +1359,38 @@ def print_ranked_table(results: Sequence[CandidateResult], top: int) -> None:
     print(border_line(REPORT_WIDTH))
 
 
+def is_recommendable_result(result: CandidateResult | None) -> bool:
+    """Return True when a result is strong enough to call a recommendation."""
+    if result is None or result.error:
+        return False
+    if result.status in {"error", "no-data", "stale-output", "partial-write", "weak"}:
+        return False
+    return result.score >= RECOMMENDATION_MIN_SCORE
+
+
+def has_any_signal(results: Sequence[CandidateResult]) -> bool:
+    """Return True when any result had enough data quality to be useful."""
+    return any(
+        not result.error
+        and result.status not in {"error", "no-data", "stale-output", "partial-write"}
+        and result.score >= 50.0
+        for result in results
+    )
+
+
+def scan_recommendation_status(results: Sequence[CandidateResult]) -> str:
+    """Return a machine-readable recommendation status for reports."""
+    ranked = sorted(results, key=result_sort_key, reverse=True)
+    best = ranked[0] if ranked else None
+    if best is None:
+        return "no-candidates"
+    if is_recommendable_result(best):
+        return "recommended"
+    if has_any_signal(results):
+        return "partial-only"
+    return "no-working-setting"
+
+
 def confidence_summary(result: CandidateResult | None) -> str:
     """Return a short interpretation of the best result."""
     if result is None:
@@ -1366,13 +1399,46 @@ def confidence_summary(result: CandidateResult | None) -> str:
         return "No match yet; output was already streaming stale data before probes."
     if result.error:
         return "No confident match; the best-ranked setting ended with an error."
-    if result.score >= 99.0 and result.repeatability >= 1.0:
+    if is_recommendable_result(result) and result.score >= 99.0 and result.repeatability >= 1.0:
         return "Likely correct; repeated tests were near-perfect."
-    if result.score >= 90.0:
+    if is_recommendable_result(result):
         return "Strong match; verify cabling/device behavior and review the report."
     if result.score >= 50.0:
         return "Partial match only; settings may be close, but not reliable."
     return "No confident match; inspect wiring, ports, flow control, and device backlog."
+
+
+def print_result_details(result: CandidateResult) -> None:
+    """Print switch-setting and score details for one scan result."""
+    print(f"    Baud rate:          {result.settings.baud}")
+    print(f"    Data bits:          {result.settings.data_bits}")
+    print(
+        f"    Parity:             "
+        f"{parity_name(result.settings.parity)} ({result.settings.parity_code()})"
+    )
+    print(f"    Stop bits:          {result.settings.stop_bits}")
+    print(f"    Flow control:       {flow_control_name(result.settings.flow_control)}")
+    print(f"    Compact setting:    {result.settings.label()}")
+    print(
+        f"    Indicator:          "
+        f"{result_indicator(result.score, result.status, result.error)}"
+    )
+    print(f"    Score:              {result.score:.2f}/100")
+    print(f"    Repeatability:      {result.repeatability:.3f}")
+    print(f"    Bytes sent/read:    {result.bytes_sent}/{result.bytes_received}")
+    print(f"    Old bytes cleared:  {result.bytes_drained_before}")
+    print(f"    Exact byte ratio:   {result.metrics.exact_byte_match_ratio:.3f}")
+    print(f"    Line integrity:     {result.metrics.line_integrity_ratio:.3f}")
+    print(f"    Printable ASCII:    {result.metrics.printable_ascii_ratio:.3f}")
+    print(f"    Missing/extra:      {result.metrics.missing_bytes}/{result.metrics.extra_bytes}")
+    if result.status == "stale-output":
+        print("    Note:               COM5 never went quiet before this probe.")
+        if result.error:
+            print(f"    Detail:             {result.error}")
+    elif result.error:
+        print(f"    Error:              {result.error}")
+    elif result.metrics.extra_bytes > result.bytes_sent:
+        print("    Note:               output had substantial extra bytes/backlog.")
 
 
 def parity_name(parity: str) -> str:
@@ -1431,34 +1497,32 @@ def print_scan_summary(
 
     print()
     print(border_line(REPORT_WIDTH))
-    print(bordered_text("RECOMMENDED SWITCH SETTING", REPORT_WIDTH))
+    if is_recommendable_result(best):
+        print(bordered_text("RECOMMENDED SWITCH SETTING", REPORT_WIDTH))
+        print(border_line(REPORT_WIDTH))
+        print_result_details(best)
+        print(border_line(REPORT_WIDTH))
+        return
+
+    if has_any_signal(results):
+        print(bordered_text("NO RELIABLE SETTING FOUND", REPORT_WIDTH))
+        print(border_line(REPORT_WIDTH))
+        print("    The best row was only a partial result.")
+        print("    Do not use it as the printer-buffer switch setting yet.")
+        print("    Reset/clear the buffer, check cabling and flow control, then run again.")
+    else:
+        print(bordered_text("NO WORKING SETTING FOUND", REPORT_WIDTH))
+        print(border_line(REPORT_WIDTH))
+        print("    The current printer-buffer switch setup did not pass any serial test.")
+        print("    Do not use the top row as a switch recommendation.")
+        print("    This can happen with an unused switch combination, disabled port,")
+        print("    held output, wrong cable, wrong COM port, or flow-control hold.")
+
+    print()
     print(border_line(REPORT_WIDTH))
-    print(f"    Baud rate:          {best.settings.baud}")
-    print(f"    Data bits:          {best.settings.data_bits}")
-    print(f"    Parity:             {parity_name(best.settings.parity)} ({best.settings.parity_code()})")
-    print(f"    Stop bits:          {best.settings.stop_bits}")
-    print(f"    Flow control:       {flow_control_name(best.settings.flow_control)}")
-    print(f"    Compact setting:    {best.settings.label()}")
-    print(
-        f"    Indicator:          "
-        f"{result_indicator(best.score, best.status, best.error)}"
-    )
-    print(f"    Score:              {best.score:.2f}/100")
-    print(f"    Repeatability:      {best.repeatability:.3f}")
-    print(f"    Bytes sent/read:    {best.bytes_sent}/{best.bytes_received}")
-    print(f"    Old bytes cleared:  {best.bytes_drained_before}")
-    print(f"    Exact byte ratio:   {best.metrics.exact_byte_match_ratio:.3f}")
-    print(f"    Line integrity:     {best.metrics.line_integrity_ratio:.3f}")
-    print(f"    Printable ASCII:    {best.metrics.printable_ascii_ratio:.3f}")
-    print(f"    Missing/extra:      {best.metrics.missing_bytes}/{best.metrics.extra_bytes}")
-    if best.status == "stale-output":
-        print("    Note:               COM5 never went quiet before this probe.")
-        if best.error:
-            print(f"    Detail:             {best.error}")
-    elif best.error:
-        print(f"    Error:              {best.error}")
-    elif best.metrics.extra_bytes > best.bytes_sent:
-        print("    Note:               output had substantial extra bytes/backlog.")
+    print(bordered_text("BEST OBSERVED RESULT ONLY", REPORT_WIDTH))
+    print(border_line(REPORT_WIDTH))
+    print_result_details(best)
     print(border_line(REPORT_WIDTH))
 
 
@@ -2642,6 +2706,14 @@ def run_scan(options: ScanOptions) -> int:
     )
     metadata["completed_candidates"] = len(results)
     metadata["elapsed_sec"] = elapsed_sec
+    metadata["recommendation_status"] = scan_recommendation_status(results)
+    ranked_results = sorted(results, key=result_sort_key, reverse=True)
+    best_result = ranked_results[0] if ranked_results else None
+    metadata["recommended_setting"] = (
+        dataclass_to_jsonable(best_result.settings)
+        if is_recommendable_result(best_result)
+        else None
+    )
     write_json_report(options.json_report, metadata, results)
     write_csv_report(options.csv_report, results)
     logger.info("serial_probe completed; candidates=%s early_stopped=%s", len(results), early_stopped)
