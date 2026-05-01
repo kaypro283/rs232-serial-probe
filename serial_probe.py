@@ -21,6 +21,7 @@ import statistics
 import subprocess
 import sys
 import threading
+import textwrap
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,7 +64,8 @@ ANSI_RESET = "\033[0m"
 STD_OUTPUT_HANDLE = -11
 ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
 SCREEN_WIDTH = 72
-REPORT_WIDTH = 104
+REPORT_WIDTH = 78
+PROGRESS_WIDTH = 70
 RECOMMENDATION_MIN_SCORE = 90.0
 TOP_MATCH_MIN_SCORE = 99.0
 TIE_SCORE_TOLERANCE = 0.5
@@ -91,9 +93,10 @@ class SerialSettings:
 
     def label(self) -> str:
         """Return a compact human-readable settings label."""
+        flow = self.flow_control.upper()
         return (
             f"{self.baud} {self.data_bits}{self.parity_code()}"
-            f"{self.stop_bits} flow={self.flow_control}"
+            f"{self.stop_bits} FLOW={flow}"
         )
 
 
@@ -446,10 +449,10 @@ def score_received(expected: bytes, received: bytes) -> ScoreResult:
 def available_bauds(min_baud: int, max_baud: int) -> list[int]:
     """Return configured baud rates within inclusive min/max limits."""
     if min_baud > max_baud:
-        raise ValueError("--min-baud cannot be greater than --max-baud")
+        raise ValueError("MINIMUM BAUD CANNOT BE GREATER THAN MAXIMUM BAUD")
     selected = [baud for baud in BAUD_RATES if min_baud <= baud <= max_baud]
     if not selected:
-        raise ValueError("no configured baud rates are inside the requested range")
+        raise ValueError("NO PROGRAM BAUD RATES ARE IN THAT RANGE")
     return selected
 
 
@@ -490,7 +493,7 @@ def normalize_port_name(port: str) -> str:
 def ensure_distinct_ports(in_port: str, out_port: str) -> None:
     """Raise if the input and output ports resolve to the same port name."""
     if normalize_port_name(in_port) == normalize_port_name(out_port):
-        raise ValueError("--in-port and --out-port must not be the same port")
+        raise ValueError("INPUT AND OUTPUT PORTS MUST NOT BE THE SAME")
 
 
 def import_or_install_pyserial() -> Any:
@@ -501,11 +504,11 @@ def import_or_install_pyserial() -> Any:
         return serial
     except ImportError:
         install_command = [sys.executable, "-m", "pip", "install", "pyserial"]
-        print("pyserial is missing; attempting: " + " ".join(install_command))
+        print("PYSERIAL MISSING; TRYING: " + " ".join(install_command))
         try:
             subprocess.check_call(install_command)
         except (OSError, subprocess.CalledProcessError):
-            print("Install pyserial with: python -m pip install pyserial")
+            print("INSTALL PYSERIAL WITH: PYTHON -M PIP INSTALL PYSERIAL")
             raise SystemExit(2)
 
     try:
@@ -513,7 +516,7 @@ def import_or_install_pyserial() -> Any:
 
         return serial
     except ImportError:
-        print("Install pyserial with: python -m pip install pyserial")
+        print("INSTALL PYSERIAL WITH: PYTHON -M PIP INSTALL PYSERIAL")
         raise SystemExit(2)
 
 
@@ -656,15 +659,15 @@ def print_report_title(title: str) -> None:
 def format_duration(seconds: float) -> str:
     """Return a compact human-readable duration."""
     if seconds < 1:
-        return f"{seconds * 1000:.0f}ms"
+        return f"{seconds * 1000:.0f}MS"
     rounded = int(round(seconds))
     hours, remainder = divmod(rounded, 3600)
     minutes, secs = divmod(remainder, 60)
     if hours:
-        return f"{hours}h{minutes:02d}m{secs:02d}s"
+        return f"{hours}H{minutes:02d}M{secs:02d}S"
     if minutes:
-        return f"{minutes}m{secs:02d}s"
-    return f"{secs}s"
+        return f"{minutes}M{secs:02d}S"
+    return f"{secs}S"
 
 
 def format_finish_clock(remaining_seconds: float, now: dt.datetime | None = None) -> str:
@@ -680,7 +683,7 @@ def byte_size_label(byte_count: int) -> str:
     """Return an early-terminal-friendly byte count label."""
     if byte_count % 1024 == 0:
         return f"{byte_count // 1024}K"
-    return f"{byte_count} bytes"
+    return f"{byte_count} BYTES"
 
 
 def result_indicator(score: float, status: str, error: str | None = None) -> str:
@@ -709,21 +712,33 @@ def estimated_transmit_seconds(settings: SerialSettings, byte_count: int) -> flo
 
 def console_progress(message: str) -> None:
     """Print a timestamped live progress message."""
-    print(f"{time.strftime('%H:%M:%S')} {message}", flush=True)
+    prefix = f"{time.strftime('%H:%M:%S')} "
+    width = max(20, 80 - len(prefix))
+    lines = str(message).splitlines() or [""]
+    for line_index, line in enumerate(lines):
+        wrapped = textwrap.wrap(
+            line,
+            width=width,
+            break_long_words=True,
+            replace_whitespace=False,
+        ) or [""]
+        for wrap_index, part in enumerate(wrapped):
+            lead = prefix if line_index == 0 and wrap_index == 0 else " " * len(prefix)
+            print(f"{lead}{part}", flush=True)
 
 
 def print_progress_legend() -> None:
     """Print a concise explanation of live progress fields."""
-    print("Live progress legend:")
-    print("  [candidate/total setting] identifies the current serial setting.")
-    print("  test X/Y is the current send/read attempt for that setting.")
-    print("  writing A/B bytes is how much has been written to the input port.")
-    print("  received=N is bytes captured from the output port during this test.")
-    print("  cleared=N is old output removed before sending the test message.")
-    print("  quiet=S/T means no new output bytes for S seconds; T is the wait limit.")
-    print("  PASS/GOOD/PARTIAL/FAIL/STALE/ERROR is the quick result indicator.")
-    print("  score is 0-100 confidence for that test or setting.")
-    print("  SCAN TIME shows elapsed time, remaining time, and approximate finish.")
+    print("OPERATOR LEGEND")
+    print("  [ITEM/TOTAL SETTING]  CURRENT SERIAL SETTING.")
+    print("  TEST X/Y              SEND/READ PASS FOR THAT SETTING.")
+    print("  WRITING A/B           BYTES WRITTEN TO INPUT PORT.")
+    print("  RECEIVED=N            BYTES READ FROM OUTPUT PORT.")
+    print("  CLEARED=N             OLD OUTPUT REMOVED BEFORE SEND.")
+    print("  QUIET=S/T             OUTPUT QUIET TIME AND LIMIT.")
+    print("  PASS GOOD PART FAIL STALE ERROR  QUICK RESULT.")
+    print("  SCORE                 0-100 MATCH CONFIDENCE.")
+    print("  SCAN TIME             ELAPSED, LEFT, FINISH TIME.")
 
 
 def received_length(received: bytearray, lock: threading.Lock) -> int:
@@ -753,8 +768,8 @@ def drain_output_until_quiet(
 
     if progress:
         progress(
-            f"{prefix}: clearing old output until {quiet_seconds:.1f}s quiet "
-            f"(max {max_seconds:.1f}s, max {max_bytes} bytes)"
+            f"{prefix}: CLEAR OLD OUTPUT UNTIL {quiet_seconds:.1f}S QUIET "
+            f"(MAX {max_seconds:.1f}S, MAX {max_bytes} BYTES)"
         )
 
     try:
@@ -784,8 +799,8 @@ def drain_output_until_quiet(
             if progress and now >= next_progress_at:
                 silence = max(0.0, now - last_data_time)
                 progress(
-                    f"{prefix}: clearing old output cleared={bytes_drained}, "
-                    f"quiet={silence:.1f}/{quiet_seconds:.1f}s"
+                    f"{prefix}: CLEARING OLD OUTPUT CLEARED={bytes_drained}, "
+                    f"QUIET={silence:.1f}/{quiet_seconds:.1f}S"
                 )
                 next_progress_at = now + max(progress_interval, 0.1)
     except Exception as exc:  # pyserial raises driver-specific subclasses.
@@ -825,12 +840,12 @@ def execute_burst(
     progress_interval = max(progress_interval, 0.1)
     prefix = (
         f"[{candidate_index:04d}/{candidate_total:04d} {settings.label()}] "
-        f"test {burst_index}/{burst_total}"
+        f"TEST {burst_index}/{burst_total}"
     )
     chunk_size = write_chunk_size(settings)
 
     if progress:
-        progress(f"{prefix}: flush input/output buffers; settle {settle_ms} ms")
+        progress(f"{prefix}: RESET BUFFERS; PAUSE {settle_ms} MS")
     reset_serial_buffers(in_serial)
     reset_serial_buffers(out_serial)
     time.sleep(settle_ms / 1000.0)
@@ -850,22 +865,21 @@ def execute_burst(
         if drain.quiet:
             if progress:
                 progress(
-                    f"{prefix}: old output is quiet; cleared={drain.bytes_drained} "
-                    f"bytes in {format_duration(drain.elapsed_sec)}"
+                    f"{prefix}: OUTPUT QUIET; CLEARED={drain.bytes_drained} "
+                    f"BYTES IN {format_duration(drain.elapsed_sec)}"
                 )
         else:
             error = (
-                "output did not go quiet before test send "
-                f"(reason={drain.reason}, cleared={drain.bytes_drained})"
+                "OUTPUT DID NOT GO QUIET BEFORE TEST SEND "
+                f"(REASON={drain.reason.upper()}, CLEARED={drain.bytes_drained})"
             )
             if drain.error:
                 error = f"{error}: {drain.error}"
             logger.info("%s: %s", prefix, error)
             if progress:
                 progress(
-                    f"{prefix}: RESULT STALE score=0.00; skipped send because "
-                    f"output kept producing data; cleared={drain.bytes_drained}, "
-                    f"reason={drain.reason}"
+                    f"{prefix}: RESULT STALE SCORE=0.00; SEND SKIPPED; "
+                    f"CLEARED={drain.bytes_drained}, REASON={drain.reason.upper()}"
                 )
             empty_score = score_received(expected, b"")
             return TrialResult(
@@ -914,8 +928,8 @@ def execute_burst(
     if progress:
         estimated = estimated_transmit_seconds(settings, len(expected))
         progress(
-            f"{prefix}: sending {len(expected)} bytes on {settings.label()} "
-            f"(chunk={chunk_size}, about {format_duration(estimated)} to send)"
+            f"{prefix}: SEND {len(expected)} BYTES ON {settings.label()} "
+            f"(CHUNK={chunk_size}, ABOUT {format_duration(estimated)})"
         )
     try:
         next_progress_at = time.monotonic() + progress_interval
@@ -931,10 +945,10 @@ def execute_burst(
             if progress and now >= next_progress_at:
                 percent = (bytes_sent / len(expected)) * 100.0
                 progress(
-                    f"{prefix}: writing {bytes_sent}/{len(expected)} bytes "
+                    f"{prefix}: WRITING {bytes_sent}/{len(expected)} BYTES "
                     f"({percent:5.1f}%), "
-                    f"received={received_length(received, received_lock)}, "
-                    f"cleared={drain.bytes_drained}"
+                    f"RECEIVED={received_length(received, received_lock)}, "
+                    f"CLEARED={drain.bytes_drained}"
                 )
                 next_progress_at = now + progress_interval
     except Exception as exc:  # pyserial raises driver-specific subclasses.
@@ -945,8 +959,8 @@ def execute_burst(
 
     if progress:
         progress(
-            f"{prefix}: write complete, sent={bytes_sent}; "
-            f"waiting for {read_timeout:.1f}s of quiet on {settings.label()}"
+            f"{prefix}: WRITE DONE, SENT={bytes_sent}; "
+            f"WAIT {read_timeout:.1f}S QUIET ON {settings.label()}"
         )
 
     wait_deadline = time.monotonic() + max(read_timeout + (settle_ms / 1000.0) + 2.0, 2.0)
@@ -957,8 +971,8 @@ def execute_burst(
         if progress and now >= next_wait_progress_at:
             silence = max(0.0, now - last_data_time)
             progress(
-                f"{prefix}: reading received={received_length(received, received_lock)} "
-                f"bytes, quiet={silence:.1f}/{read_timeout:.1f}s"
+                f"{prefix}: READING RECEIVED={received_length(received, received_lock)} "
+                f"BYTES, QUIET={silence:.1f}/{read_timeout:.1f}S"
             )
             next_wait_progress_at = now + progress_interval
         if now >= wait_deadline:
@@ -990,12 +1004,12 @@ def execute_burst(
     if progress:
         indicator = result_indicator(score.score, status, error)
         progress(
-            f"{prefix}: RESULT {indicator} score={score.score:.2f} ({status}); "
-            f"sent={bytes_sent}, received={len(received_bytes)}, "
-            f"cleared={drain.bytes_drained}, "
-            f"exact={score.metrics.exact_byte_match_ratio:.3f}, "
-            f"lines={score.metrics.line_integrity_ratio:.3f}, "
-            f"printable={score.metrics.printable_ascii_ratio:.3f}"
+            f"{prefix}: RESULT {indicator} SCORE={score.score:.2f} ({status.upper()}); "
+            f"SENT={bytes_sent}, RECEIVED={len(received_bytes)}, "
+            f"CLEARED={drain.bytes_drained}, "
+            f"EXACT={score.metrics.exact_byte_match_ratio:.3f}, "
+            f"LINES={score.metrics.line_integrity_ratio:.3f}, "
+            f"ASCII={score.metrics.printable_ascii_ratio:.3f}"
         )
 
     return TrialResult(
@@ -1129,18 +1143,23 @@ def run_candidate(
     if progress:
         per_burst = estimated_transmit_seconds(settings, payload.byte_count)
         total_estimate = per_burst * options.bursts
-        progress(border_line(78))
-        progress(bordered_text(f"SETTINGS CHANGE: setting {index}/{total} -> {settings.label()}", 78))
-        progress(border_line(78))
+        progress(border_line(PROGRESS_WIDTH))
+        progress(
+            bordered_text(
+                f"SETTING {index}/{total}  {settings.label()}",
+                PROGRESS_WIDTH,
+            )
+        )
+        progress(border_line(PROGRESS_WIDTH))
         progress(
             f"[{index:04d}/{total:04d} {settings.label()}] TESTING | "
-            f"test message={payload.byte_count} bytes, tests per setting={options.bursts}, "
-            f"time to send={format_duration(per_burst)}/test "
-            f"({format_duration(total_estimate)} total)"
+            f"TEST={payload.byte_count} BYTES, COUNT={options.bursts}, "
+            f"SEND={format_duration(per_burst)}/TEST "
+            f"({format_duration(total_estimate)} TOTAL)"
         )
         progress(
-            f"[{index:04d}/{total:04d} {settings.label()}] opening OUT {options.out_port} "
-            f"and IN {options.in_port}"
+            f"[{index:04d}/{total:04d} {settings.label()}] OPEN OUT {options.out_port} "
+            f"AND IN {options.in_port}"
         )
 
     try:
@@ -1152,8 +1171,8 @@ def run_candidate(
             ) as in_serial:
                 if progress:
                     progress(
-                        f"[{index:04d}/{total:04d} {settings.label()}] ports opened; "
-                        f"reset buffers and settle {options.settle_ms} ms"
+                        f"[{index:04d}/{total:04d} {settings.label()}] PORTS OPEN; "
+                        f"RESET BUFFERS; PAUSE {options.settle_ms} MS"
                     )
                 reset_serial_buffers(out_serial)
                 reset_serial_buffers(in_serial)
@@ -1196,7 +1215,7 @@ def run_candidate(
         if progress:
             progress(
                 f"[{index:04d}/{total:04d} {settings.label()}] "
-                f"ERROR opening/running: {exc}"
+                f"ERROR OPEN/RUN: {exc}"
             )
         return aggregate_candidate_result(
             index=index,
@@ -1332,14 +1351,14 @@ def write_csv_report(path: Path, results: Sequence[CandidateResult]) -> None:
 
 def format_progress(result: CandidateResult) -> str:
     """Return one console progress line for a candidate result."""
-    status = result.status if not result.error else f"{result.status}: {result.error[:60]}"
+    status = result.status.upper() if not result.error else f"{result.status.upper()}: {result.error[:60]}"
     indicator = result_indicator(result.score, result.status, result.error)
     return (
         f"[{result.index:04d}/{result.total:04d}] RESULT {indicator} "
         f"{result.settings.label():32s} "
-        f"sent={result.bytes_sent:7d} recv={result.bytes_received:7d} "
-        f"cleared={result.bytes_drained_before:7d} "
-        f"score={result.score:6.2f} {status}"
+        f"SENT={result.bytes_sent:7d} READ={result.bytes_received:7d} "
+        f"CLR={result.bytes_drained_before:7d} "
+        f"SCORE={result.score:6.2f} {status}"
     )
 
 
@@ -1358,7 +1377,7 @@ def format_scan_eta(
     if completed <= 0:
         return (
             f"SCAN TIME {completed:04d}/{total:04d}: "
-            f"elapsed={format_duration(elapsed)} left=unknown finish=unknown"
+            f"ELAPSED={format_duration(elapsed)} LEFT=? FINISH=?"
         )
 
     average = elapsed / completed
@@ -1366,10 +1385,10 @@ def format_scan_eta(
     finish = format_finish_clock(remaining_seconds, clock_now)
     return (
         f"SCAN TIME {completed:04d}/{total:04d}: "
-        f"elapsed={format_duration(elapsed)} "
-        f"avg={format_duration(average)}/set "
-        f"left={format_duration(remaining_seconds)} "
-        f"finish={finish}"
+        f"ELAPSED={format_duration(elapsed)} "
+        f"AVG={format_duration(average)}/SET "
+        f"LEFT={format_duration(remaining_seconds)} "
+        f"FINISH={finish}"
     )
 
 
@@ -1381,7 +1400,7 @@ def print_ranked_table(results: Sequence[CandidateResult], top: int) -> None:
     print("TOP OBSERVED RESULTS")
     print(border_line(REPORT_WIDTH))
     print(
-        "Rank  Score  Baud    Mode   Flow      Sent     Recv  Cleared   Exact   Lines   Print   Status"
+        "RK SCORE   BAUD MODE FLOW       SENT   READ  CLR  EXCT LINE RESULT"
     )
     print(border_line(REPORT_WIDTH))
     for rank, result in enumerate(ranked, start=1):
@@ -1390,19 +1409,19 @@ def print_ranked_table(results: Sequence[CandidateResult], top: int) -> None:
             f"{result.settings.parity_code()}"
             f"{result.settings.stop_bits}"
         )
+        indicator = result_indicator(result.score, result.status, result.error)
         print(
-            f"{rank:>4}  "
-            f"{result.score:>5.1f}  "
-            f"{result.settings.baud:>6}  "
-            f"{mode:<5}  "
-            f"{result.settings.flow_control:<8}  "
-            f"{result.bytes_sent:>7}  "
-            f"{result.bytes_received:>7}  "
-            f"{result.bytes_drained_before:>7}  "
-            f"{result.metrics.exact_byte_match_ratio:>6.3f}  "
-            f"{result.metrics.line_integrity_ratio:>6.3f}  "
-            f"{result.metrics.printable_ascii_ratio:>6.3f}  "
-            f"{result.status}"
+            f"{rank:>2} "
+            f"{result.score:>5.1f} "
+            f"{result.settings.baud:>6} "
+            f"{mode:<4} "
+            f"{result.settings.flow_control.upper():<8} "
+            f"{result.bytes_sent:>6} "
+            f"{result.bytes_received:>6} "
+            f"{result.bytes_drained_before:>4} "
+            f"{result.metrics.exact_byte_match_ratio:>4.2f} "
+            f"{result.metrics.line_integrity_ratio:>4.2f} "
+            f"{indicator}"
         )
     print(border_line(REPORT_WIDTH))
 
@@ -1472,58 +1491,58 @@ def scan_recommendation_status(results: Sequence[CandidateResult]) -> str:
 def confidence_summary(result: CandidateResult | None, tied_count: int = 0) -> str:
     """Return a short interpretation of the best result."""
     if result is None:
-        return "No candidates were tested."
+        return "NO SETTINGS TESTED."
     if result.status == "stale-output":
-        return "No match yet; output was already streaming stale data before probes."
+        return "NO MATCH. OUTPUT WAS NOT QUIET BEFORE TEST."
     if result.error:
-        return "No confident match; the best-ranked setting ended with an error."
+        return "NO MATCH. BEST ROW ENDED WITH ERROR."
     if tied_count > 1:
-        return "Multiple top settings are tied; review the tied settings before choosing switches."
+        return "MULTIPLE TOP SETTINGS. REVIEW BEFORE SETTING SWITCHES."
     if is_recommendable_result(result) and result.score >= 99.0 and result.repeatability >= 1.0:
-        return "Likely correct; repeated tests were near-perfect."
+        return "LIKELY CORRECT."
     if is_recommendable_result(result):
-        return "Strong match; verify cabling/device behavior and review the report."
+        return "STRONG MATCH. VERIFY BEFORE SETTING SWITCHES."
     if result.score >= 50.0:
-        return "Partial match only; settings may be close, but not reliable."
-    return "No confident match; inspect wiring, ports, flow control, and device backlog."
+        return "PARTIAL MATCH ONLY. NOT RELIABLE."
+    return "NO CONFIDENT MATCH. CHECK CABLES, PORTS, FLOW CONTROL."
 
 
 def print_result_details(result: CandidateResult) -> None:
     """Print switch-setting and score details for one scan result."""
-    print(f"    Baud rate:          {result.settings.baud}")
-    print(f"    Data bits:          {result.settings.data_bits}")
+    print(f"    BAUD RATE:          {result.settings.baud}")
+    print(f"    DATA BITS:          {result.settings.data_bits}")
     print(
-        f"    Parity:             "
+        f"    PARITY:             "
         f"{parity_name(result.settings.parity)} ({result.settings.parity_code()})"
     )
-    print(f"    Stop bits:          {result.settings.stop_bits}")
-    print(f"    Flow control:       {flow_control_name(result.settings.flow_control)}")
-    print(f"    Compact setting:    {result.settings.label()}")
+    print(f"    STOP BITS:          {result.settings.stop_bits}")
+    print(f"    FLOW CONTROL:       {flow_control_name(result.settings.flow_control)}")
+    print(f"    SETTING:            {result.settings.label()}")
     print(
-        f"    Indicator:          "
+        f"    RESULT:             "
         f"{result_indicator(result.score, result.status, result.error)}"
     )
-    print(f"    Score:              {result.score:.2f}/100")
-    print(f"    Repeatability:      {result.repeatability:.3f}")
-    print(f"    Bytes sent/read:    {result.bytes_sent}/{result.bytes_received}")
-    print(f"    Old bytes cleared:  {result.bytes_drained_before}")
-    print(f"    Exact byte ratio:   {result.metrics.exact_byte_match_ratio:.3f}")
-    print(f"    Line integrity:     {result.metrics.line_integrity_ratio:.3f}")
-    print(f"    Printable ASCII:    {result.metrics.printable_ascii_ratio:.3f}")
-    print(f"    Missing/extra:      {result.metrics.missing_bytes}/{result.metrics.extra_bytes}")
+    print(f"    SCORE:              {result.score:.2f}/100")
+    print(f"    REPEAT:             {result.repeatability:.3f}")
+    print(f"    SENT/READ:          {result.bytes_sent}/{result.bytes_received}")
+    print(f"    OLD BYTES CLEAR:    {result.bytes_drained_before}")
+    print(f"    EXACT RATIO:        {result.metrics.exact_byte_match_ratio:.3f}")
+    print(f"    LINE RATIO:         {result.metrics.line_integrity_ratio:.3f}")
+    print(f"    ASCII RATIO:        {result.metrics.printable_ascii_ratio:.3f}")
+    print(f"    MISSING/EXTRA:      {result.metrics.missing_bytes}/{result.metrics.extra_bytes}")
     if result.status == "stale-output":
-        print("    Note:               COM5 never went quiet before this probe.")
+        print("    NOTE:               OUTPUT NEVER WENT QUIET.")
         if result.error:
-            print(f"    Detail:             {result.error}")
+            print(f"    DETAIL:             {result.error}")
     elif result.error:
-        print(f"    Error:              {result.error}")
+        print(f"    ERROR:              {result.error}")
     elif result.metrics.extra_bytes > result.bytes_sent:
-        print("    Note:               output had substantial extra bytes/backlog.")
+        print("    NOTE:               EXTRA OUTPUT/BACKLOG PRESENT.")
 
 
 def print_tied_results(results: Sequence[CandidateResult]) -> None:
     """Print a compact table of tied top candidate settings."""
-    print("    Rank  Score   Setting")
+    print("    RK   SCORE   SETTING")
     for rank, result in enumerate(results, start=1):
         print(f"    {rank:>4}  {result.score:>5.1f}   {result.settings.label()}")
 
@@ -1534,10 +1553,10 @@ def ask_continue_after_top_match(result: CandidateResult) -> bool:
     print(border_line(REPORT_WIDTH))
     print(bordered_text("TOP MATCH FOUND", REPORT_WIDTH))
     print(border_line(REPORT_WIDTH))
-    print(f"    Setting:            {result.settings.label()}")
-    print(f"    Score:              {result.score:.2f}/100")
-    print("    The scan can continue to look for tied settings.")
-    print("    Answer N to end the scan now and write the report.")
+    print(f"    SETTING:            {result.settings.label()}")
+    print(f"    SCORE:              {result.score:.2f}/100")
+    print("    CONTINUE TO LOOK FOR POSSIBLE TIES.")
+    print("    ENTER N TO END NOW AND WRITE REPORT.")
     print(border_line(REPORT_WIDTH))
     return prompt_yes_no("CONTINUE SCAN", True)
 
@@ -1545,21 +1564,21 @@ def ask_continue_after_top_match(result: CandidateResult) -> bool:
 def parity_name(parity: str) -> str:
     """Return a clear parity label for reports."""
     return {
-        "none": "none",
-        "even": "even",
-        "odd": "odd",
-        "mark": "mark",
-        "space": "space",
+        "none": "NONE",
+        "even": "EVEN",
+        "odd": "ODD",
+        "mark": "MARK",
+        "space": "SPACE",
     }[parity]
 
 
 def flow_control_name(flow_control: str) -> str:
     """Return a clear flow-control label for reports."""
     return {
-        "none": "none",
-        "xon/xoff": "XON/XOFF software",
-        "rts/cts": "RTS/CTS hardware",
-        "dsr/dtr": "DSR/DTR hardware",
+        "none": "NONE",
+        "xon/xoff": "XON/XOFF",
+        "rts/cts": "RTS/CTS",
+        "dsr/dtr": "DSR/DTR",
     }[flow_control]
 
 
@@ -1581,21 +1600,21 @@ def print_scan_summary(
 
     print()
     print_report_title("SCAN SUMMARY")
-    print(f"  Duration:             {format_duration(elapsed_sec)}")
-    print(f"  Settings tested:      {len(results)}/{total_candidates}")
-    print(f"  Stopped early:        {'yes' if early_stopped else 'no'}")
+    print(f"  RUN TIME:             {format_duration(elapsed_sec)}")
+    print(f"  SETTINGS TESTED:      {len(results)}/{total_candidates}")
+    print(f"  ENDED EARLY:          {'YES' if early_stopped else 'NO'}")
     print(
-        "  Result counts:        "
+        "  RESULT COUNTS:        "
         + ", ".join(
             f"{name}={counts.get(name, 0)}"
             for name in ("PASS", "GOOD", "PARTIAL", "FAIL", "STALE", "ERROR")
         )
     )
-    print(f"  Top table rows:       {min(top, len(ranked))}")
-    print(f"  Interpretation:       {confidence_summary(best, len(tied))}")
+    print(f"  TOP ROWS:             {min(top, len(ranked))}")
+    print(f"  FINDING:              {confidence_summary(best, len(tied))}")
     if early_stopped:
-        print("  Early stop note:      Operator ended scan after a top match.")
-        print("                         Later settings were not tested for possible ties.")
+        print("  NOTE:                 OPERATOR ENDED AFTER TOP MATCH.")
+        print("                        LATER SETTINGS WERE NOT TESTED FOR TIES.")
 
     if best is None:
         return
@@ -1606,11 +1625,11 @@ def print_scan_summary(
         print(bordered_text("MULTIPLE TOP SETTINGS FOUND", REPORT_WIDTH))
         print(border_line(REPORT_WIDTH))
         print(
-            "    More than one setting matched within "
-            f"{TIE_SCORE_TOLERANCE:.1f} score points."
+            "    MORE THAN ONE SETTING MATCHED WITHIN "
+            f"{TIE_SCORE_TOLERANCE:.1f} SCORE POINTS."
         )
-        print("    Do not treat the first row as the only possible switch setting.")
-        print("    Try a larger test message or repeat these tied settings.")
+        print("    DO NOT TREAT ROW 1 AS THE ONLY POSSIBLE SWITCH SETTING.")
+        print("    USE A LARGER TEST MESSAGE OR REPEAT THESE SETTINGS.")
         print()
         print_tied_results(tied[:top])
         print(border_line(REPORT_WIDTH))
@@ -1621,24 +1640,24 @@ def print_scan_summary(
         print(border_line(REPORT_WIDTH))
         print_result_details(best)
         if early_stopped:
-            print("    Note:               Scan ended by operator after this top match.")
-            print("                        Possible later ties were not tested.")
+            print("    NOTE:               OPERATOR ENDED AFTER THIS TOP MATCH.")
+            print("                        POSSIBLE LATER TIES WERE NOT TESTED.")
         print(border_line(REPORT_WIDTH))
         return
 
     if has_any_signal(results):
         print(bordered_text("NO RELIABLE SETTING FOUND", REPORT_WIDTH))
         print(border_line(REPORT_WIDTH))
-        print("    The best row was only a partial result.")
-        print("    Do not use it as the printer-buffer switch setting yet.")
-        print("    Reset/clear the buffer, check cabling and flow control, then run again.")
+        print("    BEST ROW WAS ONLY A PARTIAL RESULT.")
+        print("    DO NOT USE IT AS THE BUFFER SWITCH SETTING YET.")
+        print("    RESET/CLEAR BUFFER, CHECK CABLES AND FLOW CONTROL, RUN AGAIN.")
     else:
         print(bordered_text("NO WORKING SETTING FOUND", REPORT_WIDTH))
         print(border_line(REPORT_WIDTH))
-        print("    The current printer-buffer switch setup did not pass any serial test.")
-        print("    Do not use the top row as a switch recommendation.")
-        print("    This can happen with an unused switch combination, disabled port,")
-        print("    held output, wrong cable, wrong COM port, or flow-control hold.")
+        print("    CURRENT BUFFER SWITCH SETUP DID NOT PASS ANY TEST.")
+        print("    DO NOT USE TOP ROW AS A SWITCH RECOMMENDATION.")
+        print("    POSSIBLE CAUSES: UNUSED SWITCH POSITION, DISABLED PORT,")
+        print("    HELD OUTPUT, WRONG CABLE, WRONG COM PORT, FLOW-CONTROL HOLD.")
 
     print()
     print(border_line(REPORT_WIDTH))
@@ -1687,23 +1706,23 @@ def validate_options(options: ScanOptions) -> None:
     """Validate scan options before launching hardware I/O."""
     ensure_distinct_ports(options.in_port, options.out_port)
     if options.payload_bytes < minimum_payload_size():
-        raise ValueError(f"test message size must be at least {minimum_payload_size()} bytes")
+        raise ValueError(f"TEST MESSAGE SIZE MUST BE AT LEAST {minimum_payload_size()} BYTES")
     if options.read_timeout <= 0:
-        raise ValueError("wait-after-sending time must be positive")
+        raise ValueError("READ WAIT MUST BE POSITIVE")
     if options.settle_ms < 0:
-        raise ValueError("pause-after-opening time cannot be negative")
+        raise ValueError("OPEN PAUSE CANNOT BE NEGATIVE")
     if options.top <= 0:
-        raise ValueError("top result count must be positive")
+        raise ValueError("TOP ROW COUNT MUST BE POSITIVE")
     if options.bursts <= 0:
-        raise ValueError("tests per setting must be positive")
+        raise ValueError("TEST COUNT MUST BE POSITIVE")
     if options.progress_interval <= 0:
-        raise ValueError("progress interval must be positive")
+        raise ValueError("SCREEN UPDATE INTERVAL MUST BE POSITIVE")
     if options.pre_drain_timeout < 0:
-        raise ValueError("old-output clearing time cannot be negative")
+        raise ValueError("CLEAR OUTPUT TIME CANNOT BE NEGATIVE")
     if options.pre_drain_quiet <= 0:
-        raise ValueError("old-output quiet time must be positive")
+        raise ValueError("QUIET TIME MUST BE POSITIVE")
     if options.max_drain_bytes <= 0:
-        raise ValueError("max drain bytes must be positive")
+        raise ValueError("MAX CLEAR BYTES MUST BE POSITIVE")
     available_bauds(options.min_baud, options.max_baud)
 
 
@@ -1730,7 +1749,7 @@ def estimate_scan_overhead_seconds(options: ScanOptions) -> float:
 def prompt_text(label: str, current: str) -> str:
     """Prompt for a string value, preserving current on blank input."""
     try:
-        value = input(f"{label} [{current}]: ").strip()
+        value = input(f"{label.upper()} [{current}]: ").strip()
     except EOFError:
         return current
     return current if value == "" else value
@@ -1740,7 +1759,7 @@ def prompt_int(label: str, current: int, minimum: int | None = None) -> int:
     """Prompt for an integer value, preserving current on blank input."""
     while True:
         try:
-            value = input(f"{label} [{current}]: ").strip()
+            value = input(f"{label.upper()} [{current}]: ").strip()
         except EOFError:
             return current
         if value == "":
@@ -1748,10 +1767,10 @@ def prompt_int(label: str, current: int, minimum: int | None = None) -> int:
         try:
             parsed = int(value)
         except ValueError:
-            print("Enter a whole number.")
+            print("ENTER A WHOLE NUMBER.")
             continue
         if minimum is not None and parsed < minimum:
-            print(f"Enter a value >= {minimum}.")
+            print(f"ENTER A VALUE >= {minimum}.")
             continue
         return parsed
 
@@ -1760,7 +1779,7 @@ def prompt_float(label: str, current: float, minimum: float | None = None) -> fl
     """Prompt for a float value, preserving current on blank input."""
     while True:
         try:
-            value = input(f"{label} [{current}]: ").strip()
+            value = input(f"{label.upper()} [{current}]: ").strip()
         except EOFError:
             return current
         if value == "":
@@ -1768,10 +1787,10 @@ def prompt_float(label: str, current: float, minimum: float | None = None) -> fl
         try:
             parsed = float(value)
         except ValueError:
-            print("Enter a number.")
+            print("ENTER A NUMBER.")
             continue
         if minimum is not None and parsed < minimum:
-            print(f"Enter a value >= {minimum}.")
+            print(f"ENTER A VALUE >= {minimum}.")
             continue
         return parsed
 
@@ -1779,7 +1798,7 @@ def prompt_float(label: str, current: float, minimum: float | None = None) -> fl
 def prompt_path(label: str, current: Path) -> Path:
     """Prompt for a filesystem path, preserving current on blank input."""
     try:
-        value = input(f"{label} [{current}]: ").strip()
+        value = input(f"{label.upper()} [{current}]: ").strip()
     except EOFError:
         return current
     return current if value == "" else Path(value)
@@ -1790,7 +1809,7 @@ def prompt_yes_no(label: str, current: bool) -> bool:
     default = "Y" if current else "N"
     while True:
         try:
-            value = input(f"{label} [{default}]: ").strip().lower()
+            value = input(f"{label.upper()} [{default}]: ").strip().lower()
         except EOFError:
             return current
         if value == "":
@@ -1799,39 +1818,44 @@ def prompt_yes_no(label: str, current: bool) -> bool:
             return True
         if value in {"n", "no"}:
             return False
-        print("Enter y or n.")
+        print("ENTER Y OR N.")
 
 
 def print_menu_help() -> None:
     """Print short help for the interactive CLI."""
     print_banner()
-    print("START: python serial_probe.py")
+    print("START: PYTHON SERIAL_PROBE.PY")
     print()
     print("HELP")
     print()
-    print("Purpose:")
-    print("  Find the likely serial switch settings for a printer buffer.")
+    print("PURPOSE")
+    print("  FIND SERIAL SWITCH SETTINGS FOR A PRINTER BUFFER.")
     print()
-    print("How it works:")
-    print("  The program sends a known test message into the input port.")
-    print("  It reads what comes out of the output port.")
-    print("  It tries every selected serial setting.")
-    print("  It ranks the settings by how cleanly the message came through.")
-    print("  After the scan, use 11 MEMORY TEST to check 16K, 32K, or 64K transfers.")
+    print("METHOD")
+    print("  SEND KNOWN ASCII TEXT TO INPUT PORT.")
+    print("  READ OUTPUT PORT.")
+    print("  TEST EACH SELECTED SERIAL SETTING.")
+    print("  RANK BY MATCH QUALITY.")
+    print("  USE 11 MEMORY TEST AFTER A GOOD SETTING IS FOUND.")
     print()
     print("OPERATOR NOTES:")
-    print("  Test message size: how much known text is sent for each setting.")
-    print("  Tests per setting: how many times that setting is tried.")
-    print("  Ask on top match: pause after a PASS and ask whether to continue.")
-    print("  Clear old output: discard old buffer data before sending a new test.")
-    print("  Max clear: default is 32768 bytes, enough for a 16K buffer plus margin.")
-    print("  Top matches: the best-scoring settings shown at the end.")
-    print("  Memory test: command 11, using the setting recommended by the scan report.")
+    print("  TEST SIZE:       BYTES SENT FOR EACH SETTING.")
+    print("  TEST COUNT:      NUMBER OF TRIES PER SETTING.")
+    print("  ASK ON MATCH:    PAUSE AFTER PASS; ASK CONTINUE.")
+    print("  CLEAR OUTPUT:    DISCARD OLD BUFFER DATA FIRST.")
+    print("  MAX CLEAR:       DEFAULT 32768 BYTES.")
+    print("  TOP ROWS:        BEST RESULTS SHOWN AT END.")
+    print("  MEMORY TEST:     COMMAND 11 AFTER SCAN.")
 
 
 def print_setting(label: str, value: object) -> None:
     """Print one aligned current-settings row."""
-    print(f"  {label:<20} {value}")
+    prefix = f"  {label.upper():<20} "
+    width = max(20, 80 - len(prefix))
+    wrapped = textwrap.wrap(str(value), width=width, break_long_words=True) or [""]
+    print(prefix + wrapped[0])
+    for line in wrapped[1:]:
+        print(" " * len(prefix) + line)
 
 
 def print_configuration(options: ScanOptions) -> None:
@@ -1853,67 +1877,67 @@ def print_configuration(options: ScanOptions) -> None:
     print()
     print_banner()
     print("CURRENT SETTINGS")
-    print_setting("Ports:", f"{options.in_port} -> {options.out_port}")
-    print_setting("Baud range:", f"{options.min_baud}..{options.max_baud}")
-    print_setting("Settings to test:", len(candidates))
+    print_setting("PORTS:", f"{options.in_port} -> {options.out_port}")
+    print_setting("BAUD RANGE:", f"{options.min_baud}..{options.max_baud}")
+    print_setting("SETTINGS:", len(candidates))
     if baud_order:
-        print_setting("Baud test order:", f"{baud_order[0]} down to {baud_order[-1]}")
+        print_setting("BAUD ORDER:", f"{baud_order[0]} DOWN TO {baud_order[-1]}")
     if range_error:
-        print_setting("Range problem:", range_error)
+        print_setting("RANGE ERROR:", range_error)
     print_setting(
-        "Why that many:",
-        f"{len(bauds)} baud x "
-        f"{len(DATA_BITS)} data x {len(PARITIES)} parity x "
-        f"{len(STOP_BITS)} stop x {len(FLOW_CONTROLS)} flow",
+        "COUNT FORMULA:",
+        f"{len(bauds)} BAUD X "
+        f"{len(DATA_BITS)} DATA X {len(PARITIES)} PARITY X "
+        f"{len(STOP_BITS)} STOP X {len(FLOW_CONTROLS)} FLOW",
     )
-    print_setting("Test message size:", f"{options.payload_bytes} bytes")
-    print_setting("Tests per setting:", options.bursts)
-    print_setting("Ask on top match:", "yes" if options.ask_on_top_match else "no")
-    print_setting("Wait after sending:", f"{options.read_timeout:.2f}s")
-    print_setting("Pause after opening:", f"{options.settle_ms} ms")
+    print_setting("TEST BYTES:", f"{options.payload_bytes} BYTES")
+    print_setting("TEST COUNT:", options.bursts)
+    print_setting("ASK ON MATCH:", "YES" if options.ask_on_top_match else "NO")
+    print_setting("READ WAIT:", f"{options.read_timeout:.2f}S")
+    print_setting("OPEN PAUSE:", f"{options.settle_ms} MS")
     print_setting(
-        "Clear old output:",
+        "CLEAR OUTPUT:",
         (
-            "no"
+            "NO"
             if options.no_pre_drain
             else (
-                f"yes, quiet={options.pre_drain_quiet:.2f}s, "
-                f"give up after={options.pre_drain_timeout:.2f}s, "
-                f"max clear={options.max_drain_bytes} bytes"
+                f"YES, QUIET={options.pre_drain_quiet:.2f}S, "
+                f"LIMIT={options.pre_drain_timeout:.2f}S, "
+                f"MAX={options.max_drain_bytes} BYTES"
             )
         )
     )
-    print_setting("Top matches shown:", options.top)
-    print_setting("Memory test:", "use 11 after scan; enter the recommended switch setting")
-    print_setting("Detailed report:", options.json_report)
-    print_setting("Spreadsheet report:", options.csv_report)
-    print_setting("Diagnostic log:", options.log_file)
-    print_setting("Time sending data:", format_duration(wire))
-    print_setting("Time waiting:", f"{format_duration(overhead)} if output is quiet")
-    print_setting("Estimated total:", format_duration(wire + overhead))
+    print_setting("TOP ROWS:", options.top)
+    print_setting("MEMORY TEST:", "USE 11 AFTER SCAN")
+    print_setting("JSON FILE:", options.json_report)
+    print_setting("CSV FILE:", options.csv_report)
+    print_setting("LOG FILE:", options.log_file)
+    print_setting("SEND TIME:", format_duration(wire).upper())
+    print_setting("WAIT TIME:", f"{format_duration(overhead).upper()} IF QUIET")
+    print_setting("TOTAL EST.:", format_duration(wire + overhead).upper())
 
 
 def configure_baud_range(options: ScanOptions) -> ScanOptions:
     """Prompt for the baud range."""
-    print("Available baud rates:")
+    print("AVAILABLE BAUD RATES:")
     print(", ".join(str(baud) for baud in BAUD_RATES))
-    print("Scan order: fastest selected baud first, then downward.")
-    min_baud = prompt_int("Minimum baud", options.min_baud)
-    max_baud = prompt_int("Maximum baud", options.max_baud)
+    print("SCAN ORDER: FASTEST SELECTED BAUD FIRST.")
+    min_baud = prompt_int("MINIMUM BAUD", options.min_baud)
+    max_baud = prompt_int("MAXIMUM BAUD", options.max_baud)
     return dataclasses.replace(options, min_baud=min_baud, max_baud=max_baud)
 
 
 def configure_payload(options: ScanOptions) -> ScanOptions:
     """Prompt for payload and burst settings."""
-    print(f"Smallest allowed test message is {minimum_payload_size()} bytes.")
+    print(f"MINIMUM TEST MESSAGE IS {minimum_payload_size()} BYTES.")
     payload_bytes = prompt_int(
-        "Test message size in bytes",
+        "TEST MESSAGE SIZE IN BYTES",
         options.payload_bytes,
         minimum=minimum_payload_size(),
     )
-    bursts = prompt_int("Number of tests per setting", options.bursts, minimum=1)
+    bursts = prompt_int("NUMBER OF TESTS PER SETTING", options.bursts, minimum=1)
     ask_on_top_match = prompt_yes_no(
-        "Ask whether to continue after a top match",
+        "ASK WHETHER TO CONTINUE AFTER TOP MATCH",
         options.ask_on_top_match,
     )
     return dataclasses.replace(
@@ -1926,9 +1950,9 @@ def configure_payload(options: ScanOptions) -> ScanOptions:
 
 def configure_timing(options: ScanOptions) -> ScanOptions:
     """Prompt for timing settings."""
-    read_timeout = prompt_float("How long to wait for output after sending, seconds", options.read_timeout, 0.1)
-    settle_ms = prompt_int("Pause after opening ports, ms", options.settle_ms, 0)
-    progress_interval = prompt_float("Console progress interval, seconds", options.progress_interval, 0.1)
+    read_timeout = prompt_float("OUTPUT WAIT AFTER SEND, SECONDS", options.read_timeout, 0.1)
+    settle_ms = prompt_int("PAUSE AFTER OPENING PORTS, MS", options.settle_ms, 0)
+    progress_interval = prompt_float("SCREEN UPDATE INTERVAL, SECONDS", options.progress_interval, 0.1)
     return dataclasses.replace(
         options,
         read_timeout=read_timeout,
@@ -1939,10 +1963,10 @@ def configure_timing(options: ScanOptions) -> ScanOptions:
 
 def configure_pre_drain(options: ScanOptions) -> ScanOptions:
     """Prompt for stale-output drain settings."""
-    enabled = prompt_yes_no("Clear old output before each test", not options.no_pre_drain)
-    pre_drain_quiet = prompt_float("How long output must stay quiet before sending, seconds", options.pre_drain_quiet, 0.05)
-    pre_drain_timeout = prompt_float("How long to try clearing old output, seconds", options.pre_drain_timeout, 0.0)
-    max_drain_bytes = prompt_int("Most old bytes to clear before marking STALE", options.max_drain_bytes, 1)
+    enabled = prompt_yes_no("CLEAR OLD OUTPUT BEFORE EACH TEST", not options.no_pre_drain)
+    pre_drain_quiet = prompt_float("QUIET TIME BEFORE SEND, SECONDS", options.pre_drain_quiet, 0.05)
+    pre_drain_timeout = prompt_float("TIME LIMIT FOR CLEARING OLD OUTPUT, SECONDS", options.pre_drain_timeout, 0.0)
+    max_drain_bytes = prompt_int("MAX OLD BYTES TO CLEAR BEFORE STALE", options.max_drain_bytes, 1)
     return dataclasses.replace(
         options,
         no_pre_drain=not enabled,
@@ -1954,10 +1978,10 @@ def configure_pre_drain(options: ScanOptions) -> ScanOptions:
 
 def configure_reports(options: ScanOptions) -> ScanOptions:
     """Prompt for result and report settings."""
-    top = prompt_int("Number of top matches to show", options.top, 1)
-    json_report = prompt_path("Detailed report file", options.json_report)
-    csv_report = prompt_path("Spreadsheet report file", options.csv_report)
-    log_file = prompt_path("Diagnostic log file", options.log_file)
+    top = prompt_int("NUMBER OF TOP ROWS TO SHOW", options.top, 1)
+    json_report = prompt_path("JSON REPORT FILE", options.json_report)
+    csv_report = prompt_path("CSV REPORT FILE", options.csv_report)
+    log_file = prompt_path("LOG FILE", options.log_file)
     return dataclasses.replace(
         options,
         top=top,
@@ -1983,35 +2007,35 @@ def prompt_parity(current: str) -> str:
     }
     while True:
         try:
-            value = input(f"Parity N/E/O/M/S [{current[0].upper()}]: ").strip().lower()
+            value = input(f"PARITY N/E/O/M/S [{current[0].upper()}]: ").strip().lower()
         except EOFError:
             return current
         if value == "":
             return current
         if value in choices:
             return choices[value]
-        print("Enter N, E, O, M, or S.")
+        print("ENTER N, E, O, M, OR S.")
 
 
 def prompt_flow_control(current: str) -> str:
     """Prompt for a flow-control mode."""
     flow_options = ["none", "xon/xoff", "rts/cts", "dsr/dtr"]
-    print("Flow control:")
-    print("  1. none")
-    print("  2. XON/XOFF software")
-    print("  3. RTS/CTS hardware")
-    print("  4. DSR/DTR hardware")
+    print("FLOW CONTROL")
+    print("  1. NONE")
+    print("  2. XON/XOFF")
+    print("  3. RTS/CTS")
+    print("  4. DSR/DTR")
     current_index = flow_options.index(current) + 1
     while True:
         try:
-            choice = input(f"Select flow control [{current_index}]: ").strip()
+            choice = input(f"SELECT FLOW CONTROL [{current_index}]: ").strip()
         except EOFError:
             return current
         if choice == "":
             return current
         if choice in {"1", "2", "3", "4"}:
             return flow_options[int(choice) - 1]
-        print("Enter 1, 2, 3, or 4.")
+        print("ENTER 1, 2, 3, OR 4.")
 
 
 def prompt_serial_setting(default: SerialSettings) -> SerialSettings:
@@ -2019,20 +2043,20 @@ def prompt_serial_setting(default: SerialSettings) -> SerialSettings:
     print()
     print_banner()
     print("MEMORY TEST SERIAL SETTING")
-    print("Enter the setting recommended by the scan report.")
-    baud = prompt_int("Baud rate", default.baud, 1)
+    print("ENTER SETTING FROM SCAN REPORT.")
+    baud = prompt_int("BAUD RATE", default.baud, 1)
     while baud not in BAUD_RATES:
-        print("That baud rate is not in the program baud list.")
-        baud = prompt_int("Baud rate", default.baud, 1)
-    data_bits = prompt_int("Data bits, 7 or 8", default.data_bits, 7)
+        print("BAUD RATE NOT IN PROGRAM LIST.")
+        baud = prompt_int("BAUD RATE", default.baud, 1)
+    data_bits = prompt_int("DATA BITS, 7 OR 8", default.data_bits, 7)
     while data_bits not in DATA_BITS:
-        print("Enter 7 or 8.")
-        data_bits = prompt_int("Data bits, 7 or 8", default.data_bits, 7)
+        print("ENTER 7 OR 8.")
+        data_bits = prompt_int("DATA BITS, 7 OR 8", default.data_bits, 7)
     parity = prompt_parity(default.parity)
-    stop_bits = prompt_int("Stop bits, 1 or 2", default.stop_bits, 1)
+    stop_bits = prompt_int("STOP BITS, 1 OR 2", default.stop_bits, 1)
     while stop_bits not in STOP_BITS:
-        print("Enter 1 or 2.")
-        stop_bits = prompt_int("Stop bits, 1 or 2", default.stop_bits, 1)
+        print("ENTER 1 OR 2.")
+        stop_bits = prompt_int("STOP BITS, 1 OR 2", default.stop_bits, 1)
     flow_control = prompt_flow_control(default.flow_control)
     return SerialSettings(baud, data_bits, parity, stop_bits, flow_control)
 
@@ -2042,10 +2066,10 @@ def prompt_memory_sizes() -> list[int]:
     print()
     print_banner()
     print("MEMORY TEST SIZE")
-    print("  1. 16K quick test")
+    print("  1. 16K QUICK TEST")
     print("  2. 16K, 32K, 64K")
-    print("  3. 4K through 64K")
-    print("  4. Custom maximum, in K")
+    print("  3. 4K THROUGH 64K")
+    print("  4. CUSTOM MAXIMUM, IN K")
     while True:
         try:
             choice = input("ENTER SELECTION [2]: ").strip()
@@ -2070,9 +2094,9 @@ def prompt_memory_sizes() -> list[int]:
                 64 * 1024,
             ]
         if choice == "4":
-            max_k = prompt_int("Maximum size in K", 64, 1)
+            max_k = prompt_int("MAXIMUM SIZE IN K", 64, 1)
             return [size_k * 1024 for size_k in range(4, max_k + 1, 4)]
-        print("Enter 1, 2, 3, or 4.")
+        print("ENTER 1, 2, 3, OR 4.")
 
 
 def prompt_memory_method() -> str:
@@ -2080,11 +2104,11 @@ def prompt_memory_method() -> str:
     print()
     print_banner()
     print("MEMORY TEST METHOD")
-    print("  1. Hold output, then release")
-    print("  2. Read while sending")
+    print("  1. HOLD OUTPUT, THEN RELEASE")
+    print("  2. READ WHILE SENDING")
     print()
-    print("Use 1 when the buffer has an OFF LINE, HOLD, or PAUSE control.")
-    print("Use 2 when the buffer cannot be held; it checks clean large transfers.")
+    print("USE 1 WITH OFF LINE, HOLD, OR PAUSE CONTROL.")
+    print("USE 2 WHEN OUTPUT CANNOT BE HELD.")
     while True:
         try:
             choice = input("ENTER SELECTION [1]: ").strip()
@@ -2096,7 +2120,7 @@ def prompt_memory_method() -> str:
             return "hold-release"
         if choice == "2":
             return "live-transfer"
-        print("Enter 1 or 2.")
+        print("ENTER 1 OR 2.")
 
 
 def memory_report_paths() -> tuple[Path, Path, Path]:
@@ -2133,8 +2157,8 @@ def write_payload_only(
     expected = payload.data
     estimated = estimated_transmit_seconds(settings, len(expected))
     console_progress(
-        f"{prefix}: sending {len(expected)} bytes "
-        f"(chunk={chunk_size}, about {format_duration(estimated)} to send)"
+        f"{prefix}: SEND {len(expected)} BYTES "
+        f"(CHUNK={chunk_size}, ABOUT {format_duration(estimated)})"
     )
     try:
         next_progress_at = time.monotonic() + max(progress_interval, 0.1)
@@ -2150,7 +2174,7 @@ def write_payload_only(
             if now >= next_progress_at:
                 percent = (bytes_sent / len(expected)) * 100.0
                 console_progress(
-                    f"{prefix}: writing {bytes_sent}/{len(expected)} bytes "
+                    f"{prefix}: WRITING {bytes_sent}/{len(expected)} BYTES "
                     f"({percent:5.1f}%)"
                 )
                 next_progress_at = now + max(progress_interval, 0.1)
@@ -2181,9 +2205,7 @@ def read_until_quiet(
     deadline = started + max_seconds
     next_progress_at = time.monotonic() + max(progress_interval, 0.1)
     error: str | None = None
-    console_progress(
-        f"{prefix}: reading output until quiet for {read_timeout:.1f}s"
-    )
+    console_progress(f"{prefix}: READ OUTPUT UNTIL QUIET FOR {read_timeout:.1f}S")
     while True:
         try:
             waiting = getattr(out_serial, "in_waiting", 0)
@@ -2204,15 +2226,15 @@ def read_until_quiet(
         if now >= next_progress_at:
             silence = max(0.0, now - last_data_time)
             console_progress(
-                f"{prefix}: reading received={len(received)} bytes, "
-                f"quiet={silence:.1f}/{read_timeout:.1f}s"
+                f"{prefix}: READING RECEIVED={len(received)} BYTES, "
+                f"QUIET={silence:.1f}/{read_timeout:.1f}S"
             )
             next_progress_at = now + max(progress_interval, 0.1)
 
         if now >= deadline:
             error = (
-                "read stopped before output went quiet "
-                f"after {format_duration(max_seconds)}"
+                "READ STOPPED BEFORE OUTPUT QUIET "
+                f"AFTER {format_duration(max_seconds)}"
             )
             logger.debug("%s", error)
             break
@@ -2233,14 +2255,14 @@ def run_memory_hold_release_test(
     payload = generate_payload(size_bytes)
     started = time.monotonic()
     prefix = f"[MEM {index:02d}/{total:02d} {settings.label()} {byte_size_label(size_bytes)}]"
-    console_progress(border_line(78))
+    console_progress(border_line(PROGRESS_WIDTH))
     console_progress(
         bordered_text(
             f"MEMORY TEST: {byte_size_label(size_bytes)} ({index}/{total})",
-            78,
+            PROGRESS_WIDTH,
         )
     )
-    console_progress(border_line(78))
+    console_progress(border_line(PROGRESS_WIDTH))
     try:
         with open_serial_port(
             serial_module,
@@ -2273,8 +2295,8 @@ def run_memory_hold_release_test(
                     if not drain.quiet:
                         empty_score = score_received(payload.data, b"")
                         error = (
-                            "output did not go quiet before memory test "
-                            f"(reason={drain.reason}, cleared={drain.bytes_drained})"
+                            "OUTPUT DID NOT GO QUIET BEFORE MEMORY TEST "
+                            f"(REASON={drain.reason.upper()}, CLEARED={drain.bytes_drained})"
                         )
                         if drain.error:
                             error = f"{error}: {drain.error}"
@@ -2310,7 +2332,7 @@ def run_memory_hold_release_test(
                 bytes_seen_before_release = int(getattr(out_serial, "in_waiting", 0))
                 if bytes_seen_before_release:
                     console_progress(
-                        f"{prefix}: {bytes_seen_before_release} bytes arrived before release"
+                        f"{prefix}: {bytes_seen_before_release} BYTES ARRIVED BEFORE RELEASE"
                     )
                 wait_for_operator(
                     "RELEASE BUFFER OUTPUT OR PUT IT ON LINE, THEN PRESS ENTER: "
@@ -2364,11 +2386,11 @@ def run_memory_hold_release_test(
         status = "weak"
     indicator = result_indicator(score.score, status, error)
     console_progress(
-        f"{prefix}: RESULT {indicator} score={score.score:.2f} ({status}); "
-        f"sent={bytes_sent}, received={len(received_bytes)}, "
-        f"cleared={drain.bytes_drained}, early={bytes_seen_before_release}, "
-        f"exact={score.metrics.exact_byte_match_ratio:.3f}, "
-        f"lines={score.metrics.line_integrity_ratio:.3f}"
+        f"{prefix}: RESULT {indicator} SCORE={score.score:.2f} ({status.upper()}); "
+        f"SENT={bytes_sent}, RECEIVED={len(received_bytes)}, "
+        f"CLEARED={drain.bytes_drained}, EARLY={bytes_seen_before_release}, "
+        f"EXACT={score.metrics.exact_byte_match_ratio:.3f}, "
+        f"LINES={score.metrics.line_integrity_ratio:.3f}"
     )
     return MemoryTestResult(
         size_bytes=size_bytes,
@@ -2412,14 +2434,14 @@ def run_memory_size_test(
 
     payload = generate_payload(size_bytes)
     started = time.monotonic()
-    console_progress(border_line(78))
+    console_progress(border_line(PROGRESS_WIDTH))
     console_progress(
         bordered_text(
             f"MEMORY TEST: {byte_size_label(size_bytes)} ({index}/{total})",
-            78,
+            PROGRESS_WIDTH,
         )
     )
-    console_progress(border_line(78))
+    console_progress(border_line(PROGRESS_WIDTH))
     try:
         with open_serial_port(
             serial_module,
@@ -2536,43 +2558,43 @@ def print_memory_report(
     print()
     print_report_title("MEMORY TEST REPORT")
     print(border_line(REPORT_WIDTH))
-    print(bordered_text("RECOMMENDED SWITCH SETTING USED", REPORT_WIDTH))
+    print(bordered_text("SERIAL SETTING USED", REPORT_WIDTH))
     print(border_line(REPORT_WIDTH))
-    print(f"    Baud rate:         {settings.baud}")
-    print(f"    Data bits:         {settings.data_bits}")
-    print(f"    Parity:            {parity_name(settings.parity)} ({settings.parity_code()})")
-    print(f"    Stop bits:         {settings.stop_bits}")
-    print(f"    Flow control:      {flow_control_name(settings.flow_control)}")
-    print(f"    Compact setting:   {settings.label()}")
+    print(f"    BAUD RATE:         {settings.baud}")
+    print(f"    DATA BITS:         {settings.data_bits}")
+    print(f"    PARITY:            {parity_name(settings.parity)} ({settings.parity_code()})")
+    print(f"    STOP BITS:         {settings.stop_bits}")
+    print(f"    FLOW CONTROL:      {flow_control_name(settings.flow_control)}")
+    print(f"    SETTING:           {settings.label()}")
     print()
-    print(f"  Result:              {memory_test_interpretation(results)}")
+    print(f"  RESULT:              {memory_test_interpretation(results).upper()}")
     print(border_line(REPORT_WIDTH))
-    print("Size   Method        Result   Score    Sent     Read    Early   Clear   Missing   Extra    Time")
+    print("SIZE  METHOD RESULT SCORE   SENT   READ EARLY CLEAR  MISS EXTRA  TIME")
     print(border_line(REPORT_WIDTH))
     for result in results:
         print(
-            f"{result.size_label:<6} "
-            f"{result.method:<12} "
-            f"{result.indicator:<8} "
-            f"{result.score:>6.1f} "
-            f"{result.bytes_sent:>7} "
-            f"{result.bytes_received:>8} "
-            f"{result.bytes_seen_before_release:>8} "
-            f"{result.bytes_cleared_before:>7} "
-            f"{result.metrics.missing_bytes:>9} "
-            f"{result.metrics.extra_bytes:>7} "
-            f"{format_duration(result.elapsed_sec):>7}"
+            f"{result.size_label:<5} "
+            f"{result.method[:6].upper():<6} "
+            f"{result.indicator:<6} "
+            f"{result.score:>5.1f} "
+            f"{result.bytes_sent:>6} "
+            f"{result.bytes_received:>6} "
+            f"{result.bytes_seen_before_release:>5} "
+            f"{result.bytes_cleared_before:>5} "
+            f"{result.metrics.missing_bytes:>5} "
+            f"{result.metrics.extra_bytes:>5} "
+            f"{format_duration(result.elapsed_sec):>6}"
         )
     print(border_line(REPORT_WIDTH))
     if any(result.method == "live-transfer" for result in results):
-        print("  Note: read-while-sending confirms large clean transfer, not actual RAM size.")
+        print("  NOTE: READ-WHILE-SENDING DOES NOT PROVE RAM SIZE.")
     if any(result.bytes_seen_before_release > 0 for result in results):
-        print("  Note: bytes in EARLY arrived before release; output was not fully held.")
+        print("  NOTE: EARLY BYTES ARRIVED BEFORE RELEASE.")
     print()
     print_report_title("MEMORY TEST FILES")
-    print(f"  Detailed report:    {json_report}")
-    print(f"  Spreadsheet report: {csv_report}")
-    print(f"  Diagnostic log:     {log_file}")
+    print(f"  JSON FILE: {json_report}")
+    print(f"  CSV FILE:  {csv_report}")
+    print(f"  LOG FILE:  {log_file}")
     print(border_line(REPORT_WIDTH))
 
 
@@ -2646,7 +2668,7 @@ def run_memory_test(options: ScanOptions) -> None:
     try:
         ensure_distinct_ports(options.in_port, options.out_port)
     except ValueError as exc:
-        print(f"Settings problem: {exc}")
+        print(f"SETTINGS ERROR: {exc}")
         return
     settings = prompt_serial_setting(SerialSettings(9600, 8, "none", 1, "none"))
     sizes = prompt_memory_sizes()
@@ -2656,14 +2678,14 @@ def run_memory_test(options: ScanOptions) -> None:
     serial_module = import_or_install_pyserial()
     print()
     print_report_title("MEMORY TEST START")
-    print("  This test uses the serial setting you entered from the scan report.")
+    print("  USES SERIAL SETTING ENTERED FROM SCAN REPORT.")
     if method == "hold-release":
-        print("  Hold the buffer output while data is sent, then release it when asked.")
+        print("  HOLD BUFFER OUTPUT WHILE DATA IS SENT; RELEASE WHEN ASKED.")
     else:
-        print("  The program reads while sending. This checks clean transfer size.")
-    print(f"  Test setting:    {settings.label()}")
-    print(f"  Test sizes:      {', '.join(byte_size_label(size) for size in sizes)}")
-    print(f"  Test method:     {method}")
+        print("  READS WHILE SENDING. CHECKS CLEAN TRANSFER SIZE.")
+    print(f"  SETTING:    {settings.label()}")
+    print(f"  SIZES:      {', '.join(byte_size_label(size) for size in sizes)}")
+    print(f"  METHOD:     {method.upper()}")
     print(border_line(REPORT_WIDTH))
     results = [
         run_memory_size_test(
@@ -2709,7 +2731,7 @@ def interactive_menu() -> ScanOptions | None:
             try:
                 validate_options(options)
             except ValueError as exc:
-                print(f"Settings problem: {exc}")
+                print(f"SETTINGS ERROR: {exc}")
                 continue
             return options
         if choice == "2":
@@ -2745,7 +2767,7 @@ def interactive_menu() -> ScanOptions | None:
         elif choice in {"0", "q", "quit", "exit"}:
             return None
         else:
-            print("Enter a number from 0 to 11.")
+            print("ENTER A NUMBER FROM 0 TO 11.")
 
 
 def metadata_for_scan(
@@ -2797,33 +2819,33 @@ def run_scan(options: ScanOptions) -> int:
     logger.info("payload: %s bytes, %s lines", payload.byte_count, payload.line_count)
     logger.info("candidates: %s", len(candidates))
 
-    print("Mode: every selected serial setting will be tested.")
+    print_report_title("SCAN START")
+    print("MODE: TEST ALL SELECTED SERIAL SETTINGS.")
     print(
-        f"Ports: {options.in_port} -> {options.out_port}; "
-        f"test message={payload.byte_count} bytes x {options.bursts} test(s) per setting"
+        f"PORTS: {options.in_port} -> {options.out_port}; "
+        f"TEST={payload.byte_count} BYTES X {options.bursts}"
     )
     if options.no_pre_drain:
         print(
-            f"Old-output clearing: off; old {options.out_port} output will be scored as received data."
+            f"CLEAR OUTPUT: OFF; OLD {options.out_port} DATA WILL BE SCORED."
         )
     else:
         print(
-            f"Old-output clearing: on; {options.out_port} must go quiet for "
-            f"{options.pre_drain_quiet:.1f}s before sending "
-            f"(timeout {options.pre_drain_timeout:.1f}s, "
-            f"max {options.max_drain_bytes} bytes)."
+            f"CLEAR OUTPUT: ON; QUIET={options.pre_drain_quiet:.1f}S "
+            f"LIMIT={options.pre_drain_timeout:.1f}S "
+            f"MAX={options.max_drain_bytes} BYTES."
         )
     if options.ask_on_top_match:
-        print("Top-match prompt: on; a PASS result will ask whether to continue.")
+        print("TOP MATCH PROMPT: ON; PASS ASKS WHETHER TO CONTINUE.")
     else:
-        print("Top-match prompt: off; the scan will not pause after a PASS result.")
-    print(f"Live progress: updates every {options.progress_interval:.1f}s while a candidate is running.")
+        print("TOP MATCH PROMPT: OFF.")
+    print(f"SCREEN UPDATE: {options.progress_interval:.1f}S WHILE SETTING RUNS.")
     print_progress_legend()
-    print(f"Reports: {options.json_report}, {options.csv_report}, {options.log_file}")
+    print(f"REPORTS: {options.json_report}, {options.csv_report}, {options.log_file}")
     rough_total = estimate_scan_wire_seconds(options) + estimate_scan_overhead_seconds(options)
     print(
-        f"Rough starting estimate: {format_duration(rough_total)}; "
-        f"finish about {format_finish_clock(rough_total)}"
+        f"START EST.: {format_duration(rough_total)}; "
+        f"FINISH ABOUT {format_finish_clock(rough_total)}"
     )
 
     results: list[CandidateResult] = []
@@ -2895,9 +2917,9 @@ def run_scan(options: ScanOptions) -> int:
     )
     print()
     print_report_title("REPORT FILES")
-    print(f"  JSON report: {options.json_report}")
-    print(f"  CSV summary: {options.csv_report}")
-    print(f"  Log file:    {options.log_file}")
+    print(f"  JSON FILE: {options.json_report}")
+    print(f"  CSV FILE:  {options.csv_report}")
+    print(f"  LOG FILE:  {options.log_file}")
     print(border_line(REPORT_WIDTH))
     return 0
 
@@ -2906,20 +2928,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Program entry point."""
     enable_terminal_style()
     if sys.version_info < (3, 10):
-        print("Python 3.10 or newer is required.")
+        print("PYTHON 3.10 OR NEWER IS REQUIRED.")
         return 2
     args = list(sys.argv[1:] if argv is None else argv)
     if any(arg in {"-h", "--help", "help"} for arg in args):
         print_menu_help()
         return 0
     if args:
-        print("This version is configured from the interactive terminal menu.")
-        print("Run without scan options:")
-        print("  python serial_probe.py")
+        print("THIS PROGRAM IS SET FROM THE TERMINAL MENU.")
+        print("RUN WITHOUT OPTIONS:")
+        print("  PYTHON SERIAL_PROBE.PY")
         return 2
     options = interactive_menu()
     if options is None:
-        print("No scan started.")
+        print("NO SCAN STARTED.")
         return 0
     return run_scan(options)
 

@@ -23,7 +23,7 @@ python serial_probe.py --help
 
 The first screen is the command menu. Use `9 CURRENT SETTINGS` to view ports, baud range, number of settings to test, test message size, repeat count, timing, old-output clearing, report files, and estimated scan time. Use `11 MEMORY TEST` after you have a likely switch setting. The scan tests every selected combination.
 
-The terminal UI uses bright green text when the console supports ANSI color, matching the look of an early monochrome CRT. PyCharm runs are treated as color-capable. Set `NO_COLOR=1` before running if you want plain console text.
+The terminal UI is written for an 80-column early terminal style. Screens use terse uppercase operator text and bright green text when the console supports ANSI color. PyCharm runs are treated as color-capable. Set `NO_COLOR=1` before running if you want plain console text.
 
 Status screens, setting-change notices, and the final report use `*` borders to match the style of terminal reports from early printer and communications utilities.
 
@@ -79,8 +79,8 @@ The menu estimates scan time in plain terms:
 
 The console shows:
 
-- A `SETTINGS CHANGE` banner for each new setting.
-- The active setting, such as `110 8N1 flow=none`.
+- A `SETTING` banner for each new setting.
+- The active setting, such as `110 8N1 FLOW=NONE`.
 - Test number.
 - Write progress.
 - Bytes received.
@@ -93,10 +93,10 @@ The console shows:
 Example:
 
 ```text
-22:10:02 SETTINGS CHANGE: setting 1/960 -> 110 8N1 flow=none
-22:10:02 [0001/0960 110 8N1 flow=none] test 1/1: sending 180 bytes
-22:10:18 [0001/0960 110 8N1 flow=none] test 1/1: RESULT FAIL score=0.00
-SCAN TIME 0001/0960: elapsed=16s avg=16s/set left=4h15m44s finish=02:26:02
+22:10:02 *              SETTING 1/960  110 8N1 FLOW=NONE              *
+22:10:02 [0001/0960 110 8N1 FLOW=NONE] TEST 1/1: SEND 180 BYTES
+22:10:18 [0001/0960 110 8N1 FLOW=NONE] TEST 1/1: RESULT FAIL SCORE=0.00
+SCAN TIME 0001/0960: ELAPSED=16S AVG=16S/SET LEFT=4H15M44S FINISH=02:26:02
 ```
 
 ## Stale Output
