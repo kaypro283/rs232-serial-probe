@@ -65,6 +65,7 @@ ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
 SCREEN_WIDTH = 72
 REPORT_WIDTH = 104
 RECOMMENDATION_MIN_SCORE = 90.0
+TOP_MATCH_MIN_SCORE = 99.0
 TIE_SCORE_TOLERANCE = 0.5
 
 
@@ -197,6 +198,7 @@ class ScanOptions:
     pre_drain_timeout: float
     pre_drain_quiet: float
     max_drain_bytes: int
+    ask_on_top_match: bool
 
 
 @dataclass(frozen=True)
@@ -1414,6 +1416,20 @@ def is_recommendable_result(result: CandidateResult | None) -> bool:
     return result.score >= RECOMMENDATION_MIN_SCORE
 
 
+def is_top_match_result(result: CandidateResult | None) -> bool:
+    """Return True when a result is strong enough to pause the scan."""
+    if not is_recommendable_result(result):
+        return False
+    if result.status != "exact":
+        return False
+    return (
+        result.score >= TOP_MATCH_MIN_SCORE
+        and result.repeatability >= 1.0
+        and result.metrics.missing_bytes == 0
+        and result.metrics.extra_bytes == 0
+    )
+
+
 def top_tied_results(results: Sequence[CandidateResult]) -> list[CandidateResult]:
     """Return recommendable results that are effectively tied for first place."""
     ranked = sorted(results, key=result_sort_key, reverse=True)
@@ -1512,6 +1528,20 @@ def print_tied_results(results: Sequence[CandidateResult]) -> None:
         print(f"    {rank:>4}  {result.score:>5.1f}   {result.settings.label()}")
 
 
+def ask_continue_after_top_match(result: CandidateResult) -> bool:
+    """Ask the operator whether to continue after a top match."""
+    print()
+    print(border_line(REPORT_WIDTH))
+    print(bordered_text("TOP MATCH FOUND", REPORT_WIDTH))
+    print(border_line(REPORT_WIDTH))
+    print(f"    Setting:            {result.settings.label()}")
+    print(f"    Score:              {result.score:.2f}/100")
+    print("    The scan can continue to look for tied settings.")
+    print("    Answer N to end the scan now and write the report.")
+    print(border_line(REPORT_WIDTH))
+    return prompt_yes_no("CONTINUE SCAN", True)
+
+
 def parity_name(parity: str) -> str:
     """Return a clear parity label for reports."""
     return {
@@ -1563,6 +1593,9 @@ def print_scan_summary(
     )
     print(f"  Top table rows:       {min(top, len(ranked))}")
     print(f"  Interpretation:       {confidence_summary(best, len(tied))}")
+    if early_stopped:
+        print("  Early stop note:      Operator ended scan after a top match.")
+        print("                         Later settings were not tested for possible ties.")
 
     if best is None:
         return
@@ -1587,6 +1620,9 @@ def print_scan_summary(
         print(bordered_text("RECOMMENDED SWITCH SETTING", REPORT_WIDTH))
         print(border_line(REPORT_WIDTH))
         print_result_details(best)
+        if early_stopped:
+            print("    Note:               Scan ended by operator after this top match.")
+            print("                        Possible later ties were not tested.")
         print(border_line(REPORT_WIDTH))
         return
 
@@ -1643,6 +1679,7 @@ def default_scan_options() -> ScanOptions:
         pre_drain_timeout=DEFAULT_PRE_DRAIN_TIMEOUT,
         pre_drain_quiet=DEFAULT_PRE_DRAIN_QUIET,
         max_drain_bytes=DEFAULT_MAX_DRAIN_BYTES,
+        ask_on_top_match=False,
     )
 
 
@@ -1785,6 +1822,7 @@ def print_menu_help() -> None:
     print("OPERATOR NOTES:")
     print("  Test message size: how much known text is sent for each setting.")
     print("  Tests per setting: how many times that setting is tried.")
+    print("  Ask on top match: pause after a PASS and ask whether to continue.")
     print("  Clear old output: discard old buffer data before sending a new test.")
     print("  Max clear: default is 32768 bytes, enough for a 16K buffer plus margin.")
     print("  Top matches: the best-scoring settings shown at the end.")
@@ -1830,6 +1868,7 @@ def print_configuration(options: ScanOptions) -> None:
     )
     print_setting("Test message size:", f"{options.payload_bytes} bytes")
     print_setting("Tests per setting:", options.bursts)
+    print_setting("Ask on top match:", "yes" if options.ask_on_top_match else "no")
     print_setting("Wait after sending:", f"{options.read_timeout:.2f}s")
     print_setting("Pause after opening:", f"{options.settle_ms} ms")
     print_setting(
@@ -1873,7 +1912,16 @@ def configure_payload(options: ScanOptions) -> ScanOptions:
         minimum=minimum_payload_size(),
     )
     bursts = prompt_int("Number of tests per setting", options.bursts, minimum=1)
-    return dataclasses.replace(options, payload_bytes=payload_bytes, bursts=bursts)
+    ask_on_top_match = prompt_yes_no(
+        "Ask whether to continue after a top match",
+        options.ask_on_top_match,
+    )
+    return dataclasses.replace(
+        options,
+        payload_bytes=payload_bytes,
+        bursts=bursts,
+        ask_on_top_match=ask_on_top_match,
+    )
 
 
 def configure_timing(options: ScanOptions) -> ScanOptions:
@@ -2765,6 +2813,10 @@ def run_scan(options: ScanOptions) -> int:
             f"(timeout {options.pre_drain_timeout:.1f}s, "
             f"max {options.max_drain_bytes} bytes)."
         )
+    if options.ask_on_top_match:
+        print("Top-match prompt: on; a PASS result will ask whether to continue.")
+    else:
+        print("Top-match prompt: off; the scan will not pause after a PASS result.")
     print(f"Live progress: updates every {options.progress_interval:.1f}s while a candidate is running.")
     print_progress_legend()
     print(f"Reports: {options.json_report}, {options.csv_report}, {options.log_file}")
@@ -2790,6 +2842,13 @@ def run_scan(options: ScanOptions) -> int:
         results.append(result)
         print(format_progress(result), flush=True)
         print(format_scan_eta(len(results), len(candidates), scan_started), flush=True)
+        if options.ask_on_top_match and is_top_match_result(result):
+            if ask_continue_after_top_match(result):
+                logger.info("operator chose to continue after top match: %s", result.settings.label())
+            else:
+                early_stopped = True
+                logger.info("operator ended scan after top match: %s", result.settings.label())
+                break
 
     completed_at = dt.datetime.now(dt.timezone.utc).isoformat()
     elapsed_sec = time.monotonic() - scan_started
@@ -2804,6 +2863,9 @@ def run_scan(options: ScanOptions) -> int:
     )
     metadata["completed_candidates"] = len(results)
     metadata["elapsed_sec"] = elapsed_sec
+    metadata["early_stop_reason"] = (
+        "operator-ended-after-top-match" if early_stopped else None
+    )
     metadata["recommendation_status"] = scan_recommendation_status(results)
     ranked_results = sorted(results, key=result_sort_key, reverse=True)
     best_result = ranked_results[0] if ranked_results else None

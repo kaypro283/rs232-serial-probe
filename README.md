@@ -61,6 +61,7 @@ The default menu settings are tuned for a practical scan:
 - `180` bytes per setting.
 - `1` test per setting.
 - Every selected serial setting is tested.
+- `Ask on top match` is off by default. If enabled, a `PASS` result pauses the scan and asks whether to continue looking for possible ties.
 - Old-output clearing stops after `32768` bytes by default, which is enough for a 16K buffer plus margin.
 - No early stop.
 
@@ -87,6 +88,7 @@ The console shows:
 - Result indicator: `PASS`, `GOOD`, `PARTIAL`, `FAIL`, `STALE`, or `ERROR`.
 - Score from `0` to `100`.
 - A `SCAN TIME` line with elapsed time, average time per setting, remaining time, and approximate finish clock.
+- If `Ask on top match` is enabled, a `TOP MATCH FOUND` prompt after a `PASS` result.
 
 Example:
 
