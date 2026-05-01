@@ -62,6 +62,7 @@ The default menu settings are tuned for a practical scan:
 - `1` test per setting.
 - Every selected serial setting is tested.
 - `Ask on top match` is off by default. If enabled, a `PASS` result pauses the scan and asks whether to continue looking for possible ties.
+- `Auto validate top matches after scan` is on by default. It retests the top-score setting or settings with an 8K payload, then uses a 16K payload if a tie remains. The menu can turn this off or change the sizes.
 - Old-output clearing stops after `32768` bytes by default, which is enough for a 16K buffer plus margin.
 - No early stop.
 
