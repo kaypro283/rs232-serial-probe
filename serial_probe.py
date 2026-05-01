@@ -65,6 +65,7 @@ ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
 SCREEN_WIDTH = 72
 REPORT_WIDTH = 104
 RECOMMENDATION_MIN_SCORE = 90.0
+TIE_SCORE_TOLERANCE = 0.5
 
 
 @dataclass(frozen=True)
@@ -1413,6 +1414,20 @@ def is_recommendable_result(result: CandidateResult | None) -> bool:
     return result.score >= RECOMMENDATION_MIN_SCORE
 
 
+def top_tied_results(results: Sequence[CandidateResult]) -> list[CandidateResult]:
+    """Return recommendable results that are effectively tied for first place."""
+    ranked = sorted(results, key=result_sort_key, reverse=True)
+    best = ranked[0] if ranked else None
+    if not is_recommendable_result(best):
+        return []
+    return [
+        result
+        for result in ranked
+        if is_recommendable_result(result)
+        and (best.score - result.score) <= TIE_SCORE_TOLERANCE
+    ]
+
+
 def has_any_signal(results: Sequence[CandidateResult]) -> bool:
     """Return True when any result had enough data quality to be useful."""
     return any(
@@ -1430,13 +1445,15 @@ def scan_recommendation_status(results: Sequence[CandidateResult]) -> str:
     if best is None:
         return "no-candidates"
     if is_recommendable_result(best):
+        if len(top_tied_results(results)) > 1:
+            return "multiple-candidates"
         return "recommended"
     if has_any_signal(results):
         return "partial-only"
     return "no-working-setting"
 
 
-def confidence_summary(result: CandidateResult | None) -> str:
+def confidence_summary(result: CandidateResult | None, tied_count: int = 0) -> str:
     """Return a short interpretation of the best result."""
     if result is None:
         return "No candidates were tested."
@@ -1444,6 +1461,8 @@ def confidence_summary(result: CandidateResult | None) -> str:
         return "No match yet; output was already streaming stale data before probes."
     if result.error:
         return "No confident match; the best-ranked setting ended with an error."
+    if tied_count > 1:
+        return "Multiple top settings are tied; review the tied settings before choosing switches."
     if is_recommendable_result(result) and result.score >= 99.0 and result.repeatability >= 1.0:
         return "Likely correct; repeated tests were near-perfect."
     if is_recommendable_result(result):
@@ -1486,6 +1505,13 @@ def print_result_details(result: CandidateResult) -> None:
         print("    Note:               output had substantial extra bytes/backlog.")
 
 
+def print_tied_results(results: Sequence[CandidateResult]) -> None:
+    """Print a compact table of tied top candidate settings."""
+    print("    Rank  Score   Setting")
+    for rank, result in enumerate(results, start=1):
+        print(f"    {rank:>4}  {result.score:>5.1f}   {result.settings.label()}")
+
+
 def parity_name(parity: str) -> str:
     """Return a clear parity label for reports."""
     return {
@@ -1517,6 +1543,7 @@ def print_scan_summary(
     """Print a concise human-readable scan summary."""
     ranked = sorted(results, key=result_sort_key, reverse=True)
     best = ranked[0] if ranked else None
+    tied = top_tied_results(results)
     counts: dict[str, int] = {}
     for result in results:
         indicator = result_indicator(result.score, result.status, result.error)
@@ -1535,13 +1562,27 @@ def print_scan_summary(
         )
     )
     print(f"  Top table rows:       {min(top, len(ranked))}")
-    print(f"  Interpretation:       {confidence_summary(best)}")
+    print(f"  Interpretation:       {confidence_summary(best, len(tied))}")
 
     if best is None:
         return
 
     print()
     print(border_line(REPORT_WIDTH))
+    if len(tied) > 1:
+        print(bordered_text("MULTIPLE TOP SETTINGS FOUND", REPORT_WIDTH))
+        print(border_line(REPORT_WIDTH))
+        print(
+            "    More than one setting matched within "
+            f"{TIE_SCORE_TOLERANCE:.1f} score points."
+        )
+        print("    Do not treat the first row as the only possible switch setting.")
+        print("    Try a larger test message or repeat these tied settings.")
+        print()
+        print_tied_results(tied[:top])
+        print(border_line(REPORT_WIDTH))
+        return
+
     if is_recommendable_result(best):
         print(bordered_text("RECOMMENDED SWITCH SETTING", REPORT_WIDTH))
         print(border_line(REPORT_WIDTH))
@@ -2766,11 +2807,16 @@ def run_scan(options: ScanOptions) -> int:
     metadata["recommendation_status"] = scan_recommendation_status(results)
     ranked_results = sorted(results, key=result_sort_key, reverse=True)
     best_result = ranked_results[0] if ranked_results else None
+    tied_results = top_tied_results(results)
     metadata["recommended_setting"] = (
         dataclass_to_jsonable(best_result.settings)
-        if is_recommendable_result(best_result)
+        if is_recommendable_result(best_result) and len(tied_results) <= 1
         else None
     )
+    metadata["tied_top_settings"] = [
+        dataclass_to_jsonable(result.settings) for result in tied_results
+    ]
+    metadata["tie_score_tolerance"] = TIE_SCORE_TOLERANCE
     write_json_report(options.json_report, metadata, results)
     write_csv_report(options.csv_report, results)
     logger.info("serial_probe completed; candidates=%s early_stopped=%s", len(results), early_stopped)

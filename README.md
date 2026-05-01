@@ -115,6 +115,7 @@ At the end, the tool prints:
 
 - Ranked table of top observed results.
 - Recommended switch setting with baud rate, data bits, parity, stop bits, and flow control, but only when the result is strong enough.
+- A `MULTIPLE TOP SETTINGS FOUND` report when two or more strong results are effectively tied.
 - A clear `NO WORKING SETTING FOUND` report when the current buffer switch setup fails every test.
 - Scan duration.
 - Number of settings tested.
