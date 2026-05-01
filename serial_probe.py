@@ -52,6 +52,18 @@ DEFAULT_PROGRESS_INTERVAL = 1.0
 DEFAULT_PRE_DRAIN_TIMEOUT = 0.5
 DEFAULT_PRE_DRAIN_QUIET = 0.1
 DEFAULT_MAX_DRAIN_BYTES = 32_768
+EXPLORATORY_PAYLOAD_BYTES = 160
+EXPLORATORY_READ_TIMEOUT = 1.0
+EXPLORATORY_SETTLE_MS = 40
+EXPLORATORY_BURSTS = 1
+EXPLORATORY_PROGRESS_INTERVAL = 1.0
+EXPLORATORY_PRE_DRAIN_TIMEOUT = 0.5
+EXPLORATORY_PRE_DRAIN_QUIET = 0.1
+EXPLORATORY_MAX_DRAIN_BYTES = DEFAULT_MAX_DRAIN_BYTES
+EXPLORATORY_SHORTLIST_LIMIT = 24
+EXPLORATORY_MIN_NARROW_SCORE = 90.0
+EXPLORATORY_SCORE_TOLERANCE = 10.0
+EXPLORATORY_SUMMARY_ROWS = 8
 FNV_OFFSET_32 = 0x811C9DC5
 FNV_PRIME_32 = 0x01000193
 ProgressCallback = Callable[[str], None]
@@ -202,6 +214,21 @@ class ScanOptions:
     auto_validate_top_matches: bool
     validate_size_1_bytes: int
     validate_size_2_tie_bytes: int
+
+
+@dataclass(frozen=True)
+class ExploratorySelection:
+    """Ranked exploratory findings and the optional full-scan candidate subset."""
+
+    results: list[CandidateResult]
+    ranked_results: list[CandidateResult]
+    shortlist_results: list[CandidateResult]
+    narrowed_candidates: list[SerialSettings]
+    elapsed_sec: float
+    fallback_reason: str | None
+    notes: list[str]
+    cutoff_score: float | None
+    truncated: bool
 
 
 @dataclass(frozen=True)
@@ -1269,7 +1296,9 @@ def setup_logging(log_file: Path) -> logging.Logger:
     log_file.parent.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("serial_probe")
     logger.setLevel(logging.DEBUG)
-    logger.handlers.clear()
+    for existing_handler in list(logger.handlers):
+        logger.removeHandler(existing_handler)
+        existing_handler.close()
     handler = logging.FileHandler(log_file, encoding="utf-8")
     handler.setLevel(logging.DEBUG)
     handler.setFormatter(
@@ -1798,6 +1827,351 @@ def estimate_scan_overhead_seconds(options: ScanOptions) -> float:
     return len(candidates) * options.bursts * per_burst
 
 
+def exploratory_payload_bytes() -> int:
+    """Return the fixed internal exploratory payload size."""
+    return max(EXPLORATORY_PAYLOAD_BYTES, minimum_payload_size())
+
+
+def exploratory_fixed_settings_label() -> str:
+    """Return a compact description of fixed exploratory scan settings."""
+    return (
+        f"{exploratory_payload_bytes()} BYTES X {EXPLORATORY_BURSTS}, "
+        f"READ={EXPLORATORY_READ_TIMEOUT:.1f}S, "
+        f"PAUSE={EXPLORATORY_SETTLE_MS}MS, "
+        f"CLEAR={EXPLORATORY_PRE_DRAIN_TIMEOUT:.1f}S/"
+        f"{EXPLORATORY_PRE_DRAIN_QUIET:.1f}S"
+    )
+
+
+def exploratory_scan_options(options: ScanOptions) -> ScanOptions:
+    """Return fixed internal options for quick exploratory mode."""
+    return dataclasses.replace(
+        options,
+        payload_bytes=exploratory_payload_bytes(),
+        read_timeout=EXPLORATORY_READ_TIMEOUT,
+        settle_ms=EXPLORATORY_SETTLE_MS,
+        bursts=EXPLORATORY_BURSTS,
+        progress_interval=EXPLORATORY_PROGRESS_INTERVAL,
+        no_pre_drain=False,
+        pre_drain_timeout=EXPLORATORY_PRE_DRAIN_TIMEOUT,
+        pre_drain_quiet=EXPLORATORY_PRE_DRAIN_QUIET,
+        max_drain_bytes=EXPLORATORY_MAX_DRAIN_BYTES,
+        ask_on_top_match=False,
+    )
+
+
+def is_exploratory_signal(result: CandidateResult) -> bool:
+    """Return True when an exploratory result is useful enough for narrowing."""
+    if result.error:
+        return False
+    if result.status in {"error", "no-data", "stale-output", "partial-write"}:
+        return False
+    return result.score >= EXPLORATORY_MIN_NARROW_SCORE
+
+
+def select_exploratory_candidates(
+    results: Sequence[CandidateResult],
+    all_candidates: Sequence[SerialSettings],
+    elapsed_sec: float,
+) -> ExploratorySelection:
+    """Select a conservative full-scan shortlist from exploratory results."""
+    ranked_results = sorted(results, key=result_sort_key, reverse=True)
+    ranked_nonzero = [result for result in ranked_results if result.score > 0.0]
+    notes: list[str] = []
+    fallback_reason: str | None = None
+    cutoff_score: float | None = None
+    shortlist_results: list[CandidateResult] = []
+    narrowed_candidates: list[SerialSettings] = []
+    truncated = False
+
+    stale_count = sum(1 for result in results if result.status == "stale-output")
+    no_data_count = sum(1 for result in results if result.status == "no-data")
+    error_count = sum(1 for result in results if result.error or result.status == "error")
+    if stale_count:
+        notes.append(f"STALE={stale_count}; OUTPUT WAS NOT QUIET FOR THOSE SETTINGS.")
+    if no_data_count:
+        notes.append(f"NO DATA={no_data_count}; NOTHING USEFUL WAS READ.")
+    if error_count:
+        notes.append(f"ERROR={error_count}; CHECK LOG FOR DRIVER DETAILS.")
+
+    if not results:
+        fallback_reason = "NO EXPLORATORY SETTINGS WERE TESTED."
+    elif not ranked_nonzero:
+        fallback_reason = "NO EXPLORATORY SIGNAL WAS OBSERVED."
+    else:
+        eligible = [result for result in ranked_results if is_exploratory_signal(result)]
+        best = ranked_nonzero[0]
+        if not eligible:
+            fallback_reason = (
+                f"BEST EXPLORATORY SCORE {best.score:.1f} "
+                f"IS BELOW {EXPLORATORY_MIN_NARROW_SCORE:.1f}."
+            )
+        else:
+            best_eligible = eligible[0]
+            cutoff_score = max(
+                EXPLORATORY_MIN_NARROW_SCORE,
+                best_eligible.score - EXPLORATORY_SCORE_TOLERANCE,
+            )
+            within_cutoff = [
+                result for result in eligible if result.score >= cutoff_score
+            ]
+            shortlist_results = within_cutoff[:EXPLORATORY_SHORTLIST_LIMIT]
+            truncated = len(within_cutoff) > len(shortlist_results)
+            seed_frames = {
+                (
+                    result.settings.baud,
+                    result.settings.data_bits,
+                    result.settings.parity,
+                    result.settings.stop_bits,
+                )
+                for result in shortlist_results
+            }
+            expanded_settings = {
+                SerialSettings(baud, data_bits, parity, stop_bits, flow)
+                for baud, data_bits, parity, stop_bits in seed_frames
+                for flow in FLOW_CONTROLS
+            }
+            narrowed_candidates = [
+                candidate for candidate in all_candidates if candidate in expanded_settings
+            ]
+            tied_count = sum(
+                1
+                for result in within_cutoff
+                if abs(result.score - best_eligible.score) <= TIE_SCORE_TOLERANCE
+            )
+            if tied_count > 1:
+                notes.append(
+                    f"AMBIGUOUS={tied_count}; TOP SCORES ARE CLOSE TOGETHER."
+                )
+            if best_eligible.score < RECOMMENDATION_MIN_SCORE:
+                notes.append("CONFIDENCE IS LOW; USE ONLY AS A FULL-SCAN HINT.")
+            if best_eligible.metrics.extra_bytes > best_eligible.bytes_sent:
+                notes.append("BEST ROW HAD EXTRA OUTPUT; BACKLOG OR NOISE MAY EXIST.")
+            if truncated:
+                notes.append(
+                    f"SHORTLIST LIMITED TO TOP {EXPLORATORY_SHORTLIST_LIMIT} "
+                    "EXPLORATORY ROWS."
+                )
+            notes.append(
+                "FLOW CONTROL WAS EXPANDED FOR EACH PROMISING FRAME SETTING."
+            )
+
+    if fallback_reason:
+        notes.append("FULL SCAN WILL USE ALL SELECTED SETTINGS.")
+
+    return ExploratorySelection(
+        results=list(results),
+        ranked_results=ranked_results,
+        shortlist_results=shortlist_results,
+        narrowed_candidates=narrowed_candidates,
+        elapsed_sec=elapsed_sec,
+        fallback_reason=fallback_reason,
+        notes=notes,
+        cutoff_score=cutoff_score,
+        truncated=truncated,
+    )
+
+
+def print_exploratory_start(
+    options: ScanOptions,
+    exploratory_options: ScanOptions,
+    candidate_count: int,
+    payload: ProbePayload,
+) -> None:
+    """Print the exploratory-mode start banner."""
+    print()
+    print_report_title("QUICK EXPLORATORY START")
+    print("MODE: FIXED INTERNAL PRE-SCAN; FULL SCAN SETTINGS ARE NOT CHANGED.")
+    print(
+        f"PORTS: {options.in_port} -> {options.out_port}; "
+        f"TEST={payload.byte_count} BYTES X {exploratory_options.bursts}"
+    )
+    print(
+        f"TIMING: READ={exploratory_options.read_timeout:.1f}S, "
+        f"PAUSE={exploratory_options.settle_ms}MS."
+    )
+    print(
+        f"CLEAR OUTPUT: ON; QUIET={exploratory_options.pre_drain_quiet:.1f}S "
+        f"LIMIT={exploratory_options.pre_drain_timeout:.1f}S "
+        f"MAX={exploratory_options.max_drain_bytes} BYTES."
+    )
+    print(f"SETTINGS: {candidate_count}; BROAD LIGHT PASS.")
+    print(border_line(REPORT_WIDTH))
+
+
+def print_exploratory_summary(selection: ExploratorySelection) -> None:
+    """Print a concise exploratory finding summary."""
+    print()
+    print_report_title("QUICK EXPLORATORY RESULTS")
+    print(f"  RUN TIME:             {format_duration(selection.elapsed_sec)}")
+    print(f"  SETTINGS TESTED:      {len(selection.results)}")
+    print(f"  FIXED SETTINGS:       {exploratory_fixed_settings_label()}")
+    if selection.fallback_reason:
+        print(f"  FINDING:              {selection.fallback_reason}")
+    elif selection.shortlist_results:
+        print(
+            "  FINDING:              "
+            f"{len(selection.shortlist_results)} ROWS AT SCORE >= "
+            f"{selection.cutoff_score:.1f}"
+        )
+        print(
+            "  FULL-SCAN CANDIDATES: "
+            f"{len(selection.narrowed_candidates)} AFTER FLOW EXPANSION"
+        )
+
+    top_rows = [
+        result for result in selection.ranked_results if result.score > 0.0
+    ][:EXPLORATORY_SUMMARY_ROWS]
+    if top_rows:
+        print()
+        print(border_line(REPORT_WIDTH))
+        print("RK SCORE   BAUD MODE FLOW       READ  CLR  EXCT LINE RESULT")
+        print(border_line(REPORT_WIDTH))
+        for rank, result in enumerate(top_rows, start=1):
+            mode = (
+                f"{result.settings.data_bits}"
+                f"{result.settings.parity_code()}"
+                f"{result.settings.stop_bits}"
+            )
+            indicator = result_indicator(result.score, result.status, result.error)
+            print(
+                f"{rank:>2} "
+                f"{result.score:>5.1f} "
+                f"{result.settings.baud:>6} "
+                f"{mode:<4} "
+                f"{result.settings.flow_control.upper():<8} "
+                f"{result.bytes_received:>6} "
+                f"{result.bytes_drained_before:>4} "
+                f"{result.metrics.exact_byte_match_ratio:>4.2f} "
+                f"{result.metrics.line_integrity_ratio:>4.2f} "
+                f"{indicator}"
+            )
+        print(border_line(REPORT_WIDTH))
+    else:
+        print("  TOP ROWS:             NONE")
+
+    if selection.notes:
+        print()
+        print("  NOTES:")
+        for note in selection.notes:
+            print(f"    {note}")
+    print(border_line(REPORT_WIDTH))
+
+
+def exploratory_metadata(
+    requested: bool,
+    narrowing_accepted: bool,
+    selection: ExploratorySelection | None,
+    original_candidate_count: int,
+    final_candidate_count: int,
+) -> dict[str, Any]:
+    """Return JSON metadata for exploratory mode and candidate narrowing."""
+    fixed_settings = {
+        "payload_bytes": exploratory_payload_bytes(),
+        "read_timeout": EXPLORATORY_READ_TIMEOUT,
+        "settle_ms": EXPLORATORY_SETTLE_MS,
+        "bursts": EXPLORATORY_BURSTS,
+        "progress_interval": EXPLORATORY_PROGRESS_INTERVAL,
+        "pre_drain_enabled": True,
+        "pre_drain_timeout": EXPLORATORY_PRE_DRAIN_TIMEOUT,
+        "pre_drain_quiet": EXPLORATORY_PRE_DRAIN_QUIET,
+        "max_drain_bytes": EXPLORATORY_MAX_DRAIN_BYTES,
+        "shortlist_limit": EXPLORATORY_SHORTLIST_LIMIT,
+        "min_narrow_score": EXPLORATORY_MIN_NARROW_SCORE,
+        "score_tolerance": EXPLORATORY_SCORE_TOLERANCE,
+    }
+    metadata: dict[str, Any] = {
+        "requested": requested,
+        "fixed_internal_settings": fixed_settings,
+        "narrowing_accepted": narrowing_accepted,
+        "original_candidate_count": original_candidate_count,
+        "final_candidate_count": final_candidate_count,
+        "candidate_source": (
+            "exploratory-narrowed"
+            if narrowing_accepted
+            else "all-selected-settings"
+        ),
+    }
+    if selection is None:
+        metadata["ran"] = False
+        return metadata
+
+    metadata.update(
+        {
+            "ran": True,
+            "elapsed_sec": selection.elapsed_sec,
+            "tested_candidates": len(selection.results),
+            "fallback_reason": selection.fallback_reason,
+            "cutoff_score": selection.cutoff_score,
+            "truncated": selection.truncated,
+            "notes": selection.notes,
+            "shortlist_count": len(selection.shortlist_results),
+            "narrowed_candidate_count": len(selection.narrowed_candidates),
+            "shortlist_settings": [
+                dataclass_to_jsonable(result.settings)
+                for result in selection.shortlist_results
+            ],
+            "narrowed_candidate_settings": [
+                dataclass_to_jsonable(settings)
+                for settings in selection.narrowed_candidates
+            ],
+            "top_results": [
+                dataclass_to_jsonable(result)
+                for result in selection.ranked_results[:EXPLORATORY_SUMMARY_ROWS]
+            ],
+        }
+    )
+    return metadata
+
+
+def run_exploratory_scan(
+    serial_module: Any,
+    options: ScanOptions,
+    candidates: Sequence[SerialSettings],
+    logger: logging.Logger,
+) -> ExploratorySelection:
+    """Run quick exploratory mode and return candidate narrowing findings."""
+    quick_options = exploratory_scan_options(options)
+    quick_payload = generate_payload(quick_options.payload_bytes)
+    print_exploratory_start(options, quick_options, len(candidates), quick_payload)
+    logger.info("quick exploratory mode started")
+    logger.info("quick options: %s", quick_options)
+    logger.info(
+        "quick payload: %s bytes, %s lines",
+        quick_payload.byte_count,
+        quick_payload.line_count,
+    )
+
+    started = time.monotonic()
+    results: list[CandidateResult] = []
+    for index, settings in enumerate(candidates, start=1):
+        result = run_candidate(
+            serial_module=serial_module,
+            index=index,
+            total=len(candidates),
+            settings=settings,
+            options=quick_options,
+            payload=quick_payload,
+            logger=logger,
+            progress=None,
+        )
+        results.append(result)
+        print("QUICK " + format_progress(result), flush=True)
+        print(format_scan_eta(len(results), len(candidates), started), flush=True)
+
+    elapsed_sec = time.monotonic() - started
+    selection = select_exploratory_candidates(results, candidates, elapsed_sec)
+    print_exploratory_summary(selection)
+    logger.info(
+        "quick exploratory completed; candidates=%s fallback=%s shortlist=%s narrowed=%s",
+        len(results),
+        selection.fallback_reason,
+        len(selection.shortlist_results),
+        len(selection.narrowed_candidates),
+    )
+    return selection
+
+
 def prompt_text(label: str, current: str) -> str:
     """Prompt for a string value, preserving current on blank input."""
     try:
@@ -1873,6 +2247,23 @@ def prompt_yes_no(label: str, current: bool) -> bool:
         print("ENTER Y OR N.")
 
 
+def prompt_yes_no_question(question: str, current: bool) -> bool:
+    """Prompt for a yes/no answer using a full question string."""
+    default = "Y" if current else "N"
+    while True:
+        try:
+            value = input(f"{question.upper()} (Y/N) [{default}]: ").strip().lower()
+        except EOFError:
+            return current
+        if value == "":
+            return current
+        if value in {"y", "yes"}:
+            return True
+        if value in {"n", "no"}:
+            return False
+        print("ENTER Y OR N.")
+
+
 def print_menu_help() -> None:
     """Print short help for the interactive CLI."""
     print_banner()
@@ -1893,6 +2284,7 @@ def print_menu_help() -> None:
     print("OPERATOR NOTES:")
     print("  TEST SIZE:       BYTES SENT FOR EACH SETTING.")
     print("  TEST COUNT:      NUMBER OF TRIES PER SETTING.")
+    print("  QUICK MODE:      ASKED AT SCAN START; FIXED INTERNAL SETTINGS.")
     print("  ASK ON MATCH:    PAUSE AFTER PASS; ASK CONTINUE.")
     print("  CLEAR OUTPUT:    DISCARD OLD BUFFER DATA FIRST.")
     print("  MAX CLEAR:       DEFAULT 32768 BYTES.")
@@ -1944,6 +2336,10 @@ def print_configuration(options: ScanOptions) -> None:
     )
     print_setting("TEST BYTES:", f"{options.payload_bytes} BYTES")
     print_setting("TEST COUNT:", options.bursts)
+    print_setting(
+        "QUICK MODE:",
+        f"ASK AT START; FIXED INTERNAL {exploratory_fixed_settings_label()}",
+    )
     print_setting("ASK ON MATCH:", "YES" if options.ask_on_top_match else "NO")
     print_setting(
         "AUTO VALIDATE:",
@@ -2897,18 +3293,63 @@ def run_scan(options: ScanOptions) -> int:
     """Run the serial probe scan and write reports."""
     serial_module = import_or_install_pyserial()
     logger = setup_logging(options.log_file)
-    scan_started = time.monotonic()
-    started_at = dt.datetime.now(dt.timezone.utc).isoformat()
-    candidates = generate_candidates(options.min_baud, options.max_baud)
+    all_candidates = generate_candidates(options.min_baud, options.max_baud)
+    candidates = list(all_candidates)
     payload = generate_payload(options.payload_bytes)
     pyserial_version = str(getattr(serial_module, "VERSION", "unknown"))
     logger.info("serial_probe started")
     logger.info("options: %s", options)
     logger.info("payload: %s bytes, %s lines", payload.byte_count, payload.line_count)
-    logger.info("candidates: %s", len(candidates))
+    logger.info("candidates: %s", len(all_candidates))
+
+    exploratory_requested = prompt_yes_no_question(
+        "Run quick exploratory mode first?",
+        False,
+    )
+    exploratory_selection: ExploratorySelection | None = None
+    exploratory_narrowing_accepted = False
+    if exploratory_requested:
+        exploratory_selection = run_exploratory_scan(
+            serial_module=serial_module,
+            options=options,
+            candidates=all_candidates,
+            logger=logger,
+        )
+        if exploratory_selection.narrowed_candidates:
+            exploratory_narrowing_accepted = prompt_yes_no_question(
+                "Use these findings to narrow full analysis?",
+                False,
+            )
+            if exploratory_narrowing_accepted:
+                candidates = list(exploratory_selection.narrowed_candidates)
+                logger.info(
+                    "operator accepted exploratory narrowing; full candidates=%s/%s",
+                    len(candidates),
+                    len(all_candidates),
+                )
+            else:
+                logger.info("operator declined exploratory narrowing")
+                print("FULL ANALYSIS WILL TEST ALL SELECTED SETTINGS.")
+        else:
+            logger.info(
+                "exploratory narrowing unavailable: %s",
+                exploratory_selection.fallback_reason,
+            )
+            print("FULL ANALYSIS WILL TEST ALL SELECTED SETTINGS.")
+    else:
+        logger.info("operator skipped quick exploratory mode")
+
+    scan_started = time.monotonic()
+    started_at = dt.datetime.now(dt.timezone.utc).isoformat()
 
     print_report_title("SCAN START")
-    print("MODE: TEST ALL SELECTED SERIAL SETTINGS.")
+    if exploratory_narrowing_accepted:
+        print("MODE: FULL ANALYSIS OF QUICK EXPLORATORY SHORTLIST.")
+        print(f"SETTINGS: {len(candidates)}/{len(all_candidates)} SELECTED BY QUICK MODE.")
+    else:
+        print("MODE: TEST ALL SELECTED SERIAL SETTINGS.")
+        if exploratory_requested:
+            print("QUICK MODE: RAN; FULL ANALYSIS NOT NARROWED.")
     print(
         f"PORTS: {options.in_port} -> {options.out_port}; "
         f"TEST={payload.byte_count} BYTES X {options.bursts}"
@@ -2942,7 +3383,15 @@ def run_scan(options: ScanOptions) -> int:
     print(f"SCREEN UPDATE: {options.progress_interval:.1f}S WHILE SETTING RUNS.")
     print_progress_legend()
     print(f"REPORTS: {options.json_report}, {options.csv_report}, {options.log_file}")
-    rough_total = estimate_scan_wire_seconds(options) + estimate_scan_overhead_seconds(options)
+    rough_total = sum(
+        estimated_transmit_seconds(candidate, options.payload_bytes) * options.bursts
+        for candidate in candidates
+    )
+    rough_total += len(candidates) * options.bursts * (
+        options.read_timeout
+        + (options.settle_ms / 1000.0)
+        + (0.0 if options.no_pre_drain else options.pre_drain_quiet)
+    )
     print(
         f"START EST.: {format_duration(rough_total)}; "
         f"FINISH ABOUT {format_finish_clock(rough_total)}"
@@ -3001,9 +3450,24 @@ def run_scan(options: ScanOptions) -> int:
         dataclass_to_jsonable(result.settings) for result in tied_results
     ]
     metadata["tie_score_tolerance"] = TIE_SCORE_TOLERANCE
+    metadata["full_candidate_count_before_exploratory"] = len(all_candidates)
+    metadata["full_candidate_count_after_exploratory"] = len(candidates)
+    metadata["exploratory_mode"] = exploratory_metadata(
+        requested=exploratory_requested,
+        narrowing_accepted=exploratory_narrowing_accepted,
+        selection=exploratory_selection,
+        original_candidate_count=len(all_candidates),
+        final_candidate_count=len(candidates),
+    )
     write_json_report(options.json_report, metadata, results)
     write_csv_report(options.csv_report, results)
-    logger.info("serial_probe completed; candidates=%s early_stopped=%s", len(results), early_stopped)
+    logger.info(
+        "serial_probe completed; candidates=%s/%s early_stopped=%s exploratory_narrowed=%s",
+        len(results),
+        len(all_candidates),
+        early_stopped,
+        exploratory_narrowing_accepted,
+    )
     logger.info("json_report=%s", options.json_report)
     logger.info("csv_report=%s", options.csv_report)
 
@@ -3018,6 +3482,13 @@ def run_scan(options: ScanOptions) -> int:
         early_stopped=early_stopped,
         top=options.top,
     )
+    if exploratory_narrowing_accepted:
+        print(
+            "  NOTE:                 FULL ANALYSIS USED QUICK EXPLORATORY "
+            f"CANDIDATES ({len(candidates)}/{len(all_candidates)})."
+        )
+    elif exploratory_requested:
+        print("  NOTE:                 QUICK EXPLORATORY DID NOT NARROW FULL ANALYSIS.")
     if options.auto_validate_top_matches and results:
         ranked = ranked_top_results(results, options.top)
         top_score = ranked[0].score if ranked else 0.0

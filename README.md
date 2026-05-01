@@ -21,7 +21,7 @@ Usage screen:
 python serial_probe.py --help
 ```
 
-The first screen is the command menu. Use `9 CURRENT SETTINGS` to view ports, baud range, number of settings to test, test message size, repeat count, timing, old-output clearing, report files, and estimated scan time. Use `11 MEMORY TEST` after you have a likely switch setting. The scan tests every selected combination.
+The first screen is the command menu. Use `9 CURRENT SETTINGS` to view ports, baud range, number of settings to test, test message size, repeat count, timing, old-output clearing, report files, and estimated scan time. It also shows that quick exploratory mode is fixed/internal and is asked at scan start. Use `11 MEMORY TEST` after you have a likely switch setting. The normal full scan tests every selected combination.
 
 The terminal UI is written for an 80-column early terminal style. Screens use terse uppercase operator text and bright green text when the console supports ANSI color. PyCharm runs are treated as color-capable. Set `NO_COLOR=1` before running if you want plain console text.
 
@@ -34,6 +34,54 @@ python serial_probe.py
 ```
 
 Use the default settings, then select `1. Start scan`.
+
+## Quick Exploratory Mode
+
+When a scan starts, the tool asks:
+
+```text
+RUN QUICK EXPLORATORY MODE FIRST? (Y/N) [N]:
+```
+
+Answer `N` or press Enter to run the normal full scan over every selected setting.
+
+Answer `Y` to run a quick pre-scan first. This pass uses fixed internal settings:
+
+- `160` byte probe payload, or the generator minimum if that is ever larger.
+- `1` test per setting.
+- `1.0` second output quiet wait after sending.
+- `40` ms port-open pause.
+- Old-output clearing on, with `0.1` seconds quiet, `0.5` seconds limit, and `32768` max clear bytes.
+
+These exploratory payload, timing, repeat, and old-output clearing settings are not configurable from the menu. Menu settings for test size, timing, repeat count, and clearing apply to the full scan only.
+
+After the quick pass, the tool prints a concise ranked summary with top observed candidates, confidence notes, stale/no-data/error counts, and whether the findings are strong enough to form a shortlist. If the findings are usable, it asks:
+
+```text
+USE THESE FINDINGS TO NARROW FULL ANALYSIS? (Y/N) [N]:
+```
+
+Answer `Y` to run the full scan only against the exploratory shortlist. Only the candidate list is narrowed; the full scan still uses the normal menu-configured payload, timing, repeat count, report settings, and validation settings. To avoid dropping meaningful flow-control differences, the shortlist keeps all flow-control modes for each promising baud/data/parity/stop-bit frame found by the quick pass.
+
+Answer `N` or press Enter to ignore the quick findings and run the normal full scan over every selected setting.
+
+If quick exploratory mode finds no usable signal, produces only low-confidence results, or is dominated by stale/no-data/error outcomes, the tool does not offer narrowing and falls back to the normal full scan automatically.
+
+Prompt-path checks:
+
+```text
+First prompt N:
+  Skip quick mode. Full scan runs all selected settings.
+
+First prompt Y, second prompt N:
+  Quick summary is shown. Full scan still runs all selected settings.
+
+First prompt Y, second prompt Y:
+  Quick summary is shown. Full scan runs the narrowed candidate list using full-scan settings.
+
+First prompt Y, no usable quick findings:
+  Quick summary explains the fallback. Full scan runs all selected settings.
+```
 
 ## How Many Combinations?
 
@@ -131,6 +179,8 @@ It also writes:
 - Debug log.
 
 The report paths are configured from the menu.
+
+The scan start screen, final summary note, debug log, and JSON metadata indicate whether quick exploratory mode ran and whether the full analysis candidate list was narrowed from those findings.
 
 ## Memory Test
 
