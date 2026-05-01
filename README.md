@@ -21,7 +21,7 @@ Usage screen:
 python serial_probe.py --help
 ```
 
-The first screen is the command menu. Use `9 CURRENT SETTINGS` to view ports, baud range, number of settings to test, test message size, repeat count, timing, old-output clearing, report files, and estimated scan time. It also shows that quick exploratory mode is fixed/internal and is asked at scan start. Use `11 MEMORY TEST` after you have a likely switch setting. The normal full scan tests every selected combination.
+The first screen is the command menu. Use `9 CURRENT SETTINGS` to view ports, baud range, number of settings to test, test message size, repeat count, timing, old-output clearing, baud focus rules, report files, and estimated scan time. It also shows that scan mode is asked at scan start and that blank means `AUTO`. Use `11 MEMORY TEST` after you have a likely switch setting. The normal full scan still tests every selected combination unless quick exploratory findings are accepted for phase 2.
 
 The terminal UI is written for an 80-column early terminal style. Screens use terse uppercase operator text and bright green text when the console supports ANSI color. PyCharm runs are treated as color-capable. Set `NO_COLOR=1` before running if you want plain console text.
 
@@ -35,9 +35,27 @@ python serial_probe.py
 
 Use the default settings, then select `1. Start scan`.
 
-## Quick Exploratory Mode
+## Scan Mode
 
 When a scan starts, the tool asks:
+
+```text
+SCAN MODE: AUTO OR MANUAL [AUTO]:
+```
+
+Accepted answers are `A`, `AUTO`, `M`, and `MANUAL`. Press Enter for `AUTO`.
+
+`AUTO` is the default. It runs quick exploratory mode and accepts phase-2 full analysis from the quick findings without asking the two follow-up yes/no questions:
+
+```text
+AUTO MODE: EXPLORATORY=YES PHASE2=YES
+```
+
+`MANUAL` preserves the old operator flow. It asks whether to run quick exploratory mode and, when quick findings are usable, later asks whether to use them for phase 2.
+
+## Quick Exploratory Mode
+
+In `MANUAL` mode, the tool asks:
 
 ```text
 RUN QUICK EXPLORATORY MODE FIRST? (Y/N) [N]:
@@ -49,8 +67,8 @@ Answer `Y` to run a quick pre-scan first. This pass uses fixed internal settings
 
 - `160` byte probe payload, or the generator minimum if that is ever larger.
 - `1` test per setting.
-- `1.0` second output quiet wait after sending.
-- `40` ms port-open pause.
+- `0.4` second output quiet wait after sending.
+- `20` ms port-open pause.
 - Old-output clearing on, with `0.1` seconds quiet, `0.5` seconds limit, and `32768` max clear bytes.
 
 These exploratory payload, timing, repeat, and old-output clearing settings are not configurable from the menu. Menu settings for test size, timing, repeat count, and clearing apply to the full scan only.
@@ -67,19 +85,54 @@ Answer `N` or press Enter to ignore the quick findings and run the normal full s
 
 If quick exploratory mode finds no usable signal, produces only low-confidence results, or is dominated by stale/no-data/error outcomes, the tool does not offer narrowing and falls back to the normal full scan automatically.
 
+## Baud Focus
+
+Quick exploratory mode has a cautious baud-focus rule. It looks for a strong pattern at one baud across multiple framing and flow-control variants. When the configured confidence gates pass, it finishes the remaining quick tests at that baud first and may defer the other bauds from the quick pass.
+
+Default gates:
+
+- Baud focus enabled: `YES`.
+- Strong-hit score: `90.0` or higher.
+- Lead over next best baud: `20.0` score points or higher.
+- Minimum strong results at the baud: `3`.
+- Minimum early samples per baud: `8`.
+
+Focus is disabled or canceled if stale output, partial writes, or driver errors appear. If the lead is not strong enough, the quick pass returns to the normal full baud sweep. The full brute-force scan still exists: choose `MANUAL`, answer `N` to quick mode, or decline quick narrowing; the tool then tests every selected baud/data/parity/stop/flow combination. If `AUTO` accepts a narrowed phase 2, the report records that choice.
+
+Use menu command `12 BAUD FOCUS` to change the focus thresholds. Use `9 CURRENT SETTINGS` to view the active values.
+
+Example operator lines:
+
+```text
+SCAN MODE: AUTO OR MANUAL [AUTO]:
+AUTO MODE: EXPLORATORY=YES PHASE2=YES
+BAUD FOCUS ENGAGED: 38400 SCORE=100.0 GAP=50.0 GOOD=4 SAMPLES=8
+OTHER BAUDS DEFERRED BY CONFIDENCE RULE
+```
+
+If confidence falls after focus starts, the tool returns to the broad scan:
+
+```text
+BAUD FOCUS CANCELED: CONFIDENCE DROPPED
+RETURNING TO FULL BAUD SWEEP
+```
+
 Prompt-path checks:
 
 ```text
-First prompt N:
+Scan mode MANUAL, quick prompt N:
   Skip quick mode. Full scan runs all selected settings.
 
-First prompt Y, second prompt N:
+Scan mode MANUAL, quick prompt Y, phase-2 prompt N:
   Quick summary is shown. Full scan still runs all selected settings.
 
-First prompt Y, second prompt Y:
+Scan mode MANUAL, quick prompt Y, phase-2 prompt Y:
   Quick summary is shown. Full scan runs the narrowed candidate list using full-scan settings.
 
-First prompt Y, no usable quick findings:
+Scan mode AUTO:
+  Quick mode runs. Phase 2 uses quick findings if they are usable; otherwise full scan runs all selected settings.
+
+Scan mode MANUAL, quick prompt Y, no usable quick findings:
   Quick summary explains the fallback. Full scan runs all selected settings.
 ```
 
@@ -105,7 +158,7 @@ The default menu settings are tuned for a practical scan:
 
 - `180` bytes per setting.
 - `1` test per setting.
-- Every selected serial setting is tested.
+- Every selected serial setting is tested in a normal full scan. AUTO may shorten the exploratory pass and phase-2 candidate list only when confidence gates pass.
 - Output wait after send is `2.0` seconds by default.
 - `Ask on top match` is off by default. If enabled, a `PASS` result pauses the scan and asks whether to continue looking for possible ties.
 - `Auto validate top matches after scan` is on by default. It retests the top-score setting or settings with an 8K payload, then uses a 16K payload if a tie remains. The menu can turn this off or change the sizes.
@@ -180,7 +233,7 @@ It also writes:
 
 The report paths are configured from the menu.
 
-The scan start screen, final summary note, debug log, and JSON metadata indicate whether quick exploratory mode ran and whether the full analysis candidate list was narrowed from those findings.
+The scan start screen, final summary note, debug log, JSON metadata, and CSV rows indicate the selected scan mode, whether quick exploratory mode ran, whether the full analysis candidate list was narrowed, whether baud focus engaged, which baud was focused, whether other bauds were deferred, and why focus was engaged or released.
 
 ## Memory Test
 

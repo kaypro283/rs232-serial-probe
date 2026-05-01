@@ -64,6 +64,11 @@ EXPLORATORY_SHORTLIST_LIMIT = 24
 EXPLORATORY_MIN_NARROW_SCORE = 90.0
 EXPLORATORY_SCORE_TOLERANCE = 10.0
 EXPLORATORY_SUMMARY_ROWS = 8
+BAUD_FOCUS_ENABLED_DEFAULT = True
+BAUD_FOCUS_STRONG_SCORE_THRESHOLD = 90.0
+BAUD_FOCUS_LEAD_GAP_THRESHOLD = 20.0
+BAUD_FOCUS_MIN_STRONG_RESULTS = 3
+BAUD_FOCUS_MIN_SAMPLES = 8
 FNV_OFFSET_32 = 0x811C9DC5
 FNV_PRIME_32 = 0x01000193
 ProgressCallback = Callable[[str], None]
@@ -214,6 +219,46 @@ class ScanOptions:
     auto_validate_top_matches: bool
     validate_size_1_bytes: int
     validate_size_2_tie_bytes: int
+    baud_focus_enabled: bool
+    baud_focus_strong_score_threshold: float
+    baud_focus_lead_gap_threshold: float
+    baud_focus_min_strong_results: int
+    baud_focus_min_samples: int
+
+
+@dataclass(frozen=True)
+class BaudFocusStats:
+    """Observed exploratory score pattern for one baud rate."""
+
+    baud: int
+    samples: int
+    strong_results: int
+    best_score: float
+
+
+@dataclass(frozen=True)
+class BaudFocusDecision:
+    """Current baud-focus confidence decision."""
+
+    baud: int | None
+    reason: str | None
+    disabled_reason: str | None
+
+
+@dataclass(frozen=True)
+class BaudFocusReport:
+    """Run summary for exploratory baud-focused narrowing."""
+
+    enabled: bool
+    engaged: bool
+    focused_baud: int | None
+    deferred_other_bauds: bool
+    deferred_candidate_count: int
+    deferred_bauds: list[int]
+    engage_reason: str | None
+    release_reason: str | None
+    disabled_reason: str | None
+    tested_before_engage: int | None
 
 
 @dataclass(frozen=True)
@@ -229,6 +274,7 @@ class ExploratorySelection:
     notes: list[str]
     cutoff_score: float | None
     truncated: bool
+    baud_focus: BaudFocusReport
 
 
 @dataclass(frozen=True)
@@ -1358,10 +1404,17 @@ def write_json_report(
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def write_csv_report(path: Path, results: Sequence[CandidateResult]) -> None:
+def write_csv_report(
+    path: Path,
+    results: Sequence[CandidateResult],
+    metadata: dict[str, Any] | None = None,
+) -> None:
     """Write a sortable CSV summary for all candidate results."""
     path.parent.mkdir(parents=True, exist_ok=True)
     ranked = sorted(results, key=result_sort_key, reverse=True)
+    exploratory = (metadata or {}).get("exploratory_mode", {})
+    baud_focus = exploratory.get("baud_focus", {})
+    scan_mode = (metadata or {}).get("scan_mode", "")
     fieldnames = [
         "rank",
         "score",
@@ -1383,6 +1436,13 @@ def write_csv_report(path: Path, results: Sequence[CandidateResult]) -> None:
         "length_ratio",
         "elapsed_sec",
         "error",
+        "scan_mode",
+        "baud_focus_engaged",
+        "baud_focus_baud",
+        "baud_focus_deferred",
+        "baud_focus_deferred_count",
+        "baud_focus_engage_reason",
+        "baud_focus_release_reason",
     ]
     with path.open("w", newline="", encoding="utf-8") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
@@ -1410,6 +1470,21 @@ def write_csv_report(path: Path, results: Sequence[CandidateResult]) -> None:
                     "length_ratio": f"{result.metrics.length_ratio:.6f}",
                     "elapsed_sec": f"{result.elapsed_sec:.3f}",
                     "error": result.error or "",
+                    "scan_mode": str(scan_mode).upper(),
+                    "baud_focus_engaged": (
+                        "YES" if baud_focus.get("engaged") else "NO"
+                    ),
+                    "baud_focus_baud": baud_focus.get("focused_baud") or "",
+                    "baud_focus_deferred": (
+                        "YES"
+                        if baud_focus.get("deferred_other_bauds")
+                        else "NO"
+                    ),
+                    "baud_focus_deferred_count": (
+                        baud_focus.get("deferred_candidate_count") or 0
+                    ),
+                    "baud_focus_engage_reason": baud_focus.get("engage_reason") or "",
+                    "baud_focus_release_reason": baud_focus.get("release_reason") or "",
                 }
             )
 
@@ -1771,6 +1846,11 @@ def default_scan_options() -> ScanOptions:
         auto_validate_top_matches=True,
         validate_size_1_bytes=8 * 1024,
         validate_size_2_tie_bytes=16 * 1024,
+        baud_focus_enabled=BAUD_FOCUS_ENABLED_DEFAULT,
+        baud_focus_strong_score_threshold=BAUD_FOCUS_STRONG_SCORE_THRESHOLD,
+        baud_focus_lead_gap_threshold=BAUD_FOCUS_LEAD_GAP_THRESHOLD,
+        baud_focus_min_strong_results=BAUD_FOCUS_MIN_STRONG_RESULTS,
+        baud_focus_min_samples=BAUD_FOCUS_MIN_SAMPLES,
     )
 
 
@@ -1804,6 +1884,14 @@ def validate_options(options: ScanOptions) -> None:
         and options.validate_size_2_tie_bytes < minimum_payload_size()
     ):
         raise ValueError(f"VALIDATE SIZE 2 MUST BE 0 OR AT LEAST {minimum_payload_size()} BYTES")
+    if not 0.0 <= options.baud_focus_strong_score_threshold <= 100.0:
+        raise ValueError("BAUD FOCUS SCORE MUST BE 0..100")
+    if options.baud_focus_lead_gap_threshold < 0.0:
+        raise ValueError("BAUD FOCUS GAP CANNOT BE NEGATIVE")
+    if options.baud_focus_min_strong_results <= 0:
+        raise ValueError("BAUD FOCUS GOOD COUNT MUST BE POSITIVE")
+    if options.baud_focus_min_samples <= 0:
+        raise ValueError("BAUD FOCUS SAMPLE COUNT MUST BE POSITIVE")
     available_bauds(options.min_baud, options.max_baud)
 
 
@@ -1843,6 +1931,19 @@ def exploratory_fixed_settings_label() -> str:
     )
 
 
+def baud_focus_settings_label(options: ScanOptions) -> str:
+    """Return a compact operator label for baud focus settings."""
+    if not options.baud_focus_enabled:
+        return "OFF"
+    return (
+        "ON, "
+        f"SCORE>={options.baud_focus_strong_score_threshold:.1f}, "
+        f"GAP>={options.baud_focus_lead_gap_threshold:.1f}, "
+        f"GOOD>={options.baud_focus_min_strong_results}, "
+        f"SAMPLES>={options.baud_focus_min_samples}"
+    )
+
+
 def exploratory_scan_options(options: ScanOptions) -> ScanOptions:
     """Return fixed internal options for quick exploratory mode."""
     return dataclasses.replace(
@@ -1860,6 +1961,193 @@ def exploratory_scan_options(options: ScanOptions) -> ScanOptions:
     )
 
 
+def empty_baud_focus_report(
+    enabled: bool,
+    disabled_reason: str | None = None,
+) -> BaudFocusReport:
+    """Return a no-focus report with optional disabled reason."""
+    return BaudFocusReport(
+        enabled=enabled,
+        engaged=False,
+        focused_baud=None,
+        deferred_other_bauds=False,
+        deferred_candidate_count=0,
+        deferred_bauds=[],
+        engage_reason=None,
+        release_reason=None,
+        disabled_reason=disabled_reason,
+        tested_before_engage=None,
+    )
+
+
+def group_candidates_by_baud(
+    candidates: Sequence[SerialSettings],
+) -> tuple[list[int], dict[int, list[SerialSettings]]]:
+    """Group candidate settings by baud while preserving scan baud order."""
+    baud_order: list[int] = []
+    grouped: dict[int, list[SerialSettings]] = {}
+    for candidate in candidates:
+        if candidate.baud not in grouped:
+            grouped[candidate.baud] = []
+            baud_order.append(candidate.baud)
+        grouped[candidate.baud].append(candidate)
+    return baud_order, grouped
+
+
+def balanced_baud_candidates(
+    candidates: Sequence[SerialSettings],
+) -> list[SerialSettings]:
+    """Return a round-robin candidate order that samples every baud early."""
+    baud_order, grouped = group_candidates_by_baud(candidates)
+    max_group_size = max((len(group) for group in grouped.values()), default=0)
+    ordered: list[SerialSettings] = []
+    for offset in range(max_group_size):
+        for baud in baud_order:
+            group = grouped[baud]
+            if offset < len(group):
+                ordered.append(group[offset])
+    return ordered
+
+
+def next_unseen_candidate(
+    candidates: Sequence[SerialSettings],
+    tested: set[SerialSettings],
+) -> SerialSettings | None:
+    """Return the next candidate not already tested."""
+    for candidate in candidates:
+        if candidate not in tested:
+            return candidate
+    return None
+
+
+def result_blocks_baud_focus(result: CandidateResult) -> str | None:
+    """Return a reason when a result disables baud focus narrowing."""
+    if result.status == "stale-output":
+        return "STALE OUTPUT SEEN"
+    if result.error or result.status in {"error", "partial-write"}:
+        return "ERROR SEEN"
+    return None
+
+
+def baud_focus_block_reason(results: Sequence[CandidateResult]) -> str | None:
+    """Return the first stale/error reason that blocks baud focus."""
+    for result in results:
+        reason = result_blocks_baud_focus(result)
+        if reason is not None:
+            return reason
+    return None
+
+
+def baud_focus_stats(
+    results: Sequence[CandidateResult],
+    baud_order: Sequence[int],
+    strong_score_threshold: float,
+) -> list[BaudFocusStats]:
+    """Return per-baud sample counts and strong-hit totals."""
+    samples = {baud: 0 for baud in baud_order}
+    strong = {baud: 0 for baud in baud_order}
+    best = {baud: 0.0 for baud in baud_order}
+    for result in results:
+        baud = result.settings.baud
+        if baud not in samples:
+            continue
+        samples[baud] += 1
+        best[baud] = max(best[baud], result.score)
+        if (
+            not result.error
+            and result.status not in {"error", "no-data", "stale-output", "partial-write"}
+            and result.score >= strong_score_threshold
+        ):
+            strong[baud] += 1
+    return [
+        BaudFocusStats(
+            baud=baud,
+            samples=samples[baud],
+            strong_results=strong[baud],
+            best_score=best[baud],
+        )
+        for baud in baud_order
+    ]
+
+
+def baud_focus_sample_floor_met(
+    results: Sequence[CandidateResult],
+    baud_order: Sequence[int],
+    grouped_candidates: dict[int, list[SerialSettings]],
+    options: ScanOptions,
+) -> bool:
+    """Return True after each baud has enough early samples."""
+    stats = baud_focus_stats(
+        results,
+        baud_order,
+        options.baud_focus_strong_score_threshold,
+    )
+    return all(
+        stat.samples >= min(
+            options.baud_focus_min_samples,
+            len(grouped_candidates.get(stat.baud, [])),
+        )
+        for stat in stats
+    )
+
+
+def select_baud_focus(
+    results: Sequence[CandidateResult],
+    baud_order: Sequence[int],
+    grouped_candidates: dict[int, list[SerialSettings]],
+    options: ScanOptions,
+) -> BaudFocusDecision:
+    """Return a focused baud only after all confidence gates pass."""
+    if not options.baud_focus_enabled:
+        return BaudFocusDecision(None, None, "BAUD FOCUS OFF")
+    if len(baud_order) < 2:
+        return BaudFocusDecision(None, None, "ONLY ONE BAUD SELECTED")
+
+    blocked = baud_focus_block_reason(results)
+    if blocked is not None:
+        return BaudFocusDecision(None, None, blocked)
+
+    stats = baud_focus_stats(
+        results,
+        baud_order,
+        options.baud_focus_strong_score_threshold,
+    )
+    if not baud_focus_sample_floor_met(results, baud_order, grouped_candidates, options):
+        return BaudFocusDecision(None, None, None)
+
+    eligible = [
+        stat
+        for stat in stats
+        if stat.samples >= min(
+            options.baud_focus_min_samples,
+            len(grouped_candidates.get(stat.baud, [])),
+        )
+        and stat.strong_results >= options.baud_focus_min_strong_results
+        and stat.best_score >= options.baud_focus_strong_score_threshold
+    ]
+    if not eligible:
+        return BaudFocusDecision(None, None, None)
+
+    eligible.sort(
+        key=lambda stat: (stat.best_score, stat.strong_results, stat.samples),
+        reverse=True,
+    )
+    best = eligible[0]
+    next_best_score = max(
+        (stat.best_score for stat in stats if stat.baud != best.baud),
+        default=0.0,
+    )
+    lead_gap = best.best_score - next_best_score
+    if lead_gap < options.baud_focus_lead_gap_threshold:
+        return BaudFocusDecision(None, None, None)
+
+    reason = (
+        f"SCORE={best.best_score:.1f} GAP={lead_gap:.1f} "
+        f"GOOD={best.strong_results} SAMPLES={best.samples}"
+    )
+    return BaudFocusDecision(best.baud, reason, None)
+
+
 def is_exploratory_signal(result: CandidateResult) -> bool:
     """Return True when an exploratory result is useful enough for narrowing."""
     if result.error:
@@ -1873,6 +2161,7 @@ def select_exploratory_candidates(
     results: Sequence[CandidateResult],
     all_candidates: Sequence[SerialSettings],
     elapsed_sec: float,
+    baud_focus: BaudFocusReport,
 ) -> ExploratorySelection:
     """Select a conservative full-scan shortlist from exploratory results."""
     ranked_results = sorted(results, key=result_sort_key, reverse=True)
@@ -1969,6 +2258,7 @@ def select_exploratory_candidates(
         notes=notes,
         cutoff_score=cutoff_score,
         truncated=truncated,
+        baud_focus=baud_focus,
     )
 
 
@@ -1995,8 +2285,34 @@ def print_exploratory_start(
         f"LIMIT={exploratory_options.pre_drain_timeout:.1f}S "
         f"MAX={exploratory_options.max_drain_bytes} BYTES."
     )
+    print(f"BAUD FOCUS: {baud_focus_settings_label(options)}.")
     print(f"SETTINGS: {candidate_count}; BROAD LIGHT PASS.")
     print(border_line(REPORT_WIDTH))
+
+
+def print_baud_focus_report(report: BaudFocusReport) -> None:
+    """Print baud focus summary lines in the report style."""
+    if not report.enabled:
+        print("  BAUD FOCUS:          OFF")
+        return
+    if report.engaged:
+        print(f"  BAUD FOCUS:          ENGAGED {report.focused_baud}")
+        print(
+            "  OTHER BAUDS:         "
+            + (
+                f"DEFERRED {report.deferred_candidate_count} SETTINGS"
+                if report.deferred_other_bauds
+                else "NOT DEFERRED"
+            )
+        )
+        if report.engage_reason:
+            print(f"  FOCUS REASON:        {report.engage_reason}")
+        if report.release_reason:
+            print(f"  FOCUS RELEASE:       {report.release_reason}")
+        return
+    print("  BAUD FOCUS:          NOT ENGAGED")
+    if report.disabled_reason:
+        print(f"  FOCUS DISABLED:      {report.disabled_reason}")
 
 
 def print_exploratory_summary(selection: ExploratorySelection) -> None:
@@ -2006,6 +2322,7 @@ def print_exploratory_summary(selection: ExploratorySelection) -> None:
     print(f"  RUN TIME:             {format_duration(selection.elapsed_sec)}")
     print(f"  SETTINGS TESTED:      {len(selection.results)}")
     print(f"  FIXED SETTINGS:       {exploratory_fixed_settings_label()}")
+    print_baud_focus_report(selection.baud_focus)
     if selection.fallback_reason:
         print(f"  FINDING:              {selection.fallback_reason}")
     elif selection.shortlist_results:
@@ -2064,6 +2381,7 @@ def exploratory_metadata(
     selection: ExploratorySelection | None,
     original_candidate_count: int,
     final_candidate_count: int,
+    options: ScanOptions,
 ) -> dict[str, Any]:
     """Return JSON metadata for exploratory mode and candidate narrowing."""
     fixed_settings = {
@@ -2079,6 +2397,13 @@ def exploratory_metadata(
         "shortlist_limit": EXPLORATORY_SHORTLIST_LIMIT,
         "min_narrow_score": EXPLORATORY_MIN_NARROW_SCORE,
         "score_tolerance": EXPLORATORY_SCORE_TOLERANCE,
+        "baud_focus_enabled": options.baud_focus_enabled,
+        "baud_focus_strong_score_threshold": (
+            options.baud_focus_strong_score_threshold
+        ),
+        "baud_focus_lead_gap_threshold": options.baud_focus_lead_gap_threshold,
+        "baud_focus_min_strong_results": options.baud_focus_min_strong_results,
+        "baud_focus_min_samples": options.baud_focus_min_samples,
     }
     metadata: dict[str, Any] = {
         "requested": requested,
@@ -2094,6 +2419,12 @@ def exploratory_metadata(
     }
     if selection is None:
         metadata["ran"] = False
+        metadata["baud_focus"] = dataclass_to_jsonable(
+            empty_baud_focus_report(
+                options.baud_focus_enabled,
+                "EXPLORATORY NOT RUN",
+            )
+        )
         return metadata
 
     metadata.update(
@@ -2105,6 +2436,7 @@ def exploratory_metadata(
             "cutoff_score": selection.cutoff_score,
             "truncated": selection.truncated,
             "notes": selection.notes,
+            "baud_focus": dataclass_to_jsonable(selection.baud_focus),
             "shortlist_count": len(selection.shortlist_results),
             "narrowed_candidate_count": len(selection.narrowed_candidates),
             "shortlist_settings": [
@@ -2144,7 +2476,59 @@ def run_exploratory_scan(
 
     started = time.monotonic()
     results: list[CandidateResult] = []
-    for index, settings in enumerate(candidates, start=1):
+    tested: set[SerialSettings] = set()
+    baud_order, grouped = group_candidates_by_baud(candidates)
+    balanced_candidates = balanced_baud_candidates(candidates)
+    focus_enabled = options.baud_focus_enabled and len(baud_order) > 1
+    focus_active = False
+    focus_engaged = False
+    focused_baud: int | None = None
+    focus_engage_reason: str | None = None
+    focus_release_reason: str | None = None
+    focus_disabled_reason: str | None = (
+        "ONLY ONE BAUD SELECTED"
+        if options.baud_focus_enabled and len(baud_order) < 2
+        else None
+    )
+    tested_before_engage: int | None = None
+    deferred_candidate_count = 0
+    deferred_bauds: list[int] = []
+    full_sweep_mode = not focus_enabled
+
+    while True:
+        if focus_active and focused_baud is not None:
+            settings = next_unseen_candidate(grouped[focused_baud], tested)
+            if settings is None:
+                deferred = [
+                    candidate
+                    for candidate in candidates
+                    if candidate not in tested and candidate.baud != focused_baud
+                ]
+                deferred_candidate_count = len(deferred)
+                deferred_bauds = [
+                    baud
+                    for baud in baud_order
+                    if baud != focused_baud
+                    and any(candidate.baud == baud for candidate in deferred)
+                ]
+                if deferred_candidate_count:
+                    print("OTHER BAUDS DEFERRED BY CONFIDENCE RULE")
+                    logger.info(
+                        "baud focus deferred %s settings at bauds %s",
+                        deferred_candidate_count,
+                        deferred_bauds,
+                    )
+                break
+        elif full_sweep_mode:
+            settings = next_unseen_candidate(candidates, tested)
+            if settings is None:
+                break
+        else:
+            settings = next_unseen_candidate(balanced_candidates, tested)
+            if settings is None:
+                break
+
+        index = len(results) + 1
         result = run_candidate(
             serial_module=serial_module,
             index=index,
@@ -2156,18 +2540,92 @@ def run_exploratory_scan(
             progress=None,
         )
         results.append(result)
+        tested.add(settings)
         print("QUICK " + format_progress(result), flush=True)
         print(format_scan_eta(len(results), len(candidates), started), flush=True)
 
+        if focus_enabled:
+            decision = select_baud_focus(results, baud_order, grouped, options)
+            if focus_active:
+                if decision.disabled_reason:
+                    focus_active = False
+                    full_sweep_mode = True
+                    focus_release_reason = decision.disabled_reason
+                    print(f"BAUD FOCUS CANCELED: {decision.disabled_reason}")
+                    print("RETURNING TO FULL BAUD SWEEP")
+                    logger.info(
+                        "baud focus canceled for %s: %s",
+                        focused_baud,
+                        decision.disabled_reason,
+                    )
+                elif decision.baud != focused_baud:
+                    focus_active = False
+                    full_sweep_mode = True
+                    focus_release_reason = "CONFIDENCE DROPPED"
+                    print("BAUD FOCUS CANCELED: CONFIDENCE DROPPED")
+                    print("RETURNING TO FULL BAUD SWEEP")
+                    logger.info("baud focus canceled for %s: confidence dropped", focused_baud)
+            elif not full_sweep_mode:
+                if decision.disabled_reason:
+                    full_sweep_mode = True
+                    focus_disabled_reason = decision.disabled_reason
+                    print(f"BAUD FOCUS DISABLED: {decision.disabled_reason}")
+                    print("RETURNING TO FULL BAUD SWEEP")
+                    logger.info("baud focus disabled: %s", decision.disabled_reason)
+                elif decision.baud is not None:
+                    focus_active = True
+                    focus_engaged = True
+                    focused_baud = decision.baud
+                    focus_engage_reason = decision.reason
+                    tested_before_engage = len(results)
+                    print(
+                        f"BAUD FOCUS ENGAGED: {focused_baud} "
+                        f"{focus_engage_reason or ''}".rstrip()
+                    )
+                    logger.info(
+                        "baud focus engaged for %s: %s",
+                        focused_baud,
+                        focus_engage_reason,
+                    )
+                elif baud_focus_sample_floor_met(
+                    results,
+                    baud_order,
+                    grouped,
+                    options,
+                ):
+                    full_sweep_mode = True
+                    focus_disabled_reason = "CONFIDENCE LOW"
+                    print("BAUD FOCUS NOT ENGAGED: CONFIDENCE LOW")
+                    print("RETURNING TO FULL BAUD SWEEP")
+                    logger.info("baud focus not engaged: confidence low")
+
     elapsed_sec = time.monotonic() - started
-    selection = select_exploratory_candidates(results, candidates, elapsed_sec)
+    baud_focus_report = BaudFocusReport(
+        enabled=options.baud_focus_enabled,
+        engaged=focus_engaged,
+        focused_baud=focused_baud,
+        deferred_other_bauds=deferred_candidate_count > 0,
+        deferred_candidate_count=deferred_candidate_count,
+        deferred_bauds=deferred_bauds,
+        engage_reason=focus_engage_reason,
+        release_reason=focus_release_reason,
+        disabled_reason=focus_disabled_reason,
+        tested_before_engage=tested_before_engage,
+    )
+    selection = select_exploratory_candidates(
+        results,
+        candidates,
+        elapsed_sec,
+        baud_focus_report,
+    )
     print_exploratory_summary(selection)
     logger.info(
-        "quick exploratory completed; candidates=%s fallback=%s shortlist=%s narrowed=%s",
+        "quick exploratory completed; candidates=%s fallback=%s shortlist=%s narrowed=%s baud_focus=%s",
         len(results),
         selection.fallback_reason,
         len(selection.shortlist_results),
         len(selection.narrowed_candidates),
+        dataclass_to_jsonable(baud_focus_report),
     )
     return selection
 
@@ -2264,6 +2722,22 @@ def prompt_yes_no_question(question: str, current: bool) -> bool:
         print("ENTER Y OR N.")
 
 
+def prompt_scan_mode() -> str:
+    """Prompt for AUTO or MANUAL scan mode. Blank defaults to AUTO."""
+    while True:
+        try:
+            value = input("SCAN MODE: AUTO OR MANUAL [AUTO]: ").strip().lower()
+        except EOFError:
+            return "auto"
+        if value == "":
+            return "auto"
+        if value in {"a", "auto"}:
+            return "auto"
+        if value in {"m", "manual"}:
+            return "manual"
+        print("ENTER A OR M.")
+
+
 def print_menu_help() -> None:
     """Print short help for the interactive CLI."""
     print_banner()
@@ -2282,9 +2756,11 @@ def print_menu_help() -> None:
     print("  USE 11 MEMORY TEST AFTER A GOOD SETTING IS FOUND.")
     print()
     print("OPERATOR NOTES:")
+    print("  SCAN MODE:       AUTO OR MANUAL AT SCAN START; BLANK=AUTO.")
     print("  TEST SIZE:       BYTES SENT FOR EACH SETTING.")
     print("  TEST COUNT:      NUMBER OF TRIES PER SETTING.")
-    print("  QUICK MODE:      ASKED AT SCAN START; FIXED INTERNAL SETTINGS.")
+    print("  QUICK MODE:      AUTO=YES; MANUAL ASKS; FIXED INTERNAL SETTINGS.")
+    print("  BAUD FOCUS:      QUICK MODE MAY DEFER OTHER BAUDS WHEN CONFIDENT.")
     print("  ASK ON MATCH:    PAUSE AFTER PASS; ASK CONTINUE.")
     print("  CLEAR OUTPUT:    DISCARD OLD BUFFER DATA FIRST.")
     print("  MAX CLEAR:       DEFAULT 32768 BYTES.")
@@ -2321,6 +2797,7 @@ def print_configuration(options: ScanOptions) -> None:
     print()
     print_banner()
     print("CURRENT SETTINGS")
+    print_setting("SCAN MODE:", "ASK AT START; BLANK=AUTO")
     print_setting("PORTS:", f"{options.in_port} -> {options.out_port}")
     print_setting("BAUD RANGE:", f"{options.min_baud}..{options.max_baud}")
     print_setting("SETTINGS:", len(candidates))
@@ -2340,6 +2817,7 @@ def print_configuration(options: ScanOptions) -> None:
         "QUICK MODE:",
         f"ASK AT START; FIXED INTERNAL {exploratory_fixed_settings_label()}",
     )
+    print_setting("BAUD FOCUS:", baud_focus_settings_label(options))
     print_setting("ASK ON MATCH:", "YES" if options.ask_on_top_match else "NO")
     print_setting(
         "AUTO VALIDATE:",
@@ -2472,6 +2950,44 @@ def configure_reports(options: ScanOptions) -> ScanOptions:
         json_report=json_report,
         csv_report=csv_report,
         log_file=log_file,
+    )
+
+
+def configure_baud_focus(options: ScanOptions) -> ScanOptions:
+    """Prompt for exploratory baud focus settings."""
+    print("BAUD FOCUS")
+    print("USED ONLY BY QUICK EXPLORATORY MODE.")
+    enabled = prompt_yes_no("BAUD FOCUS ENABLED", options.baud_focus_enabled)
+    score_threshold = prompt_float(
+        "BAUD FOCUS SCORE",
+        options.baud_focus_strong_score_threshold,
+        0.0,
+    )
+    lead_gap = prompt_float(
+        "BAUD FOCUS LEAD GAP",
+        options.baud_focus_lead_gap_threshold,
+        0.0,
+    )
+    min_strong = prompt_int(
+        "BAUD FOCUS GOOD COUNT",
+        options.baud_focus_min_strong_results,
+        1,
+    )
+    min_samples = prompt_int(
+        "BAUD FOCUS SAMPLE COUNT",
+        options.baud_focus_min_samples,
+        1,
+    )
+    if score_threshold > 100.0:
+        print("VALUE TOO HIGH. USING 100.0.")
+        score_threshold = 100.0
+    return dataclasses.replace(
+        options,
+        baud_focus_enabled=enabled,
+        baud_focus_strong_score_threshold=score_threshold,
+        baud_focus_lead_gap_threshold=lead_gap,
+        baud_focus_min_strong_results=min_strong,
+        baud_focus_min_samples=min_samples,
     )
 
 
@@ -3198,7 +3714,8 @@ def print_commands() -> None:
     print("  3 SET BAUD RANGE             9 CURRENT SETTINGS")
     print("  4 SET TEST SIZE/COUNT       10 HELP")
     print("  5 SET TIMING                11 MEMORY TEST")
-    print("  6 CLEAR OLD OUTPUT           0 QUIT")
+    print("  6 CLEAR OLD OUTPUT          12 BAUD FOCUS")
+    print("  0 QUIT")
 
 
 def interactive_menu() -> ScanOptions | None:
@@ -3248,10 +3765,12 @@ def interactive_menu() -> ScanOptions | None:
             print_menu_help()
         elif choice == "11":
             run_memory_test(options)
+        elif choice == "12":
+            options = configure_baud_focus(options)
         elif choice in {"0", "q", "quit", "exit"}:
             return None
         else:
-            print("ENTER A NUMBER FROM 0 TO 11.")
+            print("ENTER A NUMBER FROM 0 TO 12.")
 
 
 def metadata_for_scan(
@@ -3259,6 +3778,7 @@ def metadata_for_scan(
     pyserial_version: str,
     payload: ProbePayload,
     candidate_count: int,
+    scan_mode: str,
     started_at: str,
     completed_at: str | None = None,
     early_stopped: bool = False,
@@ -3274,6 +3794,7 @@ def metadata_for_scan(
         "in_port": options.in_port,
         "out_port": options.out_port,
         "mode": "scan",
+        "scan_mode": scan_mode,
         "candidate_count": candidate_count,
         "completed_candidates": None,
         "early_stopped": early_stopped,
@@ -3302,10 +3823,22 @@ def run_scan(options: ScanOptions) -> int:
     logger.info("payload: %s bytes, %s lines", payload.byte_count, payload.line_count)
     logger.info("candidates: %s", len(all_candidates))
 
-    exploratory_requested = prompt_yes_no_question(
-        "Run quick exploratory mode first?",
-        False,
-    )
+    scan_mode = prompt_scan_mode()
+    auto_mode = scan_mode == "auto"
+    if auto_mode:
+        exploratory_requested = True
+        phase2_auto_accept = True
+        print("AUTO MODE: EXPLORATORY=YES PHASE2=YES")
+        logger.info("scan mode auto: exploratory=yes phase2=yes")
+    else:
+        print("MANUAL MODE: OPERATOR PROMPTS ENABLED")
+        exploratory_requested = prompt_yes_no_question(
+            "Run quick exploratory mode first?",
+            False,
+        )
+        phase2_auto_accept = False
+        logger.info("scan mode manual: exploratory=%s", exploratory_requested)
+
     exploratory_selection: ExploratorySelection | None = None
     exploratory_narrowing_accepted = False
     if exploratory_requested:
@@ -3316,14 +3849,18 @@ def run_scan(options: ScanOptions) -> int:
             logger=logger,
         )
         if exploratory_selection.narrowed_candidates:
-            exploratory_narrowing_accepted = prompt_yes_no_question(
-                "Use these findings to narrow full analysis?",
-                False,
-            )
+            if phase2_auto_accept:
+                exploratory_narrowing_accepted = True
+                print("AUTO MODE: PHASE2 QUICK LIST ACCEPTED")
+            else:
+                exploratory_narrowing_accepted = prompt_yes_no_question(
+                    "Use these findings to narrow full analysis?",
+                    False,
+                )
             if exploratory_narrowing_accepted:
                 candidates = list(exploratory_selection.narrowed_candidates)
                 logger.info(
-                    "operator accepted exploratory narrowing; full candidates=%s/%s",
+                    "exploratory narrowing accepted; full candidates=%s/%s",
                     len(candidates),
                     len(all_candidates),
                 )
@@ -3343,6 +3880,9 @@ def run_scan(options: ScanOptions) -> int:
     started_at = dt.datetime.now(dt.timezone.utc).isoformat()
 
     print_report_title("SCAN START")
+    print(f"SCAN MODE: {scan_mode.upper()}.")
+    if auto_mode:
+        print("AUTO MODE: EXPLORATORY=YES PHASE2=YES.")
     if exploratory_narrowing_accepted:
         print("MODE: FULL ANALYSIS OF QUICK EXPLORATORY SHORTLIST.")
         print(f"SETTINGS: {len(candidates)}/{len(all_candidates)} SELECTED BY QUICK MODE.")
@@ -3428,6 +3968,7 @@ def run_scan(options: ScanOptions) -> int:
         pyserial_version=pyserial_version,
         payload=payload,
         candidate_count=len(candidates),
+        scan_mode=scan_mode,
         started_at=started_at,
         completed_at=completed_at,
         early_stopped=early_stopped,
@@ -3458,9 +3999,10 @@ def run_scan(options: ScanOptions) -> int:
         selection=exploratory_selection,
         original_candidate_count=len(all_candidates),
         final_candidate_count=len(candidates),
+        options=options,
     )
     write_json_report(options.json_report, metadata, results)
-    write_csv_report(options.csv_report, results)
+    write_csv_report(options.csv_report, results, metadata)
     logger.info(
         "serial_probe completed; candidates=%s/%s early_stopped=%s exploratory_narrowed=%s",
         len(results),
@@ -3482,6 +4024,7 @@ def run_scan(options: ScanOptions) -> int:
         early_stopped=early_stopped,
         top=options.top,
     )
+    print(f"  NOTE:                 SCAN MODE {scan_mode.upper()}.")
     if exploratory_narrowing_accepted:
         print(
             "  NOTE:                 FULL ANALYSIS USED QUICK EXPLORATORY "
@@ -3489,6 +4032,15 @@ def run_scan(options: ScanOptions) -> int:
         )
     elif exploratory_requested:
         print("  NOTE:                 QUICK EXPLORATORY DID NOT NARROW FULL ANALYSIS.")
+    if exploratory_selection is not None and exploratory_selection.baud_focus.engaged:
+        report = exploratory_selection.baud_focus
+        print(
+            "  NOTE:                 BAUD FOCUS "
+            f"{report.focused_baud}; "
+            f"DEFERRED={report.deferred_candidate_count}."
+        )
+        if report.release_reason:
+            print(f"  NOTE:                 BAUD FOCUS RELEASED: {report.release_reason}.")
     if options.auto_validate_top_matches and results:
         ranked = ranked_top_results(results, options.top)
         top_score = ranked[0].score if ranked else 0.0
