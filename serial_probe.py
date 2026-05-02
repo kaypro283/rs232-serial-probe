@@ -3416,6 +3416,33 @@ def run_phase0_baud_liveness(
     return report
 
 
+def run_phase0_only_sweep(
+    serial_module: Any,
+    options: ScanOptions,
+    logger: logging.Logger,
+) -> int:
+    """Run only the Phase 0 baud liveness sweep and stop before full scan."""
+    candidates = prioritize_discovery_candidates(
+        generate_candidates(options.min_baud, options.max_baud),
+        options,
+    )
+    logger.info("phase 0 only sweep requested")
+    logger.info("options: %s", options)
+    logger.info("phase 0 only candidates before baud grouping: %s", len(candidates))
+    run_phase0_baud_liveness(
+        serial_module=serial_module,
+        options=options,
+        candidates=candidates,
+        logger=logger,
+    )
+    print()
+    print_report_title("PHASE 0 SWEEP COMPLETE")
+    print("FULL SCAN WAS NOT RUN.")
+    print_wrapped_value("  DEBUG LOG:   ", options.log_file)
+    print(border_line(REPORT_WIDTH))
+    return 0
+
+
 def run_exploratory_scan(
     serial_module: Any,
     options: ScanOptions,
@@ -3737,6 +3764,14 @@ def prompt_scan_mode() -> str:
         print("ENTER F OR Q.")
 
 
+def prompt_phase0_only_sweep() -> bool:
+    """Ask whether start scan should run only the Phase 0 baud sweep."""
+    return prompt_yes_no_question(
+        "Run only Phase 0 baud liveness sweep?",
+        False,
+    )
+
+
 def print_menu_help() -> None:
     """Print short help for the interactive CLI."""
     print_paged_lines(
@@ -3757,6 +3792,7 @@ def print_menu_help() -> None:
             "  USE 11 MEMORY TEST AFTER A GOOD SETTING IS FOUND.",
             "",
             "OPERATOR NOTES:",
+            "  START SCAN:      FIRST ASKS WHETHER TO RUN ONLY PHASE 0.",
             "  SCAN TYPE:       FULL OR QUICK AT SCAN START; BLANK=FULL.",
             "  FULL MODE:       MOST RELIABLE FOR SWITCH MAPPING; QUICK MODE ASKS.",
             "  QUICK MODE:      RUNS DISCOVERY AND MAY NARROW PHASE 2.",
@@ -4919,10 +4955,18 @@ def metadata_for_scan(
 
 def run_scan(options: ScanOptions) -> int:
     """Run the serial probe scan and write reports."""
+    phase0_only = prompt_phase0_only_sweep()
     serial_module = import_or_install_pyserial()
     logger = setup_logging(options.log_file)
     pyserial_version = str(getattr(serial_module, "VERSION", "unknown"))
     logger.info("serial_probe started")
+
+    if phase0_only:
+        return run_phase0_only_sweep(
+            serial_module=serial_module,
+            options=options,
+            logger=logger,
+        )
 
     scan_mode = prompt_scan_mode()
     turbo_enabled = prompt_yes_no_question(
