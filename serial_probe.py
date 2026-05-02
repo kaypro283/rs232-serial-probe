@@ -449,26 +449,6 @@ class DualBaudLivenessReport:
 
 
 @dataclass(frozen=True)
-class MemoryTestResult:
-    """Result from one memory test transfer size."""
-
-    size_bytes: int
-    size_label: str
-    method: str
-    settings: SerialSettings
-    bytes_sent: int
-    bytes_received: int
-    bytes_cleared_before: int
-    bytes_seen_before_release: int
-    score: float
-    indicator: str
-    status: str
-    error: str | None
-    elapsed_sec: float
-    metrics: ScoreMetrics
-
-
-@dataclass(frozen=True)
 class FlowControlValidationResult:
     """Result from one post-scan flow-control validation."""
 
@@ -532,32 +512,6 @@ def switch_note_hash(switch_note: str | None) -> str | None:
     if not note:
         return None
     return f"{fnv1a32(note.encode('utf-8', 'replace')):08X}"
-
-
-def settings_nonce_id(settings: SerialSettings | DualSerialSettings) -> str:
-    """Return a compact serial-settings id for payload nonce fields."""
-    if isinstance(settings, DualSerialSettings):
-        return sanitize_nonce_value(
-            "I"
-            f"{settings.input_settings.baud}"
-            f"{settings.input_settings.data_bits}"
-            f"{settings.input_settings.parity_code()}"
-            f"{settings.input_settings.stop_bits}"
-            f"{flow_control_code(settings.input_settings.flow_control)}"
-            "_O"
-            f"{settings.output_settings.baud}"
-            f"{settings.output_settings.data_bits}"
-            f"{settings.output_settings.parity_code()}"
-            f"{settings.output_settings.stop_bits}"
-            f"{flow_control_code(settings.output_settings.flow_control)}"
-        )
-    return sanitize_nonce_value(
-        f"{settings.baud}"
-        f"{settings.data_bits}"
-        f"{settings.parity_code()}"
-        f"{settings.stop_bits}"
-        f"{flow_control_code(settings.flow_control)}"
-    )
 
 
 def candidate_nonce_id(
@@ -1404,13 +1358,6 @@ def format_finish_clock(remaining_seconds: float, now: dt.datetime | None = None
     if finish.date() == current.date():
         return finish.strftime("%H:%M:%S")
     return finish.strftime("%Y-%m-%d %H:%M:%S")
-
-
-def byte_size_label(byte_count: int) -> str:
-    """Return an early-terminal-friendly byte count label."""
-    if byte_count % 1024 == 0:
-        return f"{byte_count // 1024}K"
-    return f"{byte_count} BYTES"
 
 
 def result_indicator(score: float, status: str, error: str | None = None) -> str:
@@ -3931,7 +3878,6 @@ def print_menu_help() -> None:
             "  READ OUTPUT PORT.",
             "  TEST EACH SELECTED SERIAL SETTING.",
             "  RANK BY MATCH QUALITY.",
-            "  USE MENU 2 FOR MEMORY TEST AFTER A GOOD SETTING IS FOUND.",
             "",
             "OPERATOR NOTES:",
             "  START SCAN:      CHOOSE AUTOMATED DISCOVERY, BANK 2 TEST, OR PHASE 0.",
@@ -3953,7 +3899,6 @@ def print_menu_help() -> None:
             "  8-BIT TEST:      SEPARATE HIGH-BIT CHALLENGE; ASCII PASS IS NOT ENOUGH.",
             "  MAX CLEAR:       DEFAULT 32768 BYTES.",
             "  TOP ROWS:        BEST RESULTS SHOWN AT END.",
-            "  MEMORY TEST:     MENU 2 AFTER SCAN.",
             "  BREAK:           CTRL+C ASKS RESUME, REPORT, MENU, OR QUIT.",
             "  AFTER SCAN:      RUN AGAIN, MAIN MENU, OR QUIT.",
         ]
@@ -4089,7 +4034,6 @@ def print_configuration(options: ScanOptions) -> None:
         )
     )
     lines.extend(setting_lines("TOP ROWS:", options.top))
-    lines.extend(setting_lines("MEMORY TEST:", "USE MENU 2 AFTER SCAN"))
     lines.extend(setting_lines("BANK 2 TEST:", "AVAILABLE INSIDE START SCAN"))
     lines.extend(setting_lines("REPORT FILE:", options.text_report))
     lines.extend(
@@ -4172,7 +4116,7 @@ def configure_timing(options: ScanOptions) -> ScanOptions:
     """Prompt for timing settings."""
     print("TIMING AND STALE DATA")
     print("TURBO APPLIES ONLY TO SCAN DISCOVERY.")
-    print("VALIDATION AND MEMORY TESTS STAY CONSERVATIVE.")
+    print("VALIDATION USES CONSERVATIVE TIMING.")
     turbo_enabled = prompt_yes_no(
         "TURBO DISCOVERY MODE",
         options.turbo_discovery_enabled,
@@ -4233,150 +4177,6 @@ def configure_reports(options: ScanOptions) -> ScanOptions:
         switch_note=switch_note,
         log_file=log_file,
     )
-
-
-def prompt_parity(current: str) -> str:
-    """Prompt for a parity value."""
-    choices = {
-        "n": "none",
-        "none": "none",
-        "e": "even",
-        "even": "even",
-        "o": "odd",
-        "odd": "odd",
-        "m": "mark",
-        "mark": "mark",
-        "s": "space",
-        "space": "space",
-    }
-    while True:
-        try:
-            value = input(f"PARITY N/E/O/M/S [{current[0].upper()}]: ").strip().lower()
-        except EOFError:
-            return current
-        if value == "":
-            return current
-        if value in choices:
-            return choices[value]
-        print("ENTER N, E, O, M, OR S.")
-
-
-def prompt_flow_control(current: str) -> str:
-    """Prompt for a flow-control mode."""
-    flow_options = ["none", "xon/xoff", "rts/cts", "dsr/dtr"]
-    print("FLOW CONTROL")
-    print("  1. NONE")
-    print("  2. XON/XOFF")
-    print("  3. RTS/CTS")
-    print("  4. DSR/DTR")
-    current_index = flow_options.index(current) + 1
-    while True:
-        try:
-            choice = input(f"SELECT FLOW CONTROL [{current_index}]: ").strip()
-        except EOFError:
-            return current
-        if choice == "":
-            return current
-        if choice in {"1", "2", "3", "4"}:
-            return flow_options[int(choice) - 1]
-        print("ENTER 1, 2, 3, OR 4.")
-
-
-def prompt_serial_setting(
-    default: SerialSettings,
-    title: str = "MEMORY TEST SERIAL SETTING",
-    intro: str = "ENTER SETTING FROM SCAN REPORT.",
-) -> SerialSettings:
-    """Prompt for a known-good serial setting."""
-    print()
-    print_banner()
-    print(title)
-    print(intro)
-    baud = prompt_int("BAUD RATE", default.baud, 1)
-    while baud not in BAUD_RATES:
-        print("BAUD RATE NOT IN PROGRAM LIST.")
-        baud = prompt_int("BAUD RATE", default.baud, 1)
-    data_bits = prompt_int("DATA BITS, 7 OR 8", default.data_bits, 7)
-    while data_bits not in DATA_BITS:
-        print("ENTER 7 OR 8.")
-        data_bits = prompt_int("DATA BITS, 7 OR 8", default.data_bits, 7)
-    parity = prompt_parity(default.parity)
-    stop_bits = prompt_int("STOP BITS, 1 OR 2", default.stop_bits, 1)
-    while stop_bits not in STOP_BITS:
-        print("ENTER 1 OR 2.")
-        stop_bits = prompt_int("STOP BITS, 1 OR 2", default.stop_bits, 1)
-    flow_control = prompt_flow_control(default.flow_control)
-    return SerialSettings(baud, data_bits, parity, stop_bits, flow_control)
-
-
-def prompt_memory_sizes() -> list[int]:
-    """Prompt for memory test sizes."""
-    print()
-    print_banner()
-    print("MEMORY TEST SIZE")
-    print("  1. 16K QUICK TEST")
-    print("  2. 16K, 32K, 64K")
-    print("  3. 4K THROUGH 64K")
-    print("  4. CUSTOM MAXIMUM, IN K")
-    while True:
-        try:
-            choice = input("ENTER SELECTION [2]: ").strip()
-        except EOFError:
-            return [16 * 1024, 32 * 1024, 64 * 1024]
-        if choice == "":
-            choice = "2"
-        if choice == "1":
-            return [16 * 1024]
-        if choice == "2":
-            return [16 * 1024, 32 * 1024, 64 * 1024]
-        if choice == "3":
-            return [
-                4 * 1024,
-                8 * 1024,
-                12 * 1024,
-                16 * 1024,
-                20 * 1024,
-                24 * 1024,
-                32 * 1024,
-                48 * 1024,
-                64 * 1024,
-            ]
-        if choice == "4":
-            max_k = prompt_int("MAXIMUM SIZE IN K", 64, 1)
-            return [size_k * 1024 for size_k in range(4, max_k + 1, 4)]
-        print("ENTER 1, 2, 3, OR 4.")
-
-
-def prompt_memory_method() -> str:
-    """Prompt for the memory test method."""
-    print()
-    print_banner()
-    print("MEMORY TEST METHOD")
-    print("  1. HOLD OUTPUT, THEN RELEASE")
-    print("  2. READ WHILE SENDING")
-    print()
-    print("USE 1 WITH OFF LINE, HOLD, OR PAUSE CONTROL.")
-    print("USE 2 WHEN OUTPUT CANNOT BE HELD.")
-    while True:
-        try:
-            choice = input("ENTER SELECTION [1]: ").strip()
-        except EOFError:
-            return "hold-release"
-        if choice == "":
-            choice = "1"
-        if choice == "1":
-            return "hold-release"
-        if choice == "2":
-            return "live-transfer"
-        print("ENTER 1 OR 2.")
-
-
-def wait_for_operator(message: str) -> None:
-    """Pause for operator action in the interactive terminal."""
-    try:
-        input(message)
-    except EOFError:
-        return
 
 
 def write_payload_only(
@@ -4515,424 +4315,6 @@ def read_for_fixed_window(
             next_progress_at = now + max(progress_interval, 0.1)
 
     return bytes(received), error, time.monotonic() - started
-
-
-def run_memory_hold_release_test(
-    serial_module: Any,
-    index: int,
-    total: int,
-    size_bytes: int,
-    settings: SerialSettings,
-    options: ScanOptions,
-    logger: logging.Logger,
-) -> MemoryTestResult:
-    """Run one memory test by holding output during the input transfer."""
-    payload = generate_payload(
-        size_bytes,
-        ProbeNonce(
-            run_id=options.run_id or make_run_id("M"),
-            candidate_id=sanitize_nonce_value(
-                f"MEM{index:02d}_{settings_nonce_id(settings)}"
-            ),
-            trial_id="HOLD",
-            switch_note_hash=switch_note_hash(options.switch_note),
-        ),
-    )
-    started = time.monotonic()
-    prefix = f"[MEM {index:02d}/{total:02d} {settings.label()} {byte_size_label(size_bytes)}]"
-    console_progress(border_line(PROGRESS_WIDTH))
-    console_progress(
-        bordered_text(
-            f"MEMORY TEST: {byte_size_label(size_bytes)} ({index}/{total})",
-            PROGRESS_WIDTH,
-        )
-    )
-    console_progress(border_line(PROGRESS_WIDTH))
-    try:
-        with open_serial_port(
-            serial_module,
-            options.out_port,
-            settings,
-            max(options.read_timeout, 2.0),
-        ) as out_serial:
-            with open_serial_port(
-                serial_module,
-                options.in_port,
-                settings,
-                max(options.read_timeout, 2.0),
-            ) as in_serial:
-                reset_serial_buffers(out_serial)
-                reset_serial_buffers(in_serial)
-                time.sleep(options.settle_ms / 1000.0)
-
-                drain = DrainResult(0, 0.0, True, "disabled", None)
-                if not options.no_pre_drain:
-                    drain = drain_output_until_quiet(
-                        out_serial=out_serial,
-                        quiet_seconds=options.pre_drain_quiet,
-                        max_seconds=max(options.pre_drain_timeout, 2.0),
-                        max_bytes=options.max_drain_bytes,
-                        progress_interval=options.progress_interval,
-                        progress=console_progress,
-                        prefix=prefix,
-                        logger=logger,
-                    )
-                    if not drain.quiet:
-                        empty_score = score_received(payload.data, b"")
-                        error = (
-                            "OUTPUT DID NOT GO QUIET BEFORE MEMORY TEST "
-                            f"(REASON={drain.reason.upper()}, CLEARED={drain.bytes_drained})"
-                        )
-                        if drain.error:
-                            error = f"{error}: {drain.error}"
-                        return MemoryTestResult(
-                            size_bytes=size_bytes,
-                            size_label=byte_size_label(size_bytes),
-                            method="hold-release",
-                            settings=settings,
-                            bytes_sent=0,
-                            bytes_received=0,
-                            bytes_cleared_before=drain.bytes_drained,
-                            bytes_seen_before_release=0,
-                            score=0.0,
-                            indicator="STALE",
-                            status="stale-output",
-                            error=error,
-                            elapsed_sec=time.monotonic() - started,
-                            metrics=empty_score.metrics,
-                        )
-
-                wait_for_operator(
-                    "PUT BUFFER OUTPUT ON HOLD OR OFF LINE, THEN PRESS ENTER: "
-                )
-                reset_serial_buffers(out_serial)
-                bytes_sent, write_error, _write_elapsed = write_payload_only(
-                    in_serial=in_serial,
-                    settings=settings,
-                    payload=payload,
-                    progress_interval=options.progress_interval,
-                    prefix=prefix,
-                    logger=logger,
-                )
-                bytes_seen_before_release = int(getattr(out_serial, "in_waiting", 0))
-                if bytes_seen_before_release:
-                    console_progress(
-                        f"{prefix}: {bytes_seen_before_release} BYTES ARRIVED BEFORE RELEASE"
-                    )
-                wait_for_operator(
-                    "RELEASE BUFFER OUTPUT OR PUT IT ON LINE, THEN PRESS ENTER: "
-                )
-                received_bytes, read_error, _read_elapsed = read_until_quiet(
-                    out_serial=out_serial,
-                    settings=settings,
-                    expected_bytes=size_bytes,
-                    read_timeout=max(options.read_timeout, 2.0),
-                    progress_interval=options.progress_interval,
-                    prefix=prefix,
-                    logger=logger,
-                )
-    except Exception as exc:
-        empty_score = score_received(payload.data, b"")
-        logger.exception("memory test %s failed", byte_size_label(size_bytes))
-        return MemoryTestResult(
-            size_bytes=size_bytes,
-            size_label=byte_size_label(size_bytes),
-            method="hold-release",
-            settings=settings,
-            bytes_sent=0,
-            bytes_received=0,
-            bytes_cleared_before=0,
-            bytes_seen_before_release=0,
-            score=0.0,
-            indicator="ERROR",
-            status="error",
-            error=str(exc),
-            elapsed_sec=time.monotonic() - started,
-            metrics=empty_score.metrics,
-        )
-
-    score = score_received(payload.data, received_bytes)
-    error = write_error or read_error
-    if write_error and bytes_sent < size_bytes:
-        status = "partial-write"
-    elif error:
-        status = "error"
-    elif bytes_sent < size_bytes:
-        status = "partial-write"
-    elif not received_bytes:
-        status = "no-data"
-    elif score.score >= 99.0:
-        status = "exact"
-    elif score.score >= 90.0:
-        status = "strong"
-    elif score.score >= 50.0:
-        status = "partial"
-    else:
-        status = "weak"
-    indicator = result_indicator(score.score, status, error)
-    console_progress(
-        f"{prefix}: RESULT {indicator} SCORE={score.score:.2f} ({status.upper()}); "
-        f"SENT={bytes_sent}, RECEIVED={len(received_bytes)}, "
-        f"CLEARED={drain.bytes_drained}, EARLY={bytes_seen_before_release}, "
-        f"EXACT={score.metrics.exact_byte_match_ratio:.3f}, "
-        f"LINES={score.metrics.line_integrity_ratio:.3f}"
-    )
-    return MemoryTestResult(
-        size_bytes=size_bytes,
-        size_label=byte_size_label(size_bytes),
-        method="hold-release",
-        settings=settings,
-        bytes_sent=bytes_sent,
-        bytes_received=len(received_bytes),
-        bytes_cleared_before=drain.bytes_drained,
-        bytes_seen_before_release=bytes_seen_before_release,
-        score=score.score,
-        indicator=indicator,
-        status=status,
-        error=error,
-        elapsed_sec=time.monotonic() - started,
-        metrics=score.metrics,
-    )
-
-
-def run_memory_size_test(
-    serial_module: Any,
-    index: int,
-    total: int,
-    size_bytes: int,
-    settings: SerialSettings,
-    options: ScanOptions,
-    logger: logging.Logger,
-    method: str,
-) -> MemoryTestResult:
-    """Run one memory transfer size using a known serial setting."""
-    if method == "hold-release":
-        return run_memory_hold_release_test(
-            serial_module=serial_module,
-            index=index,
-            total=total,
-            size_bytes=size_bytes,
-            settings=settings,
-            options=options,
-            logger=logger,
-        )
-
-    payload = generate_payload(
-        size_bytes,
-        ProbeNonce(
-            run_id=options.run_id or make_run_id("M"),
-            candidate_id=sanitize_nonce_value(
-                f"MEM{index:02d}_{settings_nonce_id(settings)}"
-            ),
-            trial_id="LIVE",
-            switch_note_hash=switch_note_hash(options.switch_note),
-        ),
-    )
-    started = time.monotonic()
-    console_progress(border_line(PROGRESS_WIDTH))
-    console_progress(
-        bordered_text(
-            f"MEMORY TEST: {byte_size_label(size_bytes)} ({index}/{total})",
-            PROGRESS_WIDTH,
-        )
-    )
-    console_progress(border_line(PROGRESS_WIDTH))
-    try:
-        with open_serial_port(
-            serial_module,
-            options.out_port,
-            settings,
-            max(options.read_timeout, 2.0),
-        ) as out_serial:
-            with open_serial_port(
-                serial_module,
-                options.in_port,
-                settings,
-                max(options.read_timeout, 2.0),
-            ) as in_serial:
-                trial = execute_burst(
-                    in_serial=in_serial,
-                    out_serial=out_serial,
-                    settings=settings,
-                    payload=payload,
-                    burst_index=1,
-                    burst_total=1,
-                    candidate_index=index,
-                    candidate_total=total,
-                    read_timeout=max(options.read_timeout, 2.0),
-                    completion_quiet=max(options.read_timeout, 2.0),
-                    settle_ms=options.settle_ms,
-                    progress_interval=options.progress_interval,
-                    no_pre_drain=options.no_pre_drain,
-                    pre_drain_timeout=max(options.pre_drain_timeout, 2.0),
-                    pre_drain_quiet=options.pre_drain_quiet,
-                    max_drain_bytes=options.max_drain_bytes,
-                    logger=logger,
-                    progress=console_progress,
-                    run_id=options.run_id,
-                    switch_hash=switch_note_hash(options.switch_note),
-                )
-    except Exception as exc:
-        empty_score = score_received(payload.data, b"")
-        logger.exception("memory test %s failed", byte_size_label(size_bytes))
-        return MemoryTestResult(
-            size_bytes=size_bytes,
-            size_label=byte_size_label(size_bytes),
-            method="live-transfer",
-            settings=settings,
-            bytes_sent=0,
-            bytes_received=0,
-            bytes_cleared_before=0,
-            bytes_seen_before_release=0,
-            score=0.0,
-            indicator="ERROR",
-            status="error",
-            error=str(exc),
-            elapsed_sec=time.monotonic() - started,
-            metrics=empty_score.metrics,
-        )
-
-    return MemoryTestResult(
-        size_bytes=size_bytes,
-        size_label=byte_size_label(size_bytes),
-        method="live-transfer",
-        settings=settings,
-        bytes_sent=trial.bytes_sent,
-        bytes_received=trial.bytes_received,
-        bytes_cleared_before=trial.bytes_drained_before,
-        bytes_seen_before_release=0,
-        score=trial.score,
-        indicator=result_indicator(trial.score, trial.status, trial.error),
-        status=trial.status,
-        error=trial.error,
-        elapsed_sec=trial.elapsed_sec,
-        metrics=trial.metrics,
-    )
-
-
-def memory_test_interpretation(results: Sequence[MemoryTestResult]) -> str:
-    """Return a short memory-test conclusion."""
-    if not results:
-        return "No memory tests were run."
-    clean = [
-        result
-        for result in results
-        if result.score >= 99.0
-        and result.metrics.missing_bytes == 0
-        and result.metrics.extra_bytes == 0
-        and result.bytes_sent == result.size_bytes
-        and result.bytes_received == result.size_bytes
-    ]
-    if not clean:
-        return "No clean memory transfer was confirmed."
-    largest = max(clean, key=lambda result: result.size_bytes)
-    method = largest.method
-    early_output = any(result.bytes_seen_before_release > 0 for result in clean)
-    max_tested = max(result.size_bytes for result in results)
-    if method == "live-transfer" or early_output:
-        return (
-            f"Largest clean transfer is {largest.size_label}. "
-            "This checks clean data flow, not stored memory."
-        )
-    if largest.size_bytes == max_tested:
-        return f"Buffer held at least {largest.size_label} cleanly."
-    failed_larger = any(
-        result.size_bytes > largest.size_bytes and result.indicator not in {"PASS", "GOOD"}
-        for result in results
-    )
-    if failed_larger:
-        return f"Likely installed memory is near {largest.size_label}."
-    return f"Largest clean transfer is {largest.size_label}."
-
-
-def print_memory_report(
-    settings: SerialSettings,
-    results: Sequence[MemoryTestResult],
-    text_report: Path,
-    log_file: Path,
-) -> None:
-    """Print the final memory test report."""
-    print()
-    print_report_title("MEMORY TEST REPORT")
-    print(border_line(REPORT_WIDTH))
-    print(bordered_text("SERIAL SETTING USED", REPORT_WIDTH))
-    print(border_line(REPORT_WIDTH))
-    print(f"    BAUD RATE:         {settings.baud}")
-    print(f"    DATA BITS:         {settings.data_bits}")
-    print(f"    PARITY:            {parity_name(settings.parity)} ({settings.parity_code()})")
-    print(f"    STOP BITS:         {settings.stop_bits}")
-    print(f"    FLOW CONTROL:      {flow_control_name(settings.flow_control)}")
-    print_wrapped_value("    SETTING:           ", settings.label())
-    print()
-    print(f"  RESULT:              {memory_test_interpretation(results).upper()}")
-    print(border_line(REPORT_WIDTH))
-    print("SIZE  METHOD RESULT SCORE   SENT   READ EARLY CLEAR  MISS EXTRA  TIME")
-    print(border_line(REPORT_WIDTH))
-    for result in results:
-        print(
-            f"{result.size_label:<5} "
-            f"{result.method[:6].upper():<6} "
-            f"{result.indicator:<6} "
-            f"{result.score:>5.1f} "
-            f"{result.bytes_sent:>6} "
-            f"{result.bytes_received:>6} "
-            f"{result.bytes_seen_before_release:>5} "
-            f"{result.bytes_cleared_before:>5} "
-            f"{result.metrics.missing_bytes:>5} "
-            f"{result.metrics.extra_bytes:>5} "
-            f"{format_duration(result.elapsed_sec):>6}"
-        )
-    print(border_line(REPORT_WIDTH))
-    if any(result.method == "live-transfer" for result in results):
-        print("  NOTE: READ-WHILE-SENDING DOES NOT PROVE RAM SIZE.")
-    if any(result.bytes_seen_before_release > 0 for result in results):
-        print("  NOTE: EARLY BYTES ARRIVED BEFORE RELEASE.")
-    print("  NOTE: HOLD-RELEASE WITH >16K IS THE INPUT-SIDE BACKPRESSURE CHECK.")
-    print()
-    print_report_title("MEMORY TEST FILES")
-    print_wrapped_value("  TEXT REPORT: ", f"{text_report} (APPENDED)")
-    print_wrapped_value("  DEBUG LOG:   ", log_file)
-    print(border_line(REPORT_WIDTH))
-
-
-def write_memory_text_report(
-    text_report: Path,
-    settings: SerialSettings,
-    results: Sequence[MemoryTestResult],
-) -> None:
-    """Append a compact memory test section to the text report."""
-    text_report.parent.mkdir(parents=True, exist_ok=True)
-    created = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-    lines = [
-        "",
-        border_line(REPORT_WIDTH),
-        bordered_text("SERIAL PROBE MEMORY TEST", REPORT_WIDTH),
-        border_line(REPORT_WIDTH),
-        f"APPENDED:        {created}",
-        f"SETTING:         {settings.label()}",
-        f"RESULT:          {memory_test_interpretation(results).upper()}",
-        "",
-        "SIZE  METHOD RESULT SCORE   SENT   READ EARLY CLEAR  MISS EXTRA  TIME",
-        border_line(REPORT_WIDTH),
-    ]
-    for result in results:
-        lines.append(
-            f"{result.size_label:<5} "
-            f"{result.method[:6].upper():<6} "
-            f"{result.indicator:<6} "
-            f"{result.score:>5.1f} "
-            f"{result.bytes_sent:>6} "
-            f"{result.bytes_received:>6} "
-            f"{result.bytes_seen_before_release:>5} "
-            f"{result.bytes_cleared_before:>5} "
-            f"{result.metrics.missing_bytes:>5} "
-            f"{result.metrics.extra_bytes:>5} "
-            f"{format_duration(result.elapsed_sec):>6}"
-        )
-    lines.append(border_line(REPORT_WIDTH))
-    lines.append("NOTE: HOLD-RELEASE WITH >16K IS THE INPUT-SIDE BACKPRESSURE CHECK.")
-    with text_report.open("a", encoding="utf-8") as report_file:
-        report_file.write("\n".join(lines) + "\n")
 
 
 def flow_control_hold_byte_limit(payload_bytes: int) -> int:
@@ -5399,7 +4781,7 @@ def flow_validation_report_lines(
     lines.extend(
         [
             "NOTE: OUTPUT-SIDE HOLD/RELEASE PROVES ONLY OBSERVED PAUSE/RESUME.",
-            "NOTE: INPUT-SIDE BACKPRESSURE REQUIRES >16K HELD-OUTPUT MEMORY TEST.",
+            "NOTE: INPUT-SIDE BACKPRESSURE IS NOT PROVEN BY THIS FLOW VALIDATION.",
         ]
     )
     lines.append(border_line(REPORT_WIDTH))
@@ -5434,7 +4816,7 @@ def print_flow_control_validation_report(
             f"{result.reason[:28]}"
         )
     print("NOTE: OUTPUT-SIDE HOLD/RELEASE PROVES ONLY OBSERVED PAUSE/RESUME.")
-    print("NOTE: INPUT-SIDE BACKPRESSURE REQUIRES >16K HELD-OUTPUT MEMORY TEST.")
+    print("NOTE: INPUT-SIDE BACKPRESSURE IS NOT PROVEN BY THIS FLOW VALIDATION.")
     print(border_line(REPORT_WIDTH))
 
 
@@ -5913,81 +5295,6 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
     print_bank2_report(result, bank_options.text_report)
 
 
-def run_memory_test(options: ScanOptions) -> None:
-    """Prompt for and run a memory transfer test."""
-    options = dataclasses.replace(options, run_id=make_run_id("M"))
-    try:
-        ensure_distinct_ports(options.in_port, options.out_port)
-    except ValueError as exc:
-        print(f"SETTINGS ERROR: {exc}")
-        return
-    settings = prompt_serial_setting(SerialSettings(9600, 8, "none", 1, "none"))
-    sizes = prompt_memory_sizes()
-    method = prompt_memory_method()
-    text_report = options.text_report
-    log_file = options.log_file
-    logger = setup_logging(log_file)
-    serial_module = import_or_install_pyserial()
-    purge_buffer_output(
-        serial_module=serial_module,
-        options=options,
-        logger=logger,
-        reason="CLEAR BUFFER BEFORE MEMORY TEST.",
-    )
-    print()
-    print_report_title("MEMORY TEST START")
-    print("  USES SERIAL SETTING ENTERED FROM SCAN REPORT.")
-    if method == "hold-release":
-        print("  HOLD BUFFER OUTPUT WHILE DATA IS SENT; RELEASE WHEN ASKED.")
-    else:
-        print("  READS WHILE SENDING. CHECKS CLEAN TRANSFER SIZE.")
-    print(f"  SETTING:    {settings.label()}")
-    print(f"  SIZES:      {', '.join(byte_size_label(size) for size in sizes)}")
-    print(f"  METHOD:     {method.upper()}")
-    print(border_line(REPORT_WIDTH))
-    results: list[MemoryTestResult] = []
-    operator_break_action: str | None = None
-    size_index = 0
-    while size_index < len(sizes):
-        size = sizes[size_index]
-        display_index = size_index + 1
-        try:
-            result = run_memory_size_test(
-                serial_module=serial_module,
-                index=display_index,
-                total=len(sizes),
-                size_bytes=size,
-                settings=settings,
-                options=options,
-                logger=logger,
-                method=method,
-            )
-        except KeyboardInterrupt:
-            action = prompt_operator_break_action("MEMORY TEST")
-            if action == "resume":
-                logger.info(
-                    "operator resumed memory test at %s/%s %s",
-                    display_index,
-                    len(sizes),
-                    byte_size_label(size),
-                )
-                continue
-            operator_break_action = action
-            logger.info(
-                "operator break during memory test; action=%s completed=%s/%s",
-                action,
-                len(results),
-                len(sizes),
-            )
-            break
-        results.append(result)
-        size_index += 1
-    write_memory_text_report(text_report, settings, results)
-    print_memory_report(settings, results, text_report, log_file)
-    if operator_break_action == "quit":
-        raise QuitProgramAfterReport()
-
-
 def print_commands() -> None:
     """Print the main command menu."""
     def menu_line(left: str = "", right: str = "") -> None:
@@ -6002,16 +5309,11 @@ def print_commands() -> None:
     print_banner()
     print(bordered_text("MAIN MENU", SCREEN_WIDTH))
     print(border_line(SCREEN_WIDTH))
-    menu_line("OPERATION", "SETUP")
-    menu_line("  1  START SCAN", "  3  SET COM PORTS")
-    menu_line("  2  MEMORY TEST", "  4  SET BAUD RANGE")
-    menu_line("", "  5  SCAN SIZE / VALIDATE")
-    menu_line("", "  6  TIMING / STALE DATA")
-    menu_line()
-    menu_line("REPORTS", "REFERENCE")
-    menu_line("  7  SET REPORT FILES", "  S  CURRENT SETTINGS")
-    menu_line("  8  RESET REPORT FILES", "  ?  HELP")
-    menu_line("", "  0  QUIT")
+    menu_line("  1  START SCAN", "  2  SET COM PORTS")
+    menu_line("  3  SET BAUD RANGE", "  4  SCAN SIZE / VALIDATE")
+    menu_line("  5  TIMING / STALE DATA", "  6  SET REPORT FILES")
+    menu_line("  7  RESET REPORT FILES", "  S  CURRENT SETTINGS")
+    menu_line("  ?  HELP", "  0  QUIT")
     print(border_line(SCREEN_WIDTH))
 
 
@@ -6022,7 +5324,7 @@ def interactive_menu(options: ScanOptions | None = None) -> ScanOptions | None:
     while True:
         print_commands()
         try:
-            choice = read_operator_input("COMMAND (1-8,S,?,0): ").lstrip("\ufeff").strip().lower()
+            choice = read_operator_input("COMMAND (1-7,S,?,0): ").lstrip("\ufeff").strip().lower()
         except EOFError:
             return None
 
@@ -6034,22 +5336,20 @@ def interactive_menu(options: ScanOptions | None = None) -> ScanOptions | None:
                 continue
             return options
         if choice == "2":
-            run_memory_test(options)
-        elif choice == "3":
             options = dataclasses.replace(
                 options,
                 in_port=prompt_text("Input/transmit port", options.in_port),
                 out_port=prompt_text("Output/read port", options.out_port),
             )
-        elif choice == "4":
+        elif choice == "3":
             options = configure_baud_range(options)
-        elif choice == "5":
+        elif choice == "4":
             options = configure_payload(options)
-        elif choice == "6":
+        elif choice == "5":
             options = configure_timing(options)
-        elif choice == "7":
+        elif choice == "6":
             options = configure_reports(options)
-        elif choice == "8":
+        elif choice == "7":
             default_text_report, default_log = default_report_paths()
             options = dataclasses.replace(
                 options,
@@ -6063,7 +5363,7 @@ def interactive_menu(options: ScanOptions | None = None) -> ScanOptions | None:
         elif choice in {"0", "q", "quit", "exit"}:
             return None
         else:
-            print("ENTER 1-8, S, ?, OR 0.")
+            print("ENTER 1-7, S, ?, OR 0.")
 
 
 def prompt_after_scan_action(title: str = "RUN COMPLETE") -> str:
@@ -6597,6 +5897,24 @@ def run_dual_bank_scan(
     if operator_break_action is not None:
         return OPERATOR_BREAK_EXIT_CODE
     return 0
+
+
+def run_scan(options: ScanOptions) -> int:
+    """Prompt for and run the selected start-scan workflow."""
+    validate_options(options)
+    workflow = prompt_start_scan_workflow()
+    if workflow == "bank2":
+        run_second_bank_characterization(options)
+        return 0
+
+    logger = setup_logging(options.log_file)
+    serial_module = import_or_install_pyserial()
+    return run_dual_bank_scan(
+        serial_module=serial_module,
+        options=options,
+        logger=logger,
+        phase0_only=(workflow == "phase0"),
+    )
 
 
 def assert_approx(value: float, expected: float, tolerance: float, label: str) -> None:

@@ -25,7 +25,7 @@ Usage screen:
 python serial_probe.py --help
 ```
 
-The first screen is the command menu. Use `9 CURRENT SETTINGS` to view ports, baud range, number of settings to test, test message size, repeat count, timing, old-output clearing, Phase 0 liveness settings, quick baud focus rules, report files, and estimated scan time. It also shows that scan type is asked at scan start and that blank means `FULL`. Use `11 MEMORY TEST` after you have a likely switch setting. The normal full scan tests every selected combination unless you explicitly choose quick exploratory narrowing.
+The first screen is the command menu. Use `S CURRENT SETTINGS` to view ports, baud range, number of settings to test, test message size, repeat count, timing, old-output clearing, Phase 0 liveness settings, report files, and estimated scan time. It also shows that scan type is asked at scan start and that blank means `FULL`. The normal full scan tests every selected combination unless you explicitly choose quick exploratory narrowing.
 
 The terminal UI is written for an 80-column by 25-line early terminal style. Long operator screens pause with `PRESS ENTER FOR MORE, Q TO STOP:`. Screens use terse uppercase operator text and bright green text when the console supports ANSI color. PyCharm runs are treated as color-capable. Set `NO_COLOR=1` before running if you want plain console text.
 
@@ -41,7 +41,7 @@ Use the default settings, then select `1. Start scan`.
 
 After a scan finishes or is interrupted by the operator, the program stays in the terminal UI and asks whether to run the same settings again, return to the main menu, or quit.
 
-During a running scan, validation pass, or memory test, press `Ctrl+C` for the `OPERATOR BREAK` menu. The menu can resume the same test, end the test and write a partial report, return to the main menu after writing the report, or quit after writing the report.
+During a running scan or validation pass, press `Ctrl+C` for the `OPERATOR BREAK` menu. The menu can resume the same test, end the test and write a partial report, return to the main menu after writing the report, or quit after writing the report.
 
 ## Scan Type
 
@@ -109,38 +109,6 @@ When quick exploratory mode runs, the tool first tests each selected baud once u
 Phase 0 is a boolean gate, not a ranking. A baud is marked `ALIVE` only when the received bytes contain a valid checksummed probe line, at least one expected probe marker, a score of `90.0` or higher, no serial error, no stale output, and only limited extra bytes. Random noise or old backlog bytes are not enough.
 
 If one or more bauds are alive, quick exploratory tests only candidates at those bauds. If zero bauds are alive, the tool prints an explicit fallback and quick exploratory uses all selected bauds, preserving the older behavior. The full scan still tests all selected settings unless the normal quick shortlist is accepted for phase 2.
-
-## Quick Baud Focus
-
-Quick baud focus is a quick-scan speed rule. It looks for a strong clean pattern at one baud across multiple framing and flow-control variants. When the configured confidence gates pass, it stays at that baud, finishes the remaining quick tests there, and may defer the other bauds from the quick pass. Full scan does not need it.
-
-Default gates:
-
-- Quick baud focus enabled: `YES`.
-- Strong-hit score: `90.0` or higher.
-- Lead over next best baud: `20.0` score points or higher.
-- Minimum strong results at the baud: `3`.
-- Minimum early samples per baud: `8`.
-
-Stale output, partial writes, or driver errors before a clean hit pattern do not permanently block focus; they are treated as noise until a baud proves itself. Once focus is engaged, any stale output, partial write, driver error, or confidence drop cancels focus and returns to the normal full baud sweep. The full brute-force scan is the default: choose `FULL` or press Enter at scan type, then answer `N` or press Enter at quick mode. If `QUICK` accepts a narrowed phase 2, the report records that choice.
-
-Use menu command `10 QUICK BAUD FOCUS` to change the focus thresholds. Use `9 CURRENT SETTINGS` to view the active values.
-
-Example operator lines:
-
-```text
-SCAN TYPE: FULL OR QUICK [FULL]:
-QUICK SCAN: EXPLORATORY=YES PHASE2=YES
-QUICK BAUD FOCUS ENGAGED: 38400 SCORE=100.0 GAP=50.0 GOOD=4 SAMPLES=8
-OTHER BAUDS DEFERRED BY CONFIDENCE RULE
-```
-
-If confidence falls after focus starts, the tool returns to the broad scan:
-
-```text
-QUICK BAUD FOCUS CANCELED: CONFIDENCE DROPPED
-RETURNING TO FULL BAUD SWEEP
-```
 
 Prompt-path checks:
 
@@ -258,25 +226,6 @@ It also writes:
 The report paths are configured from the menu.
 
 Each scan appends a compact run block with the switch/jumper note, selected scan type, phase summary, top results, validation results when run, and interpretation notes.
-
-## Memory Test
-
-The memory test is a separate menu command: `11 MEMORY TEST`.
-
-Run it after the scan has found a likely switch setting. Enter the recommended baud rate, data bits, parity, stop bits, and flow control from the final scan report.
-
-The memory test can check `16K`, `32K`, and `64K` transfers. It reports:
-
-- The serial setting used.
-- The largest clean transfer.
-- Bytes sent and read.
-- Old bytes cleared before the test.
-- Bytes that appeared before the buffer was released.
-- Missing and extra bytes.
-
-For a real buffer-size check, use `Hold output, then release` if the printer buffer has an `OFF LINE`, `HOLD`, or `PAUSE` control. The program sends the test message while the output is held, then asks you to release the buffer so it can read the stored data.
-
-If the buffer cannot be held, use `Read while sending`. That checks whether a large transfer passes cleanly, but it does not prove the installed RAM size because the buffer may be passing data straight through instead of storing it.
 
 ## Safety Notes
 
