@@ -52,6 +52,16 @@ DEFAULT_PROGRESS_INTERVAL = 1.0
 DEFAULT_PRE_DRAIN_TIMEOUT = 0.5
 DEFAULT_PRE_DRAIN_QUIET = 0.1
 DEFAULT_MAX_DRAIN_BYTES = 32_768
+TURBO_DISCOVERY_ENABLED_DEFAULT = False
+TURBO_SETTLE_MS = 10
+TURBO_PRE_DRAIN_TIMEOUT = 0.25
+TURBO_PRE_DRAIN_QUIET = 0.05
+TURBO_READ_TIMEOUT_HIGH_BAUD = 0.35
+TURBO_READ_TIMEOUT_MID_BAUD = 0.45
+TURBO_READ_TIMEOUT_LOW_BAUD = 0.70
+TURBO_READ_TIMEOUT_VERY_LOW_BAUD = 1.00
+TURBO_COMPLETION_QUIET = 0.05
+DEFAULT_COMPLETION_QUIET = 0.10
 PHASE0_PAYLOAD_BYTES = 128
 PHASE0_READ_TIMEOUT = 0.25
 PHASE0_SETTLE_MS = 10
@@ -187,8 +197,20 @@ class TrialResult:
     status: str
     error: str | None
     elapsed_sec: float
+    timing: "TimingBreakdown"
     received_preview_ascii: str
     received_preview_hex: str
+
+
+@dataclass(frozen=True)
+class TimingBreakdown:
+    """Wall-clock stage timing for one candidate or burst."""
+
+    open_setup_sec: float
+    drain_sec: float
+    write_sec: float
+    read_wait_sec: float
+    other_sec: float
 
 
 @dataclass(frozen=True)
@@ -206,6 +228,7 @@ class CandidateResult:
     status: str
     error: str | None
     elapsed_sec: float
+    timing: TimingBreakdown
     metrics: ScoreMetrics
     trials: list[TrialResult]
 
@@ -231,6 +254,7 @@ class ScanOptions:
     pre_drain_timeout: float
     pre_drain_quiet: float
     max_drain_bytes: int
+    turbo_discovery_enabled: bool
     ask_on_top_match: bool
     auto_validate_top_matches: bool
     validate_size_1_bytes: int
@@ -240,6 +264,17 @@ class ScanOptions:
     baud_focus_lead_gap_threshold: float
     baud_focus_min_strong_results: int
     baud_focus_min_samples: int
+
+
+@dataclass(frozen=True)
+class EffectiveTiming:
+    """Effective phase-1 timing after applying discovery speed policy."""
+
+    read_timeout: float
+    settle_ms: int
+    pre_drain_quiet: float
+    pre_drain_timeout: float
+    completion_quiet: float
 
 
 @dataclass(frozen=True)
@@ -841,6 +876,179 @@ def estimated_transmit_seconds(settings: SerialSettings, byte_count: int) -> flo
     return (byte_count * estimated_frame_bits(settings)) / max(settings.baud, 1)
 
 
+def zero_timing_breakdown() -> TimingBreakdown:
+    """Return an empty timing breakdown."""
+    return TimingBreakdown(
+        open_setup_sec=0.0,
+        drain_sec=0.0,
+        write_sec=0.0,
+        read_wait_sec=0.0,
+        other_sec=0.0,
+    )
+
+
+def timing_total(timing: TimingBreakdown) -> float:
+    """Return the summed stage time for a timing breakdown."""
+    return (
+        timing.open_setup_sec
+        + timing.drain_sec
+        + timing.write_sec
+        + timing.read_wait_sec
+        + timing.other_sec
+    )
+
+
+def combine_timing_breakdowns(timings: Sequence[TimingBreakdown]) -> TimingBreakdown:
+    """Return stage totals for multiple timing breakdowns."""
+    if not timings:
+        return zero_timing_breakdown()
+    return TimingBreakdown(
+        open_setup_sec=sum(timing.open_setup_sec for timing in timings),
+        drain_sec=sum(timing.drain_sec for timing in timings),
+        write_sec=sum(timing.write_sec for timing in timings),
+        read_wait_sec=sum(timing.read_wait_sec for timing in timings),
+        other_sec=sum(timing.other_sec for timing in timings),
+    )
+
+
+def timing_with_other(
+    elapsed_sec: float,
+    open_setup_sec: float,
+    drain_sec: float,
+    write_sec: float,
+    read_wait_sec: float,
+) -> TimingBreakdown:
+    """Return timing with unassigned time folded into the other bucket."""
+    known = open_setup_sec + drain_sec + write_sec + read_wait_sec
+    return TimingBreakdown(
+        open_setup_sec=open_setup_sec,
+        drain_sec=drain_sec,
+        write_sec=write_sec,
+        read_wait_sec=read_wait_sec,
+        other_sec=max(0.0, elapsed_sec - known),
+    )
+
+
+def turbo_read_timeout_for_baud(settings: SerialSettings) -> float:
+    """Return the turbo read-quiet timeout floor for a baud class."""
+    if settings.baud <= 300:
+        return TURBO_READ_TIMEOUT_VERY_LOW_BAUD
+    if settings.baud <= 1200:
+        return TURBO_READ_TIMEOUT_LOW_BAUD
+    if settings.baud <= 4800:
+        return TURBO_READ_TIMEOUT_MID_BAUD
+    return TURBO_READ_TIMEOUT_HIGH_BAUD
+
+
+def effective_discovery_timing(
+    options: ScanOptions,
+    settings: SerialSettings,
+    payload_bytes: int,
+) -> EffectiveTiming:
+    """Return phase-1 timing for one setting after turbo/adaptive policy."""
+    if not options.turbo_discovery_enabled:
+        return EffectiveTiming(
+            read_timeout=options.read_timeout,
+            settle_ms=options.settle_ms,
+            pre_drain_quiet=options.pre_drain_quiet,
+            pre_drain_timeout=options.pre_drain_timeout,
+            completion_quiet=min(options.read_timeout, DEFAULT_COMPLETION_QUIET),
+        )
+
+    payload_margin = min(0.25, estimated_transmit_seconds(settings, payload_bytes) * 0.02)
+    read_timeout = turbo_read_timeout_for_baud(settings) + payload_margin
+    settle_ms = min(options.settle_ms, TURBO_SETTLE_MS)
+    return EffectiveTiming(
+        read_timeout=read_timeout,
+        settle_ms=settle_ms,
+        pre_drain_quiet=min(options.pre_drain_quiet, TURBO_PRE_DRAIN_QUIET),
+        pre_drain_timeout=min(options.pre_drain_timeout, TURBO_PRE_DRAIN_TIMEOUT),
+        completion_quiet=min(read_timeout, TURBO_COMPLETION_QUIET),
+    )
+
+
+def effective_timing_range_label(options: ScanOptions, candidates: Sequence[SerialSettings]) -> str:
+    """Return a compact operator label for effective phase-1 timing."""
+    if not candidates:
+        return "NO SETTINGS"
+    timings = [
+        effective_discovery_timing(options, candidate, options.payload_bytes)
+        for candidate in candidates
+    ]
+    read_values = [timing.read_timeout for timing in timings]
+    settle_values = [timing.settle_ms for timing in timings]
+    drain_quiet_values = [timing.pre_drain_quiet for timing in timings]
+    drain_limit_values = [timing.pre_drain_timeout for timing in timings]
+    return (
+        f"READ={min(read_values):.2f}..{max(read_values):.2f}S, "
+        f"PAUSE={min(settle_values)}..{max(settle_values)}MS, "
+        f"CLEAR={min(drain_limit_values):.2f}S/"
+        f"{min(drain_quiet_values):.2f}S"
+    )
+
+
+def receive_completion_detected(received: bytes, expected: bytes) -> bool:
+    """Return True when a received payload has enough structure to stop early."""
+    if len(received) < len(expected):
+        return False
+    if b"<<<SERIAL_PROBE_END" not in received:
+        return False
+    if len(received) == len(expected):
+        return True
+    score = score_received(expected, received)
+    return (
+        score.score >= TOP_MATCH_MIN_SCORE
+        and score.metrics.end_marker_present
+        and score.metrics.line_integrity_ratio >= 1.0
+    )
+
+
+def discovery_frame_priority(settings: SerialSettings) -> tuple[int, int, int, int]:
+    """Return a priority key that puts common printer-buffer frames first."""
+    parity_rank = {
+        "none": 0,
+        "even": 1,
+        "odd": 2,
+        "mark": 4,
+        "space": 5,
+    }.get(settings.parity, 9)
+    flow_rank = {
+        "none": 0,
+        "xon/xoff": 1,
+        "rts/cts": 2,
+        "dsr/dtr": 3,
+    }.get(settings.flow_control, 9)
+    data_rank = 0 if settings.data_bits == 8 else 1
+    stop_rank = 0 if settings.stop_bits == 1 else 1
+    if settings.data_bits == 8 and settings.parity == "none" and settings.stop_bits == 1:
+        frame_rank = 0
+    elif settings.data_bits == 8 and settings.parity in {"even", "odd"} and settings.stop_bits == 1:
+        frame_rank = 1
+    elif settings.data_bits == 7 and settings.parity in {"even", "odd"} and settings.stop_bits == 1:
+        frame_rank = 2
+    else:
+        frame_rank = 3 + data_rank + stop_rank + parity_rank
+    return frame_rank, flow_rank, parity_rank, stop_rank
+
+
+def prioritize_discovery_candidates(
+    candidates: Sequence[SerialSettings],
+    options: ScanOptions,
+) -> list[SerialSettings]:
+    """Return candidates in turbo discovery priority order when enabled."""
+    if not options.turbo_discovery_enabled:
+        return list(candidates)
+    baud_order = scan_bauds(options.min_baud, options.max_baud)
+    baud_rank = {baud: index for index, baud in enumerate(baud_order)}
+    return sorted(
+        candidates,
+        key=lambda candidate: (
+            baud_rank.get(candidate.baud, len(baud_rank)),
+            discovery_frame_priority(candidate),
+        ),
+    )
+
+
 def console_progress(message: str) -> None:
     """Print a timestamped live progress message."""
     prefix = f"{time.strftime('%H:%M:%S')} "
@@ -950,6 +1158,7 @@ def execute_burst(
     candidate_index: int,
     candidate_total: int,
     read_timeout: float,
+    completion_quiet: float,
     settle_ms: int,
     progress_interval: float,
     no_pre_drain: bool,
@@ -969,17 +1178,20 @@ def execute_burst(
     received_lock = threading.Lock()
     last_data_time = time.monotonic()
     progress_interval = max(progress_interval, 0.1)
+    completion_quiet = max(0.01, min(completion_quiet, read_timeout))
     prefix = (
         f"[{candidate_index:04d}/{candidate_total:04d} {settings.label()}] "
         f"TEST {burst_index}/{burst_total}"
     )
     chunk_size = write_chunk_size(settings)
 
+    setup_started = time.monotonic()
     if progress:
         progress(f"{prefix}: RESET BUFFERS; PAUSE {settle_ms} MS")
     reset_serial_buffers(in_serial)
     reset_serial_buffers(out_serial)
     time.sleep(settle_ms / 1000.0)
+    setup_elapsed = time.monotonic() - setup_started
 
     drain = DrainResult(0, 0.0, True, "disabled", None)
     if not no_pre_drain:
@@ -1013,6 +1225,7 @@ def execute_burst(
                     f"CLEARED={drain.bytes_drained}, REASON={drain.reason.upper()}"
                 )
             empty_score = score_received(expected, b"")
+            elapsed = time.monotonic() - started
             return TrialResult(
                 burst_index=burst_index,
                 bytes_sent=0,
@@ -1023,7 +1236,14 @@ def execute_burst(
                 metrics=empty_score.metrics,
                 status="stale-output",
                 error=error,
-                elapsed_sec=time.monotonic() - started,
+                elapsed_sec=elapsed,
+                timing=timing_with_other(
+                    elapsed,
+                    setup_elapsed,
+                    drain.elapsed_sec,
+                    0.0,
+                    0.0,
+                ),
                 received_preview_ascii="",
                 received_preview_hex="",
             )
@@ -1047,15 +1267,21 @@ def execute_burst(
                 last_data_time = now
                 continue
 
-            if writer_done.is_set() and (now - last_data_time) >= read_timeout:
-                stop_event.set()
-                break
+            if writer_done.is_set():
+                with received_lock:
+                    snapshot = bytes(received)
+                complete = receive_completion_detected(snapshot, expected)
+                quiet_target = completion_quiet if complete else read_timeout
+                if (now - last_data_time) >= quiet_target:
+                    stop_event.set()
+                    break
 
     reader_thread = threading.Thread(target=reader, name="serial-probe-reader", daemon=True)
     reader_thread.start()
 
     bytes_sent = 0
     write_error: str | None = None
+    write_started = time.monotonic()
     if progress:
         estimated = estimated_transmit_seconds(settings, len(expected))
         progress(
@@ -1090,23 +1316,29 @@ def execute_burst(
         logger.debug("burst %s write failed: %s", burst_index, write_error)
     finally:
         writer_done.set()
+    write_elapsed = time.monotonic() - write_started
 
     if progress:
         progress(
             f"{prefix}: WRITE DONE, SENT={bytes_sent}; "
-            f"WAIT {read_timeout:.1f}S QUIET ON {settings.label()}"
+            f"WAIT {read_timeout:.2f}S QUIET ON {settings.label()}"
         )
 
     wait_deadline = time.monotonic() + max(read_timeout + (settle_ms / 1000.0) + 2.0, 2.0)
     next_wait_progress_at = time.monotonic() + progress_interval
+    read_wait_started = time.monotonic()
     while reader_thread.is_alive():
         reader_thread.join(timeout=0.2)
         now = time.monotonic()
         if progress and now >= next_wait_progress_at:
             silence = max(0.0, now - last_data_time)
+            with received_lock:
+                snapshot = bytes(received)
+            complete = receive_completion_detected(snapshot, expected)
+            quiet_target = completion_quiet if complete else read_timeout
             progress(
                 f"{prefix}: READING RECEIVED={received_length(received, received_lock)} "
-                f"BYTES, QUIET={silence:.1f}/{read_timeout:.1f}S"
+                f"BYTES, QUIET={silence:.2f}/{quiet_target:.2f}S"
             )
             next_wait_progress_at = now + progress_interval
         if now >= wait_deadline:
@@ -1116,6 +1348,7 @@ def execute_burst(
     if reader_thread.is_alive():
         stop_event.set()
         reader_thread.join(timeout=1.0)
+    read_wait_elapsed = time.monotonic() - read_wait_started
 
     elapsed = time.monotonic() - started
     received_bytes = bytes(received)
@@ -1157,6 +1390,13 @@ def execute_burst(
         status=status,
         error=error,
         elapsed_sec=elapsed,
+        timing=timing_with_other(
+            elapsed,
+            setup_elapsed,
+            drain.elapsed_sec,
+            write_elapsed,
+            read_wait_elapsed,
+        ),
         received_preview_ascii=preview_ascii(received_bytes),
         received_preview_hex=preview_hex(received_bytes),
     )
@@ -1216,6 +1456,7 @@ def aggregate_candidate_result(
             status="error",
             error=opening_error,
             elapsed_sec=elapsed_sec,
+            timing=timing_with_other(elapsed_sec, elapsed_sec, 0.0, 0.0, 0.0),
             metrics=aggregate_metrics([]),
             trials=[],
         )
@@ -1243,6 +1484,14 @@ def aggregate_candidate_result(
     else:
         status = "weak"
 
+    timing = combine_timing_breakdowns([trial.timing for trial in trials])
+    timing = TimingBreakdown(
+        open_setup_sec=timing.open_setup_sec,
+        drain_sec=timing.drain_sec,
+        write_sec=timing.write_sec,
+        read_wait_sec=timing.read_wait_sec,
+        other_sec=timing.other_sec + max(0.0, elapsed_sec - timing_total(timing)),
+    )
     return CandidateResult(
         index=index,
         total=total,
@@ -1255,6 +1504,7 @@ def aggregate_candidate_result(
         status=status,
         error="; ".join(errors) if errors else None,
         elapsed_sec=elapsed_sec,
+        timing=timing,
         metrics=metrics,
         trials=trials,
     )
@@ -1273,6 +1523,7 @@ def run_candidate(
     """Run one candidate by reopening both ports and executing bursts."""
     started = time.monotonic()
     trials: list[TrialResult] = []
+    effective_timing = effective_discovery_timing(options, settings, payload.byte_count)
     logger.info("candidate %s/%s: %s", index, total, settings.label())
     if progress:
         per_burst = estimated_transmit_seconds(settings, payload.byte_count)
@@ -1289,7 +1540,8 @@ def run_candidate(
             f"[{index:04d}/{total:04d} {settings.label()}] TESTING | "
             f"TEST={payload.byte_count} BYTES, COUNT={options.bursts}, "
             f"SEND={format_duration(per_burst)}/TEST "
-            f"({format_duration(total_estimate)} TOTAL)"
+            f"({format_duration(total_estimate)} TOTAL), "
+            f"READ={effective_timing.read_timeout:.2f}S"
         )
         progress(
             f"[{index:04d}/{total:04d} {settings.label()}] OPEN OUT {options.out_port} "
@@ -1297,20 +1549,19 @@ def run_candidate(
         )
 
     try:
+        open_started = time.monotonic()
         with open_serial_port(
-            serial_module, options.out_port, settings, options.read_timeout
+            serial_module, options.out_port, settings, effective_timing.read_timeout
         ) as out_serial:
             with open_serial_port(
-                serial_module, options.in_port, settings, options.read_timeout
+                serial_module, options.in_port, settings, effective_timing.read_timeout
             ) as in_serial:
+                open_elapsed = time.monotonic() - open_started
                 if progress:
                     progress(
                         f"[{index:04d}/{total:04d} {settings.label()}] PORTS OPEN; "
-                        f"RESET BUFFERS; PAUSE {options.settle_ms} MS"
+                        "START TESTS"
                     )
-                reset_serial_buffers(out_serial)
-                reset_serial_buffers(in_serial)
-                time.sleep(options.settle_ms / 1000.0)
                 for burst_index in range(1, options.bursts + 1):
                     trial = execute_burst(
                         in_serial=in_serial,
@@ -1321,12 +1572,13 @@ def run_candidate(
                         burst_total=options.bursts,
                         candidate_index=index,
                         candidate_total=total,
-                        read_timeout=options.read_timeout,
-                        settle_ms=options.settle_ms,
+                        read_timeout=effective_timing.read_timeout,
+                        completion_quiet=effective_timing.completion_quiet,
+                        settle_ms=effective_timing.settle_ms,
                         progress_interval=options.progress_interval,
                         no_pre_drain=options.no_pre_drain,
-                        pre_drain_timeout=options.pre_drain_timeout,
-                        pre_drain_quiet=options.pre_drain_quiet,
+                        pre_drain_timeout=effective_timing.pre_drain_timeout,
+                        pre_drain_quiet=effective_timing.pre_drain_quiet,
                         max_drain_bytes=options.max_drain_bytes,
                         logger=logger,
                         progress=progress,
@@ -1351,7 +1603,7 @@ def run_candidate(
                 f"[{index:04d}/{total:04d} {settings.label()}] "
                 f"ERROR OPEN/RUN: {exc}"
             )
-        return aggregate_candidate_result(
+        result = aggregate_candidate_result(
             index=index,
             total=total,
             settings=settings,
@@ -1359,15 +1611,59 @@ def run_candidate(
             elapsed_sec=elapsed,
             opening_error=str(exc),
         )
+        logger.info(
+            "candidate %s/%s timing: total=%.3fs open_setup=%.3fs drain=%.3fs write=%.3fs read_wait=%.3fs other=%.3fs",
+            index,
+            total,
+            result.elapsed_sec,
+            result.timing.open_setup_sec,
+            result.timing.drain_sec,
+            result.timing.write_sec,
+            result.timing.read_wait_sec,
+            result.timing.other_sec,
+        )
+        return result
 
     elapsed = time.monotonic() - started
-    return aggregate_candidate_result(
+    result = aggregate_candidate_result(
         index=index,
         total=total,
         settings=settings,
         trials=trials,
         elapsed_sec=elapsed,
     )
+    result = dataclasses.replace(
+        result,
+        timing=TimingBreakdown(
+            open_setup_sec=result.timing.open_setup_sec + open_elapsed,
+            drain_sec=result.timing.drain_sec,
+            write_sec=result.timing.write_sec,
+            read_wait_sec=result.timing.read_wait_sec,
+            other_sec=max(
+                0.0,
+                result.elapsed_sec
+                - (
+                    result.timing.open_setup_sec
+                    + open_elapsed
+                    + result.timing.drain_sec
+                    + result.timing.write_sec
+                    + result.timing.read_wait_sec
+                ),
+            ),
+        ),
+    )
+    logger.info(
+        "candidate %s/%s timing: total=%.3fs open_setup=%.3fs drain=%.3fs write=%.3fs read_wait=%.3fs other=%.3fs",
+        index,
+        total,
+        result.elapsed_sec,
+        result.timing.open_setup_sec,
+        result.timing.drain_sec,
+        result.timing.write_sec,
+        result.timing.read_wait_sec,
+        result.timing.other_sec,
+    )
+    return result
 
 
 def result_sort_key(result: CandidateResult) -> tuple[float, float, float, int]:
@@ -1799,6 +2095,28 @@ def flow_control_name(flow_control: str) -> str:
     }[flow_control]
 
 
+def aggregate_result_timing(results: Sequence[CandidateResult]) -> TimingBreakdown:
+    """Return total timing across candidate results."""
+    return combine_timing_breakdowns([result.timing for result in results])
+
+
+def slowest_stage_labels(timing: TimingBreakdown, count: int = 3) -> list[str]:
+    """Return labels for the slowest timing stages."""
+    stages = [
+        ("OPEN/SETUP", timing.open_setup_sec),
+        ("DRAIN", timing.drain_sec),
+        ("WRITE", timing.write_sec),
+        ("READ WAIT", timing.read_wait_sec),
+        ("OTHER", timing.other_sec),
+    ]
+    stages.sort(key=lambda item: item[1], reverse=True)
+    return [
+        f"{name}={format_duration(seconds).upper()}"
+        for name, seconds in stages[:count]
+        if seconds > 0.0
+    ]
+
+
 def print_scan_summary(
     results: Sequence[CandidateResult],
     total_candidates: int,
@@ -1819,6 +2137,14 @@ def print_scan_summary(
     print_report_title("SCAN SUMMARY")
     print(f"  RUN TIME:             {format_duration(elapsed_sec)}")
     print(f"  SETTINGS TESTED:      {len(results)}/{total_candidates}")
+    if results:
+        print(
+            "  AVG SETTING TIME:     "
+            f"{format_duration(elapsed_sec / max(len(results), 1))}"
+        )
+        slow_labels = slowest_stage_labels(aggregate_result_timing(results))
+        if slow_labels:
+            print("  SLOWEST STAGES:       " + ", ".join(slow_labels))
     print(f"  ENDED EARLY:          {'YES' if early_stopped else 'NO'}")
     print(
         "  RESULT COUNTS:        "
@@ -1915,6 +2241,7 @@ def default_scan_options() -> ScanOptions:
         pre_drain_timeout=DEFAULT_PRE_DRAIN_TIMEOUT,
         pre_drain_quiet=DEFAULT_PRE_DRAIN_QUIET,
         max_drain_bytes=DEFAULT_MAX_DRAIN_BYTES,
+        turbo_discovery_enabled=TURBO_DISCOVERY_ENABLED_DEFAULT,
         ask_on_top_match=False,
         auto_validate_top_matches=True,
         validate_size_1_bytes=8 * 1024,
@@ -1980,12 +2307,14 @@ def estimate_scan_wire_seconds(options: ScanOptions) -> float:
 def estimate_scan_overhead_seconds(options: ScanOptions) -> float:
     """Estimate non-wire wait time assuming quiet output."""
     candidates = generate_candidates(options.min_baud, options.max_baud)
-    per_burst = (
-        options.read_timeout
-        + (options.settle_ms / 1000.0)
-        + (0.0 if options.no_pre_drain else options.pre_drain_quiet)
-    )
-    return len(candidates) * options.bursts * per_burst
+    total = 0.0
+    for candidate in candidates:
+        timing = effective_discovery_timing(options, candidate, options.payload_bytes)
+        per_burst = timing.read_timeout + (timing.settle_ms / 1000.0)
+        if not options.no_pre_drain:
+            per_burst += timing.pre_drain_quiet
+        total += per_burst * options.bursts
+    return total
 
 
 def phase0_baseline_settings(baud: int) -> SerialSettings:
@@ -2062,6 +2391,7 @@ def phase0_scan_options(options: ScanOptions) -> ScanOptions:
         pre_drain_timeout=PHASE0_PRE_DRAIN_TIMEOUT,
         pre_drain_quiet=PHASE0_PRE_DRAIN_QUIET,
         max_drain_bytes=PHASE0_MAX_DRAIN_BYTES,
+        turbo_discovery_enabled=False,
         ask_on_top_match=False,
     )
 
@@ -2193,6 +2523,7 @@ def exploratory_scan_options(options: ScanOptions) -> ScanOptions:
         pre_drain_timeout=EXPLORATORY_PRE_DRAIN_TIMEOUT,
         pre_drain_quiet=EXPLORATORY_PRE_DRAIN_QUIET,
         max_drain_bytes=EXPLORATORY_MAX_DRAIN_BYTES,
+        turbo_discovery_enabled=False,
         ask_on_top_match=False,
     )
 
@@ -3179,6 +3510,7 @@ def print_menu_help() -> None:
     print("  TEST COUNT:      NUMBER OF TRIES PER SETTING.")
     print("  QUICK MODE:      AUTO=YES; MANUAL ASKS; FIXED INTERNAL SETTINGS.")
     print("  PHASE 0:         QUICK MODE FIRST TESTS EACH BAUD AT 8N1 FLOW=NONE.")
+    print("  TURBO:           FASTER DISCOVERY TIMING; FULL EXHAUSTIVE STILL AVAILABLE.")
     print("  BAUD FOCUS:      QUICK MODE MAY DEFER OTHER BAUDS WHEN CONFIDENT.")
     print("  ASK ON MATCH:    PAUSE AFTER PASS; ASK CONTINUE.")
     print("  CLEAR OUTPUT:    DISCARD OLD BUFFER DATA FIRST.")
@@ -3238,6 +3570,19 @@ def print_configuration(options: ScanOptions) -> None:
     )
     print_setting("PHASE 0:", phase0_fixed_settings_label())
     print_setting("BAUD FOCUS:", baud_focus_settings_label(options))
+    print_setting(
+        "TURBO DISCOVERY:",
+        "ON" if options.turbo_discovery_enabled else "OFF",
+    )
+    print_setting("EFFECTIVE TIMING:", effective_timing_range_label(options, candidates))
+    print_setting(
+        "CANDIDATE ORDER:",
+        (
+            "TURBO PRIORITY; LOW-VALUE FRAMES DEFERRED"
+            if options.turbo_discovery_enabled
+            else "EXHAUSTIVE PROGRAM ORDER"
+        ),
+    )
     print_setting("ASK ON MATCH:", "YES" if options.ask_on_top_match else "NO")
     print_setting(
         "AUTO VALIDATE:",
@@ -3332,13 +3677,46 @@ def configure_payload(options: ScanOptions) -> ScanOptions:
 
 def configure_timing(options: ScanOptions) -> ScanOptions:
     """Prompt for timing settings."""
-    read_timeout = prompt_float("OUTPUT WAIT AFTER SEND, SECONDS", options.read_timeout, 0.1)
+    print("DISCOVERY TIMING")
+    print("TURBO APPLIES ONLY TO SCAN DISCOVERY; VALIDATION AND MEMORY TESTS STAY CONSERVATIVE.")
+    turbo_enabled = prompt_yes_no(
+        "TURBO DISCOVERY MODE",
+        options.turbo_discovery_enabled,
+    )
+    read_timeout = prompt_float(
+        "OUTPUT WAIT AFTER SEND, SECONDS",
+        options.read_timeout,
+        0.1,
+    )
     settle_ms = prompt_int("PAUSE AFTER OPENING PORTS, MS", options.settle_ms, 0)
-    progress_interval = prompt_float("SCREEN UPDATE INTERVAL, SECONDS", options.progress_interval, 0.1)
+    pre_drain_quiet = prompt_float(
+        "QUIET TIME BEFORE SEND, SECONDS",
+        options.pre_drain_quiet,
+        0.05,
+    )
+    pre_drain_timeout = prompt_float(
+        "MAX TIME CLEARING OLD OUTPUT, SECONDS",
+        options.pre_drain_timeout,
+        0.0,
+    )
+    max_drain_bytes = prompt_int(
+        "MAX OLD BYTES TO CLEAR BEFORE STALE",
+        options.max_drain_bytes,
+        1,
+    )
+    progress_interval = prompt_float(
+        "SCREEN UPDATE INTERVAL, SECONDS",
+        options.progress_interval,
+        0.1,
+    )
     return dataclasses.replace(
         options,
+        turbo_discovery_enabled=turbo_enabled,
         read_timeout=read_timeout,
         settle_ms=settle_ms,
+        pre_drain_quiet=pre_drain_quiet,
+        pre_drain_timeout=pre_drain_timeout,
+        max_drain_bytes=max_drain_bytes,
         progress_interval=progress_interval,
     )
 
@@ -3885,6 +4263,7 @@ def run_memory_size_test(
                     candidate_index=index,
                     candidate_total=total,
                     read_timeout=max(options.read_timeout, 2.0),
+                    completion_quiet=max(options.read_timeout, 2.0),
                     settle_ms=options.settle_ms,
                     progress_interval=options.progress_interval,
                     no_pre_drain=options.no_pre_drain,
@@ -4133,7 +4512,7 @@ def print_commands() -> None:
     print("  2 SET COM PORTS              8 MAKE REPORT NAMES")
     print("  3 SET BAUD RANGE             9 CURRENT SETTINGS")
     print("  4 SET TEST SIZE/COUNT       10 HELP")
-    print("  5 SET TIMING                11 MEMORY TEST")
+    print("  5 SET TIMING/TURBO          11 MEMORY TEST")
     print("  6 CLEAR OLD OUTPUT          12 BAUD FOCUS")
     print("  0 QUIT")
 
@@ -4234,7 +4613,10 @@ def run_scan(options: ScanOptions) -> int:
     """Run the serial probe scan and write reports."""
     serial_module = import_or_install_pyserial()
     logger = setup_logging(options.log_file)
-    all_candidates = generate_candidates(options.min_baud, options.max_baud)
+    all_candidates = prioritize_discovery_candidates(
+        generate_candidates(options.min_baud, options.max_baud),
+        options,
+    )
     candidates = list(all_candidates)
     payload = generate_payload(options.payload_bytes)
     pyserial_version = str(getattr(serial_module, "VERSION", "unknown"))
@@ -4303,6 +4685,10 @@ def run_scan(options: ScanOptions) -> int:
     print(f"SCAN MODE: {scan_mode.upper()}.")
     if auto_mode:
         print("AUTO MODE: EXPLORATORY=YES PHASE2=YES.")
+    print(
+        "TURBO DISCOVERY: "
+        + ("ON; ADAPTIVE TIMING AND PRIORITY ORDER." if options.turbo_discovery_enabled else "OFF.")
+    )
     if exploratory_narrowing_accepted:
         print("MODE: FULL ANALYSIS OF QUICK EXPLORATORY SHORTLIST.")
         print(f"SETTINGS: {len(candidates)}/{len(all_candidates)} SELECTED BY QUICK MODE.")
@@ -4340,18 +4726,21 @@ def run_scan(options: ScanOptions) -> int:
         )
     else:
         print("STAGE 2 VALIDATION: OFF.")
+    print(f"EFFECTIVE TIMING: {effective_timing_range_label(options, candidates)}.")
     print(f"SCREEN UPDATE: {options.progress_interval:.1f}S WHILE SETTING RUNS.")
     print_progress_legend()
     print(f"REPORTS: {options.json_report}, {options.csv_report}, {options.log_file}")
-    rough_total = sum(
-        estimated_transmit_seconds(candidate, options.payload_bytes) * options.bursts
-        for candidate in candidates
-    )
-    rough_total += len(candidates) * options.bursts * (
-        options.read_timeout
-        + (options.settle_ms / 1000.0)
-        + (0.0 if options.no_pre_drain else options.pre_drain_quiet)
-    )
+    rough_total = 0.0
+    for candidate in candidates:
+        timing = effective_discovery_timing(options, candidate, options.payload_bytes)
+        rough_total += estimated_transmit_seconds(
+            candidate,
+            options.payload_bytes,
+        ) * options.bursts
+        per_burst_wait = timing.read_timeout + (timing.settle_ms / 1000.0)
+        if not options.no_pre_drain:
+            per_burst_wait += timing.pre_drain_quiet
+        rough_total += per_burst_wait * options.bursts
     print(
         f"START EST.: {format_duration(rough_total)}; "
         f"FINISH ABOUT {format_finish_clock(rough_total)}"
@@ -4482,6 +4871,7 @@ def run_scan(options: ScanOptions) -> int:
             )
             stage2_options = dataclasses.replace(
                 options,
+                turbo_discovery_enabled=False,
                 payload_bytes=options.validate_size_1_bytes,
                 bursts=1,
                 ask_on_top_match=False,

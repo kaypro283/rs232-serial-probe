@@ -37,6 +37,7 @@ def make_candidate_result(
         status=status,
         error=error,
         elapsed_sec=0.0,
+        timing=sp.zero_timing_breakdown(),
         metrics=score.metrics,
         trials=[],
     )
@@ -130,6 +131,60 @@ class Phase0LivenessTests(unittest.TestCase):
         filtered = sp.candidates_after_phase0_liveness(candidates, report)
 
         self.assertEqual(filtered, candidates)
+
+
+class TurboDiscoveryTimingTests(unittest.TestCase):
+    def test_turbo_read_timeout_adapts_by_baud(self) -> None:
+        options = sp.dataclasses.replace(
+            sp.default_scan_options(),
+            turbo_discovery_enabled=True,
+        )
+        high = sp.effective_discovery_timing(
+            options,
+            sp.phase0_baseline_settings(38400),
+            options.payload_bytes,
+        )
+        low = sp.effective_discovery_timing(
+            options,
+            sp.phase0_baseline_settings(110),
+            options.payload_bytes,
+        )
+
+        self.assertLess(high.read_timeout, sp.DEFAULT_READ_TIMEOUT)
+        self.assertGreater(low.read_timeout, high.read_timeout)
+
+    def test_turbo_prioritizes_common_frame_before_low_value_frame(self) -> None:
+        options = sp.dataclasses.replace(
+            sp.default_scan_options(),
+            turbo_discovery_enabled=True,
+            min_baud=9600,
+            max_baud=9600,
+        )
+        low_value = sp.SerialSettings(9600, 7, "space", 2, "dsr/dtr")
+        likely = sp.SerialSettings(9600, 8, "none", 1, "none")
+
+        ordered = sp.prioritize_discovery_candidates([low_value, likely], options)
+
+        self.assertEqual(ordered[0], likely)
+
+    def test_exact_payload_scoring_still_returns_perfect_score(self) -> None:
+        payload = sp.generate_payload(sp.minimum_payload_size())
+
+        score = sp.score_received(payload.data, payload.data)
+
+        self.assertEqual(score.score, sp.PERFECT_SCORE)
+        self.assertTrue(score.metrics.end_marker_present)
+
+    def test_receive_completion_detects_exact_payload(self) -> None:
+        payload = sp.generate_payload(sp.minimum_payload_size())
+
+        self.assertTrue(sp.receive_completion_detected(payload.data, payload.data))
+        self.assertFalse(
+            sp.receive_completion_detected(
+                payload.data[:-10],
+                payload.data,
+            )
+        )
 
 
 if __name__ == "__main__":
