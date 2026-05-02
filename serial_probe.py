@@ -52,6 +52,11 @@ DEFAULT_PRE_DRAIN_TIMEOUT = 0.5
 DEFAULT_PRE_DRAIN_QUIET = 0.1
 DEFAULT_MAX_DRAIN_BYTES = 32_768
 TURBO_DISCOVERY_ENABLED_DEFAULT = False
+BUFFER_PURGE_ENABLED = True
+BUFFER_PURGE_CAPACITY_BYTES = 16 * 1024
+BUFFER_PURGE_QUIET_SECONDS = 1.5
+BUFFER_PURGE_PER_BAUD_MAX_SECONDS = 2.5
+BUFFER_PURGE_PROGRESS_INTERVAL = 1.0
 FLOW_VALIDATE_PAYLOAD_BYTES = 1024
 FLOW_VALIDATE_READ_TIMEOUT = 2.0
 FLOW_VALIDATE_HOLD_SECONDS = 1.0
@@ -66,12 +71,12 @@ TURBO_READ_TIMEOUT_VERY_LOW_BAUD = 1.00
 TURBO_COMPLETION_QUIET = 0.05
 DEFAULT_COMPLETION_QUIET = 0.10
 PHASE0_PAYLOAD_BYTES = 128
-PHASE0_READ_TIMEOUT = 0.25
+PHASE0_READ_TIMEOUT = 1.0
 PHASE0_SETTLE_MS = 10
 PHASE0_BURSTS = 1
 PHASE0_PROGRESS_INTERVAL = 1.0
-PHASE0_PRE_DRAIN_TIMEOUT = 0.25
-PHASE0_PRE_DRAIN_QUIET = 0.05
+PHASE0_PRE_DRAIN_TIMEOUT = 1.5
+PHASE0_PRE_DRAIN_QUIET = 0.25
 PHASE0_MAX_DRAIN_BYTES = DEFAULT_MAX_DRAIN_BYTES
 PHASE0_MIN_ALIVE_SCORE = 90.0
 PHASE0_MIN_LINE_INTEGRITY = 1.0
@@ -976,6 +981,14 @@ def print_paged_lines(
         if choice.lstrip("\ufeff").strip().lower() in {"q", "quit", "0"}:
             return
         print()
+
+
+def read_operator_input(prompt: str) -> str:
+    """Read terminal input, tolerating occasional bad console bytes."""
+    try:
+        return input(prompt)
+    except UnicodeDecodeError:
+        return ""
 
 
 def wrapped_value_lines(
@@ -2533,7 +2546,7 @@ def prompt_operator_break_action(target: str = "SCAN") -> str:
     print(border_line(REPORT_WIDTH))
     while True:
         try:
-            choice = input("ENTER SELECTION [1]: ").lstrip("\ufeff").strip().lower()
+            choice = read_operator_input("ENTER SELECTION [1]: ").lstrip("\ufeff").strip().lower()
         except EOFError:
             return "resume"
         if choice == "":
@@ -2877,6 +2890,104 @@ def phase0_scan_options(options: ScanOptions) -> ScanOptions:
         turbo_discovery_enabled=False,
         ask_on_top_match=False,
     )
+
+
+def buffer_purge_settings(options: ScanOptions) -> list[SerialSettings]:
+    """Return output-side settings used to flush a stateful printer buffer."""
+    return [
+        phase0_baseline_settings(baud)
+        for baud in scan_bauds(options.min_baud, options.max_baud)
+    ]
+
+
+def buffer_purge_banner(reason: str, settings_count: int) -> None:
+    """Print a vintage-style buffer purge banner."""
+    print()
+    print_report_title("BUFFER PURGE")
+    print_wrapped_value("  REASON:              ", reason)
+    print("  DEVICE TYPE:          SERIAL FIFO/RAM PRINTER BUFFER")
+    print(f"  ASSUMED CAPACITY:     {BUFFER_PURGE_CAPACITY_BYTES} BYTES")
+    print(f"  OUTPUT BAUD TRIES:    {settings_count}")
+    print(
+        "  METHOD:               READ BUFFER OUTPUT UNTIL QUIET "
+        "BEFORE SENDING NEW TEST DATA."
+    )
+    print(border_line(REPORT_WIDTH))
+
+
+def purge_buffer_output(
+    serial_module: Any,
+    options: ScanOptions,
+    logger: logging.Logger,
+    reason: str,
+    settings_list: Sequence[SerialSettings] | None = None,
+) -> DrainResult:
+    """Drain a stateful serial printer buffer before a test stage."""
+    if not BUFFER_PURGE_ENABLED:
+        return DrainResult(0, 0.0, True, "disabled", None)
+    settings = list(settings_list) if settings_list is not None else buffer_purge_settings(options)
+    if not settings:
+        return DrainResult(0, 0.0, True, "no-settings", None)
+
+    buffer_purge_banner(reason, len(settings))
+    started = time.monotonic()
+    total_drained = 0
+    errors: list[str] = []
+    for index, setting in enumerate(settings, start=1):
+        prefix = f"[PURGE {index:02d}/{len(settings):02d} OUT {setting.label()}]"
+        try:
+            with open_serial_port(
+                serial_module,
+                options.out_port,
+                setting,
+                max(BUFFER_PURGE_QUIET_SECONDS, 0.5),
+            ) as out_serial:
+                drain = drain_output_until_quiet(
+                    out_serial=out_serial,
+                    quiet_seconds=BUFFER_PURGE_QUIET_SECONDS,
+                    max_seconds=BUFFER_PURGE_PER_BAUD_MAX_SECONDS,
+                    max_bytes=max(options.max_drain_bytes, BUFFER_PURGE_CAPACITY_BYTES * 2),
+                    progress_interval=BUFFER_PURGE_PROGRESS_INTERVAL,
+                    progress=console_progress,
+                    prefix=prefix,
+                    logger=logger,
+                )
+        except Exception as exc:
+            error = str(exc)
+            logger.info("buffer purge failed opening %s: %s", setting.label(), error)
+            errors.append(error)
+            continue
+
+        total_drained += drain.bytes_drained
+        logger.info(
+            "buffer purge %s drained=%s quiet=%s reason=%s elapsed=%.3fs error=%s",
+            setting.label(),
+            drain.bytes_drained,
+            drain.quiet,
+            drain.reason,
+            drain.elapsed_sec,
+            drain.error,
+        )
+        if drain.error:
+            errors.append(drain.error)
+    elapsed = time.monotonic() - started
+    quiet = not errors
+    result = DrainResult(
+        bytes_drained=total_drained,
+        elapsed_sec=elapsed,
+        quiet=quiet,
+        reason="quiet" if quiet else "error",
+        error="; ".join(errors) if errors else None,
+    )
+    print()
+    print_report_title("BUFFER PURGE COMPLETE")
+    print(f"  BYTES DRAINED:        {result.bytes_drained}")
+    print(f"  RUN TIME:             {format_duration(result.elapsed_sec)}")
+    print(f"  STATUS:               {'READY' if result.quiet else 'CHECK LOG'}")
+    if result.error:
+        print_wrapped_value("  DETAIL:               ", result.error)
+    print(border_line(REPORT_WIDTH))
+    return result
 
 
 def phase0_extra_byte_limit(expected_byte_count: int) -> int:
@@ -3621,6 +3732,12 @@ def run_phase0_baud_liveness(
     logger: logging.Logger,
 ) -> BaudLivenessReport:
     """Run the fixed 8E1 baud liveness sweep used before quick mode."""
+    purge_buffer_output(
+        serial_module=serial_module,
+        options=options,
+        logger=logger,
+        reason="START PHASE 0 WITH AN EMPTY BUFFER FIFO.",
+    )
     phase0_options = phase0_scan_options(options)
     phase0_payload = generate_phase0_payload(phase0_options.payload_bytes)
     baud_order, _ = group_candidates_by_baud(candidates)
@@ -3681,6 +3798,13 @@ def run_phase0_baud_liveness(
             candidate_result.bytes_drained_before,
             candidate_result.error,
         )
+        if decision.alive:
+            if not prompt_yes_no_question(
+                "Live Phase 0 baud found. Continue Phase 0 sweep?",
+                False,
+            ):
+                logger.info("phase 0 stopped after live baud %s", baud)
+                break
 
     elapsed_sec = time.monotonic() - started
     alive_bauds = [result.baud for result in results if result.alive]
@@ -3906,6 +4030,12 @@ def run_dual_phase0_baud_matrix(
     logger: logging.Logger,
 ) -> DualBaudLivenessReport:
     """Run a fixed-frame input/output baud-pair liveness matrix."""
+    purge_buffer_output(
+        serial_module=serial_module,
+        options=options,
+        logger=logger,
+        reason="START DUAL PHASE 0 WITH AN EMPTY BUFFER FIFO.",
+    )
     phase0_options = phase0_scan_options(options)
     phase0_payload = generate_phase0_payload(phase0_options.payload_bytes)
     baud_order = scan_bauds(options.min_baud, options.max_baud)
@@ -3960,6 +4090,17 @@ def run_dual_phase0_baud_matrix(
             candidate_result.bytes_drained_before,
             candidate_result.error,
         )
+        if decision.alive:
+            if not prompt_yes_no_question(
+                "Live dual baud pair found. Continue Phase 0 matrix?",
+                False,
+            ):
+                logger.info(
+                    "dual phase 0 stopped after live pair in=%s out=%s",
+                    input_baud,
+                    output_baud,
+                )
+                break
 
     elapsed_sec = time.monotonic() - started
     alive_pairs = [
@@ -4537,7 +4678,7 @@ def prompt_yes_no(label: str, current: bool) -> bool:
     default = "Y" if current else "N"
     while True:
         try:
-            value = input(f"{label.upper()} [{default}]: ").strip().lower()
+            value = read_operator_input(f"{label.upper()} [{default}]: ").strip().lower()
         except EOFError:
             return current
         if value == "":
@@ -4554,7 +4695,7 @@ def prompt_yes_no_question(question: str, current: bool) -> bool:
     default = "Y" if current else "N"
     while True:
         try:
-            value = input(f"{question.upper()} (Y/N) [{default}]: ").strip().lower()
+            value = read_operator_input(f"{question.upper()} (Y/N) [{default}]: ").strip().lower()
         except EOFError:
             return current
         if value == "":
@@ -6142,6 +6283,12 @@ def run_flow_control_validation(
         logger.info("flow control validation skipped: no recommendable frame")
         return [], None
 
+    purge_buffer_output(
+        serial_module=serial_module,
+        options=options,
+        logger=logger,
+        reason="CLEAR VALIDATION DATA BEFORE FLOW-CONTROL TESTS.",
+    )
     payload = generate_payload(options.flow_validate_size_bytes)
     settings_list = flow_validation_settings_for_frame(frame)
     print()
@@ -6236,6 +6383,12 @@ def run_memory_test(options: ScanOptions) -> None:
     log_file = options.log_file
     logger = setup_logging(log_file)
     serial_module = import_or_install_pyserial()
+    purge_buffer_output(
+        serial_module=serial_module,
+        options=options,
+        logger=logger,
+        reason="CLEAR BUFFER BEFORE MEMORY TEST.",
+    )
     print()
     print_report_title("MEMORY TEST START")
     print("  USES SERIAL SETTING ENTERED FROM SCAN REPORT.")
@@ -6311,7 +6464,7 @@ def interactive_menu(options: ScanOptions | None = None) -> ScanOptions | None:
     while True:
         print_commands()
         try:
-            choice = input("ENTER SELECTION: ").lstrip("\ufeff").strip().lower()
+            choice = read_operator_input("ENTER SELECTION: ").lstrip("\ufeff").strip().lower()
         except EOFError:
             return None
 
@@ -6371,7 +6524,7 @@ def prompt_after_scan_action(title: str = "RUN COMPLETE") -> str:
     print(border_line(REPORT_WIDTH))
     while True:
         try:
-            choice = input("ENTER SELECTION [2]: ").lstrip("\ufeff").strip().lower()
+            choice = read_operator_input("ENTER SELECTION [2]: ").lstrip("\ufeff").strip().lower()
         except EOFError:
             return "menu"
         if choice == "":
@@ -6394,6 +6547,12 @@ def run_dual_bank_validation(
     """Run a larger validation payload for top dual-bank candidates."""
     if not shortlist:
         return [], None
+    purge_buffer_output(
+        serial_module=serial_module,
+        options=options,
+        logger=logger,
+        reason="CLEAR SCAN DATA BEFORE DUAL VALIDATION.",
+    )
     print()
     print_report_title("DUAL BANK VALIDATION")
     print(
@@ -6507,6 +6666,12 @@ def run_dual_bank_scan(
     for input_baud, output_baud in selected_pairs:
         candidates.extend(dual_frame_candidates_for_pair(input_baud, output_baud))
     payload = generate_payload(options.payload_bytes)
+    purge_buffer_output(
+        serial_module=serial_module,
+        options=options,
+        logger=logger,
+        reason="CLEAR PHASE 0 DATA BEFORE DUAL FRAME SCAN.",
+    )
     scan_started = time.monotonic()
     started_at = dt.datetime.now(dt.timezone.utc).isoformat()
 
@@ -6902,6 +7067,12 @@ def run_scan(options: ScanOptions) -> int:
             len(all_candidates),
         )
 
+    purge_buffer_output(
+        serial_module=serial_module,
+        options=options,
+        logger=logger,
+        reason="CLEAR DISCOVERY DATA BEFORE PHASE 1 SCAN.",
+    )
     scan_started = time.monotonic()
     started_at = dt.datetime.now(dt.timezone.utc).isoformat()
 
@@ -7157,6 +7328,12 @@ def run_scan(options: ScanOptions) -> int:
         top_score = ranked[0].score if ranked else 0.0
         shortlist = [result for result in ranked if abs(result.score - top_score) <= 0.0001]
         if shortlist:
+            purge_buffer_output(
+                serial_module=serial_module,
+                options=options,
+                logger=logger,
+                reason="CLEAR PHASE 1 DATA BEFORE VALIDATION.",
+            )
             print()
             print_report_title("PHASE 2 VALIDATION")
             print(
@@ -7223,6 +7400,12 @@ def run_scan(options: ScanOptions) -> int:
                 print(
                     f"TIE REMAINS ({len(tied_after_1)}). "
                     f"RUNNING PASS 2 AT {options.validate_size_2_tie_bytes} BYTES."
+                )
+                purge_buffer_output(
+                    serial_module=serial_module,
+                    options=options,
+                    logger=logger,
+                    reason="CLEAR VALIDATION PASS 1 DATA BEFORE PASS 2.",
                 )
                 stage2_options = dataclasses.replace(
                     stage2_options,
