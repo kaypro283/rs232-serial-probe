@@ -4890,13 +4890,13 @@ def interactive_menu(options: ScanOptions | None = None) -> ScanOptions | None:
             print("ENTER A NUMBER FROM 0 TO 12.")
 
 
-def prompt_after_scan_action(title: str = "SCAN COMPLETE") -> str:
-    """Ask what to do after a scan finishes or stops."""
+def prompt_after_scan_action(title: str = "RUN COMPLETE") -> str:
+    """Ask what to do after a scan or sweep finishes or stops."""
     print()
     print(border_line(REPORT_WIDTH))
     print(bordered_text(title, REPORT_WIDTH))
     print(border_line(REPORT_WIDTH))
-    print("  1 RUN SAME SETTINGS AGAIN")
+    print("  1 START SCAN AGAIN")
     print("  2 RETURN TO MAIN MENU")
     print("  0 QUIT")
     print(border_line(REPORT_WIDTH))
