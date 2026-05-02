@@ -25,7 +25,7 @@ Usage screen:
 python serial_probe.py --help
 ```
 
-The first screen is the command menu. Use `9 CURRENT SETTINGS` to view ports, baud range, number of settings to test, test message size, repeat count, timing, old-output clearing, Phase 0 liveness settings, baud focus rules, report files, and estimated scan time. It also shows that scan mode is asked at scan start and that blank means `FULL`. Use `11 MEMORY TEST` after you have a likely switch setting. The normal full scan tests every selected combination unless you explicitly choose quick exploratory narrowing.
+The first screen is the command menu. Use `9 CURRENT SETTINGS` to view ports, baud range, number of settings to test, test message size, repeat count, timing, old-output clearing, Phase 0 liveness settings, quick baud focus rules, report files, and estimated scan time. It also shows that scan type is asked at scan start and that blank means `FULL`. Use `11 MEMORY TEST` after you have a likely switch setting. The normal full scan tests every selected combination unless you explicitly choose quick exploratory narrowing.
 
 The terminal UI is written for an 80-column early terminal style. Screens use terse uppercase operator text and bright green text when the console supports ANSI color. PyCharm runs are treated as color-capable. Set `NO_COLOR=1` before running if you want plain console text.
 
@@ -39,22 +39,22 @@ python serial_probe.py
 
 Use the default settings, then select `1. Start scan`.
 
-## Scan Mode
+## Scan Type
 
 When a scan starts, the tool asks:
 
 ```text
-SCAN MODE: FULL OR AUTO [FULL]:
+SCAN TYPE: FULL OR QUICK [FULL]:
 ```
 
-Accepted answers are `F`, `FULL`, `M`, `MANUAL`, `A`, and `AUTO`. Press Enter for `FULL`.
+Accepted answers are `F`, `FULL`, `M`, `MANUAL`, `Q`, and `QUICK`. Old `A` and `AUTO` inputs are still accepted as aliases for `QUICK`. Press Enter for `FULL`.
 
 `FULL` is the default and is the safest mode for switch mapping. It asks whether to run quick exploratory mode, and pressing Enter answers `N`, so the normal path is a complete scan over every selected setting.
 
-`AUTO` runs Phase 0 baud liveness, then quick exploratory mode, and accepts phase-2 full analysis from the quick findings without asking the two follow-up yes/no questions:
+`QUICK` runs Phase 0 baud liveness, then quick exploratory mode, and accepts phase-2 full analysis from the quick findings without asking the two follow-up yes/no questions:
 
 ```text
-AUTO MODE: EXPLORATORY=YES PHASE2=YES
+QUICK SCAN: EXPLORATORY=YES PHASE2=YES
 ```
 
 `MANUAL` is accepted as an alias for `FULL`.
@@ -106,54 +106,54 @@ Phase 0 is a boolean gate, not a ranking. A baud is marked `ALIVE` only when the
 
 If one or more bauds are alive, quick exploratory tests only candidates at those bauds. If zero bauds are alive, the tool prints an explicit fallback and quick exploratory uses all selected bauds, preserving the older behavior. The full scan still tests all selected settings unless the normal quick shortlist is accepted for phase 2.
 
-## Baud Focus
+## Quick Baud Focus
 
-Quick exploratory mode has a cautious baud-focus rule. It looks for a strong clean pattern at one baud across multiple framing and flow-control variants. When the configured confidence gates pass, it stays at that baud, finishes the remaining quick tests there, and may defer the other bauds from the quick pass.
+Quick baud focus is a quick-scan speed rule. It looks for a strong clean pattern at one baud across multiple framing and flow-control variants. When the configured confidence gates pass, it stays at that baud, finishes the remaining quick tests there, and may defer the other bauds from the quick pass. Full scan does not need it.
 
 Default gates:
 
-- Baud focus enabled: `YES`.
+- Quick baud focus enabled: `YES`.
 - Strong-hit score: `90.0` or higher.
 - Lead over next best baud: `20.0` score points or higher.
 - Minimum strong results at the baud: `3`.
 - Minimum early samples per baud: `8`.
 
-Stale output, partial writes, or driver errors before a clean hit pattern do not permanently block focus; they are treated as noise until a baud proves itself. Once focus is engaged, any stale output, partial write, driver error, or confidence drop cancels focus and returns to the normal full baud sweep. The full brute-force scan is the default: choose `FULL` or press Enter at scan mode, then answer `N` or press Enter at quick mode. If `AUTO` accepts a narrowed phase 2, the report records that choice.
+Stale output, partial writes, or driver errors before a clean hit pattern do not permanently block focus; they are treated as noise until a baud proves itself. Once focus is engaged, any stale output, partial write, driver error, or confidence drop cancels focus and returns to the normal full baud sweep. The full brute-force scan is the default: choose `FULL` or press Enter at scan type, then answer `N` or press Enter at quick mode. If `QUICK` accepts a narrowed phase 2, the report records that choice.
 
-Use menu command `12 BAUD FOCUS` to change the focus thresholds. Use `9 CURRENT SETTINGS` to view the active values.
+Use menu command `10 QUICK BAUD FOCUS` to change the focus thresholds. Use `9 CURRENT SETTINGS` to view the active values.
 
 Example operator lines:
 
 ```text
-SCAN MODE: FULL OR AUTO [FULL]:
-AUTO MODE: EXPLORATORY=YES PHASE2=YES
-BAUD FOCUS ENGAGED: 38400 SCORE=100.0 GAP=50.0 GOOD=4 SAMPLES=8
+SCAN TYPE: FULL OR QUICK [FULL]:
+QUICK SCAN: EXPLORATORY=YES PHASE2=YES
+QUICK BAUD FOCUS ENGAGED: 38400 SCORE=100.0 GAP=50.0 GOOD=4 SAMPLES=8
 OTHER BAUDS DEFERRED BY CONFIDENCE RULE
 ```
 
 If confidence falls after focus starts, the tool returns to the broad scan:
 
 ```text
-BAUD FOCUS CANCELED: CONFIDENCE DROPPED
+QUICK BAUD FOCUS CANCELED: CONFIDENCE DROPPED
 RETURNING TO FULL BAUD SWEEP
 ```
 
 Prompt-path checks:
 
 ```text
-Scan mode FULL, quick prompt N:
+Scan type FULL, quick prompt N:
   Skip quick mode. Full scan runs all selected settings.
 
-Scan mode FULL, quick prompt Y, phase-2 prompt N:
+Scan type FULL, quick prompt Y, phase-2 prompt N:
   Quick summary is shown. Full scan still runs all selected settings.
 
-Scan mode FULL, quick prompt Y, phase-2 prompt Y:
+Scan type FULL, quick prompt Y, phase-2 prompt Y:
   Quick summary is shown. Full scan runs the narrowed candidate list using full-scan settings.
 
-Scan mode AUTO:
+Scan type QUICK:
   Phase 0 and quick mode run. Phase 2 uses quick findings if they are usable; otherwise full scan runs all selected settings.
 
-Scan mode FULL, quick prompt Y, no usable quick findings:
+Scan type FULL, quick prompt Y, no usable quick findings:
   Quick summary explains the fallback. Full scan runs all selected settings.
 ```
 
@@ -179,7 +179,7 @@ The default menu settings are tuned for a practical scan:
 
 - `180` bytes per setting.
 - `1` test per setting.
-- Every selected serial setting is tested in a normal full scan. AUTO may shorten the exploratory pass with Phase 0 and may shorten the phase-2 candidate list only when confidence gates pass.
+- Every selected serial setting is tested in a normal full scan. QUICK may shorten the exploratory pass with Phase 0 and may shorten the phase-2 candidate list only when confidence gates pass.
 - Output wait after send is `2.0` seconds by default.
 - `Ask on top match` is off by default. If enabled, a `PASS` result pauses the scan and asks whether to continue looking for possible ties.
 - `Auto validate top matches after scan` is on by default. It retests the top-score setting or settings with an 8K payload, then uses a 16K payload if a tie remains. The menu can turn this off or change the sizes.
@@ -253,7 +253,7 @@ It also writes:
 
 The report paths are configured from the menu.
 
-Each scan appends a compact run block with the switch/jumper note, selected scan mode, phase summary, top results, validation results when run, and interpretation notes.
+Each scan appends a compact run block with the switch/jumper note, selected scan type, phase summary, top results, validation results when run, and interpretation notes.
 
 ## Memory Test
 
