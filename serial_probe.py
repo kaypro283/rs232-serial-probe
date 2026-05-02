@@ -17,6 +17,7 @@ import datetime as dt
 import logging
 import os
 import platform
+import re
 import statistics
 import subprocess
 import sys
@@ -45,13 +46,14 @@ PARITIES: list[str] = ["none", "even", "odd", "mark", "space"]
 STOP_BITS: list[int] = [1, 2]
 FLOW_CONTROLS: list[str] = ["none", "xon/xoff", "rts/cts", "dsr/dtr"]
 DEFAULT_BURSTS = 1
-DEFAULT_PAYLOAD_BYTES = 180
+DEFAULT_PAYLOAD_BYTES = 384
 DEFAULT_READ_TIMEOUT = 2.0
 DEFAULT_SETTLE_MS = 50
 DEFAULT_PROGRESS_INTERVAL = 1.0
 DEFAULT_PRE_DRAIN_TIMEOUT = 0.5
 DEFAULT_PRE_DRAIN_QUIET = 0.1
 DEFAULT_MAX_DRAIN_BYTES = 32_768
+DEFAULT_EIGHT_BIT_PAYLOAD_BYTES = 512
 TURBO_DISCOVERY_ENABLED_DEFAULT = False
 BUFFER_PURGE_ENABLED = True
 BUFFER_PURGE_CAPACITY_BYTES = 16 * 1024
@@ -127,6 +129,10 @@ TOP_MATCH_MIN_SCORE = 99.0
 TIE_SCORE_TOLERANCE = 0.5
 PERFECT_SCORE = 100.0
 OPERATOR_BREAK_EXIT_CODE = 130
+PAYLOAD_MODE_ASCII = "ascii"
+PAYLOAD_MODE_EIGHT_BIT = "eight_bit"
+PAYLOAD_MODE_PHASE0 = "phase0"
+STALE_STATUSES = {"stale-output", "wrong-nonce", "mixed-nonce"}
 
 
 def flow_control_code(flow_control: str) -> str:
@@ -236,13 +242,41 @@ class DualSerialSettings:
 
 
 @dataclass(frozen=True)
+class ProbeNonce:
+    """Identity fields embedded in a probe payload."""
+
+    run_id: str
+    candidate_id: str
+    trial_id: str
+    switch_note_hash: str | None = None
+
+    def fields(self) -> tuple[tuple[str, str], ...]:
+        """Return compact nonce fields for payload text."""
+        values = [
+            ("RUN", self.run_id),
+            ("CAND", self.candidate_id),
+            ("TRIAL", self.trial_id),
+        ]
+        if self.switch_note_hash:
+            values.append(("NOTE", self.switch_note_hash))
+        return tuple(values)
+
+    def compact(self) -> str:
+        """Return a compact one-line nonce label."""
+        return " ".join(f"{name}={value}" for name, value in self.fields())
+
+
+@dataclass(frozen=True)
 class ProbePayload:
-    """Generated deterministic probe bytes and expected line metadata."""
+    """Generated probe bytes and expected line metadata."""
 
     data: bytes
     line_count: int
     byte_count: int
     body_hash: str
+    payload_mode: str = PAYLOAD_MODE_ASCII
+    nonce: ProbeNonce | None = None
+    high_bit_block: bytes = b""
 
 
 @dataclass(frozen=True)
@@ -257,6 +291,23 @@ class ScoreMetrics:
     length_ratio: float
     start_marker_present: bool
     end_marker_present: bool
+    valid_probe_line_count: int = 0
+    current_nonce_line_count: int = 0
+    wrong_nonce_line_count: int = 0
+    high_bit_bytes_sent: int = 0
+    high_bit_bytes_received: int = 0
+    high_bit_exact_ratio: float = 0.0
+    high_bit_stripped_count: int = 0
+
+
+@dataclass(frozen=True)
+class ParsedProbeLine:
+    """One structurally valid checksummed probe line from received bytes."""
+
+    line_number: int
+    checksum: int
+    nonce: ProbeNonce | None
+    raw_left: bytes
 
 
 @dataclass(frozen=True)
@@ -265,6 +316,8 @@ class ScoreResult:
 
     score: float
     metrics: ScoreMetrics
+    classification: str = "no-data"
+    evidence: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -295,6 +348,10 @@ class TrialResult:
     timing: "TimingBreakdown"
     received_preview_ascii: str
     received_preview_hex: str
+    score_classification: str = "unknown"
+    evidence: tuple[str, ...] = ()
+    nonce_summary: str = ""
+    payload_mode: str = PAYLOAD_MODE_ASCII
 
 
 @dataclass(frozen=True)
@@ -326,6 +383,7 @@ class CandidateResult:
     timing: TimingBreakdown
     metrics: ScoreMetrics
     trials: list[TrialResult]
+    evidence: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -361,6 +419,7 @@ class ScanOptions:
     baud_focus_lead_gap_threshold: float
     baud_focus_min_strong_results: int
     baud_focus_min_samples: int
+    run_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -540,6 +599,20 @@ class FlowControlValidationResult:
     metrics: ScoreMetrics
 
 
+@dataclass(frozen=True)
+class Bank2CharacterizationResult:
+    """Append-only result block for one second-bank switch state."""
+
+    switch_note: str
+    known_baud_text: str
+    ascii_results: list[CandidateResult]
+    eight_bit_results: list[CandidateResult]
+    flow_results: list[FlowControlValidationResult]
+    stale_data_seen: bool
+    conclusion: str
+    run_id: str
+
+
 def fnv1a32(data: bytes) -> int:
     """Return a deterministic FNV-1a 32-bit hash for bytes."""
     value = FNV_OFFSET_32
@@ -549,11 +622,97 @@ def fnv1a32(data: bytes) -> int:
     return value
 
 
-def make_probe_line(line_number: int, kind: str, data: str) -> bytes:
+def sanitize_nonce_value(value: object, fallback: str = "NA") -> str:
+    """Return a compact printable token safe for one probe line field."""
+    text = str(value).strip()
+    if not text:
+        text = fallback
+    cleaned = re.sub(r"[^A-Za-z0-9_.:-]+", "_", text)
+    return cleaned[:48] or fallback
+
+
+def make_run_id(prefix: str = "R") -> str:
+    """Return a short run id for nonce-bearing payloads."""
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S")
+    entropy = fnv1a32(f"{stamp}:{time.time_ns()}:{os.getpid()}".encode("ascii"))
+    return sanitize_nonce_value(f"{prefix}{stamp}{entropy:08X}"[-24:])
+
+
+def switch_note_hash(switch_note: str | None) -> str | None:
+    """Return a stable compact hash for an operator switch-note string."""
+    note = (switch_note or "").strip()
+    if not note:
+        return None
+    return f"{fnv1a32(note.encode('utf-8', 'replace')):08X}"
+
+
+def settings_nonce_id(settings: SerialSettings | DualSerialSettings) -> str:
+    """Return a compact serial-settings id for payload nonce fields."""
+    if isinstance(settings, DualSerialSettings):
+        return sanitize_nonce_value(
+            "I"
+            f"{settings.input_settings.baud}"
+            f"{settings.input_settings.data_bits}"
+            f"{settings.input_settings.parity_code()}"
+            f"{settings.input_settings.stop_bits}"
+            f"{flow_control_code(settings.input_settings.flow_control)}"
+            "_O"
+            f"{settings.output_settings.baud}"
+            f"{settings.output_settings.data_bits}"
+            f"{settings.output_settings.parity_code()}"
+            f"{settings.output_settings.stop_bits}"
+            f"{flow_control_code(settings.output_settings.flow_control)}"
+        )
+    return sanitize_nonce_value(
+        f"{settings.baud}"
+        f"{settings.data_bits}"
+        f"{settings.parity_code()}"
+        f"{settings.stop_bits}"
+        f"{flow_control_code(settings.flow_control)}"
+    )
+
+
+def candidate_nonce_id(
+    settings: SerialSettings | DualSerialSettings,
+    candidate_index: int,
+) -> str:
+    """Return a candidate id that is unique within the current run."""
+    return sanitize_nonce_value(f"C{candidate_index:04d}")
+
+
+def trial_nonce_id(burst_index: int) -> str:
+    """Return a compact trial id for one payload burst."""
+    return sanitize_nonce_value(f"T{burst_index:02d}")
+
+
+def representative_nonce() -> ProbeNonce:
+    """Return a fixed-width nonce used for conservative size calculations."""
+    return ProbeNonce(
+        run_id="R00000000000000000000",
+        candidate_id="C0000_00000000",
+        trial_id="T00",
+        switch_note_hash="00000000",
+    )
+
+
+def nonce_field_text(nonce: ProbeNonce | None) -> str:
+    """Return probe marker field text for a nonce."""
+    if nonce is None:
+        return ""
+    return " " + nonce.compact()
+
+
+def make_probe_line(
+    line_number: int,
+    kind: str,
+    data: str,
+    nonce: ProbeNonce | None = None,
+) -> bytes:
     """Build one checksummed ASCII line for the probe payload."""
     block_number = (line_number - 1) % 32
+    nonce_text = nonce_field_text(nonce)
     left = (
-        f"LINE {line_number:06d} BLOCK={block_number:02d} "
+        f"LINE {line_number:06d}{nonce_text} BLOCK={block_number:02d} "
         f"TYPE={kind} DATA={data}"
     ).encode("ascii")
     checksum = fnv1a32(left)
@@ -574,40 +733,76 @@ def repeated_ascii_pattern(line_number: int, length: int) -> str:
     return (rotated * repeats)[:length]
 
 
-def minimum_payload_size() -> int:
+def ascii_start_marker(payload_bytes: int, nonce: ProbeNonce | None) -> bytes:
+    """Return the ASCII probe begin marker."""
+    if nonce is None:
+        return (
+            f"<<<SERIAL_PROBE_BEGIN VERSION=1 TARGET_BYTES={payload_bytes:08d}>>>\r\n"
+        ).encode("ascii")
+    return (
+        f"<<<SERIAL_PROBE_BEGIN VERSION=2 MODE=ASCII "
+        f"TARGET_BYTES={payload_bytes:08d}{nonce_field_text(nonce)}>>>\r\n"
+    ).encode("ascii")
+
+
+def ascii_end_marker(
+    line_count: int,
+    body_hash: int,
+    nonce: ProbeNonce | None,
+) -> bytes:
+    """Return the ASCII probe end marker."""
+    if nonce is None:
+        return (
+            f"<<<SERIAL_PROBE_END LINES={line_count:06d} HASH={body_hash:08X}>>>\r\n"
+        ).encode("ascii")
+    return (
+        f"<<<SERIAL_PROBE_END LINES={line_count:06d} HASH={body_hash:08X}"
+        f"{nonce_field_text(nonce)}>>>\r\n"
+    ).encode("ascii")
+
+
+def minimum_payload_size(nonce: ProbeNonce | None = None) -> int:
     """Return the smallest payload size this generator can represent."""
-    start = b"<<<SERIAL_PROBE_BEGIN VERSION=1 TARGET_BYTES=00000000>>>\r\n"
-    end = b"<<<SERIAL_PROBE_END LINES=000000 HASH=00000000>>>\r\n"
-    smallest_line = make_probe_line(1, "PAD", "")
+    size_nonce = representative_nonce() if nonce is None else nonce
+    start = ascii_start_marker(0, size_nonce)
+    end = ascii_end_marker(0, 0, size_nonce)
+    smallest_line = make_probe_line(1, "PAD", "", size_nonce)
     return len(start) + len(end) + len(smallest_line)
 
 
-def generate_payload(payload_bytes: int) -> ProbePayload:
+def generate_payload(
+    payload_bytes: int,
+    nonce: ProbeNonce | None = None,
+) -> ProbePayload:
     """Generate an ASCII-only probe payload of exactly payload_bytes bytes.
 
     The payload contains fixed-width start/end markers and checksummed line
-    records. It is deterministic and suitable for unit tests.
+    records. Supplying a nonce makes the payload candidate/trial specific.
     """
-    min_size = minimum_payload_size()
+    min_size = minimum_payload_size(nonce)
     if payload_bytes < min_size:
         raise ValueError(f"payload-bytes must be at least {min_size}")
 
-    start = (
-        f"<<<SERIAL_PROBE_BEGIN VERSION=1 TARGET_BYTES={payload_bytes:08d}>>>\r\n"
-    ).encode("ascii")
-    end_len = len(b"<<<SERIAL_PROBE_END LINES=000000 HASH=00000000>>>\r\n")
+    start = ascii_start_marker(payload_bytes, nonce)
+    end_len = len(ascii_end_marker(0, 0, nonce))
     lines: list[bytes] = []
     line_number = 1
     current_len = len(start)
 
-    sample_full_line = make_probe_line(1, "DATA", repeated_ascii_pattern(1, 96))
-    min_pad_len = len(make_probe_line(1, "PAD", ""))
+    sample_full_line = make_probe_line(
+        1,
+        "DATA",
+        repeated_ascii_pattern(1, 96),
+        nonce,
+    )
+    min_pad_len = len(make_probe_line(1, "PAD", "", nonce))
 
     while True:
         candidate = make_probe_line(
             line_number,
             "DATA",
             repeated_ascii_pattern(line_number, 96),
+            nonce,
         )
         remaining_after = payload_bytes - current_len - len(candidate) - end_len
         if remaining_after == 0 or remaining_after >= min_pad_len:
@@ -623,8 +818,9 @@ def generate_payload(payload_bytes: int) -> ProbePayload:
             break
 
         block_number = (line_number - 1) % 32
+        nonce_text = nonce_field_text(nonce)
         pad_prefix_len = len(
-            f"LINE {line_number:06d} BLOCK={block_number:02d} "
+            f"LINE {line_number:06d}{nonce_text} BLOCK={block_number:02d} "
             "TYPE=PAD DATA=".encode("ascii")
         )
         pad_suffix_len = len(b" HASH=00000000\r\n")
@@ -641,7 +837,7 @@ def generate_payload(payload_bytes: int) -> ProbePayload:
             if pad_data_len < 0:
                 raise ValueError("could not fit final pad line into payload")
         pad_data = repeated_ascii_pattern(line_number, pad_data_len)
-        lines.append(make_probe_line(line_number, "PAD", pad_data))
+        lines.append(make_probe_line(line_number, "PAD", pad_data, nonce))
         current_len += len(lines[-1])
         line_number += 1
         break
@@ -655,9 +851,7 @@ def generate_payload(payload_bytes: int) -> ProbePayload:
     line_count = len(lines)
     body = start + b"".join(lines)
     body_hash = fnv1a32(body)
-    end = (
-        f"<<<SERIAL_PROBE_END LINES={line_count:06d} HASH={body_hash:08X}>>>\r\n"
-    ).encode("ascii")
+    end = ascii_end_marker(line_count, body_hash, nonce)
     payload = body + end
 
     if len(payload) != payload_bytes:
@@ -672,12 +866,62 @@ def generate_payload(payload_bytes: int) -> ProbePayload:
         line_count=line_count,
         byte_count=len(payload),
         body_hash=f"{body_hash:08X}",
+        payload_mode=PAYLOAD_MODE_ASCII,
+        nonce=nonce,
     )
 
 
-def parse_valid_probe_lines(data: bytes) -> dict[int, int]:
-    """Return valid line numbers and checksums found in probe-like bytes."""
-    valid: dict[int, int] = {}
+def expected_nonce_from_payload(expected: bytes) -> ProbeNonce | None:
+    """Extract nonce fields from an expected payload marker if present."""
+    head = expected[: min(len(expected), 512)].decode("ascii", "ignore")
+    run = re.search(r"\bRUN=([^ >\r\n]+)", head)
+    cand = re.search(r"\bCAND=([^ >\r\n]+)", head)
+    trial = re.search(r"\bTRIAL=([^ >\r\n]+)", head)
+    note = re.search(r"\bNOTE=([^ >\r\n]+)", head)
+    if not (run and cand and trial):
+        return None
+    return ProbeNonce(
+        run_id=run.group(1),
+        candidate_id=cand.group(1),
+        trial_id=trial.group(1),
+        switch_note_hash=note.group(1) if note else None,
+    )
+
+
+def line_nonce_from_left(left: bytes) -> ProbeNonce | None:
+    """Extract nonce fields from the checksummed part of a probe line."""
+    text = left.decode("ascii", "ignore")
+    run = re.search(r"\bRUN=([^ \r\n]+)", text)
+    cand = re.search(r"\bCAND=([^ \r\n]+)", text)
+    trial = re.search(r"\bTRIAL=([^ \r\n]+)", text)
+    note = re.search(r"\bNOTE=([^ \r\n]+)", text)
+    if not (run and cand and trial):
+        return None
+    return ProbeNonce(
+        run_id=run.group(1),
+        candidate_id=cand.group(1),
+        trial_id=trial.group(1),
+        switch_note_hash=note.group(1) if note else None,
+    )
+
+
+def nonce_matches(observed: ProbeNonce | None, expected: ProbeNonce | None) -> bool:
+    """Return True if an observed line nonce belongs to the expected trial."""
+    if expected is None:
+        return observed is None
+    if observed is None:
+        return False
+    return (
+        observed.run_id == expected.run_id
+        and observed.candidate_id == expected.candidate_id
+        and observed.trial_id == expected.trial_id
+        and observed.switch_note_hash == expected.switch_note_hash
+    )
+
+
+def parse_probe_lines(data: bytes) -> list[ParsedProbeLine]:
+    """Return structurally valid checksummed probe lines found in bytes."""
+    valid: list[ParsedProbeLine] = []
     for raw_line in data.splitlines():
         if not raw_line.startswith(b"LINE ") or b" HASH=" not in raw_line:
             continue
@@ -688,8 +932,20 @@ def parse_valid_probe_lines(data: bytes) -> dict[int, int]:
         except (ValueError, IndexError):
             continue
         if fnv1a32(left) == reported_hash:
-            valid[line_number] = reported_hash
+            valid.append(
+                ParsedProbeLine(
+                    line_number=line_number,
+                    checksum=reported_hash,
+                    nonce=line_nonce_from_left(left),
+                    raw_left=left,
+                )
+            )
     return valid
+
+
+def parse_valid_probe_lines(data: bytes) -> dict[int, int]:
+    """Return valid line numbers and checksums found in probe-like bytes."""
+    return {line.line_number: line.checksum for line in parse_probe_lines(data)}
 
 
 def printable_ascii_ratio(data: bytes) -> float:
@@ -709,8 +965,186 @@ def exact_byte_match_ratio(expected: bytes, received: bytes) -> float:
     return same_positions / denominator
 
 
+def high_bit_challenge_pattern() -> bytes:
+    """Return high-bit bytes that avoid XON/XOFF when masked to 7 bits."""
+    return bytes(
+        byte
+        for byte in range(0x80, 0x100)
+        if (byte & 0x7F) not in {0x11, 0x13}
+    )
+
+
+def eight_bit_header(payload_bytes: int, nonce: ProbeNonce | None) -> bytes:
+    """Return the ASCII header for an eight-bit challenge payload."""
+    return (
+        f"<<<SERIAL_PROBE_8BIT_BEGIN VERSION=1 TARGET_BYTES={payload_bytes:08d}"
+        f"{nonce_field_text(nonce)}>>>\r\n"
+    ).encode("ascii")
+
+
+def eight_bit_footer(
+    high_bit_count: int,
+    high_bit_hash: int,
+    nonce: ProbeNonce | None,
+) -> bytes:
+    """Return the ASCII footer for an eight-bit challenge payload."""
+    return (
+        f"\r\n<<<SERIAL_PROBE_8BIT_END HIGH_BYTES={high_bit_count:06d} "
+        f"HASH={high_bit_hash:08X}{nonce_field_text(nonce)}>>>\r\n"
+    ).encode("ascii")
+
+
+def minimum_eight_bit_payload_size(nonce: ProbeNonce | None = None) -> int:
+    """Return the smallest useful eight-bit challenge payload size."""
+    size_nonce = representative_nonce() if nonce is None else nonce
+    return len(eight_bit_header(0, size_nonce)) + len(eight_bit_footer(1, 0, size_nonce)) + 1
+
+
+def generate_eight_bit_payload(
+    payload_bytes: int,
+    nonce: ProbeNonce | None = None,
+) -> ProbePayload:
+    """Generate an eight-bit challenge payload with nonce-bearing ASCII metadata."""
+    min_size = minimum_eight_bit_payload_size(nonce)
+    if payload_bytes < min_size:
+        raise ValueError(f"eight-bit payload must be at least {min_size} bytes")
+
+    header = eight_bit_header(payload_bytes, nonce)
+    footer_len = len(eight_bit_footer(0, 0, nonce))
+    high_len = payload_bytes - len(header) - footer_len
+    if high_len <= 0:
+        raise ValueError(f"eight-bit payload must be at least {min_size} bytes")
+    pattern = high_bit_challenge_pattern()
+    high_block = (pattern * ((high_len // len(pattern)) + 1))[:high_len]
+    high_hash = fnv1a32(high_block)
+    footer = eight_bit_footer(len(high_block), high_hash, nonce)
+    payload = header + high_block + footer
+    if len(payload) != payload_bytes:
+        raise AssertionError(
+            f"eight-bit payload produced {len(payload)} bytes, expected {payload_bytes}"
+        )
+    return ProbePayload(
+        data=payload,
+        line_count=0,
+        byte_count=len(payload),
+        body_hash=f"{high_hash:08X}",
+        payload_mode=PAYLOAD_MODE_EIGHT_BIT,
+        nonce=nonce,
+        high_bit_block=high_block,
+    )
+
+
+def generate_probe_payload(
+    payload_bytes: int,
+    mode: str = PAYLOAD_MODE_ASCII,
+    nonce: ProbeNonce | None = None,
+) -> ProbePayload:
+    """Generate one payload for the requested probe mode."""
+    if mode == PAYLOAD_MODE_EIGHT_BIT:
+        return generate_eight_bit_payload(payload_bytes, nonce)
+    if mode == PAYLOAD_MODE_ASCII:
+        return generate_payload(payload_bytes, nonce)
+    if mode == PAYLOAD_MODE_PHASE0:
+        return generate_phase0_payload(payload_bytes, nonce)
+    raise ValueError(f"unknown payload mode {mode!r}")
+
+
+def eight_bit_payload_slices(expected: bytes) -> tuple[int, int] | None:
+    """Return the high-bit block slice boundaries for an expected challenge."""
+    if b"<<<SERIAL_PROBE_8BIT_BEGIN" not in expected:
+        return None
+    header_end = expected.find(b"\r\n")
+    footer_start = expected.rfind(b"\r\n<<<SERIAL_PROBE_8BIT_END")
+    if header_end < 0 or footer_start < 0 or footer_start <= header_end:
+        return None
+    return header_end + 2, footer_start
+
+
+def score_eight_bit_received(expected: bytes, received: bytes) -> ScoreResult:
+    """Score a raw eight-bit challenge payload."""
+    expected_len = len(expected)
+    received_len = len(received)
+    missing = max(expected_len - received_len, 0)
+    extra = max(received_len - expected_len, 0)
+    length_ratio = min(expected_len, received_len) / max(expected_len, received_len, 1)
+    exact_ratio = exact_byte_match_ratio(expected, received)
+    ascii_ratio = printable_ascii_ratio(received)
+    start_marker = b"<<<SERIAL_PROBE_8BIT_BEGIN" in received
+    end_marker = b"<<<SERIAL_PROBE_8BIT_END" in received
+    expected_nonce = expected_nonce_from_payload(expected)
+    wrong_nonce = False
+    if expected_nonce is not None:
+        received_nonce = expected_nonce_from_payload(received)
+        wrong_nonce = received_nonce is not None and not nonce_matches(received_nonce, expected_nonce)
+
+    high_sent = 0
+    high_received = 0
+    high_exact_ratio = 0.0
+    high_stripped = 0
+    block_slice = eight_bit_payload_slices(expected)
+    if block_slice is not None:
+        start, stop = block_slice
+        expected_high = expected[start:stop]
+        received_high = received[start : min(start + len(expected_high), len(received))]
+        high_sent = sum(1 for byte in expected_high if byte >= 0x80)
+        high_received = sum(1 for byte in received_high if byte >= 0x80)
+        high_matches = sum(
+            1
+            for expected_byte, received_byte in zip(expected_high, received_high)
+            if expected_byte == received_byte
+        )
+        high_exact_ratio = high_matches / max(len(expected_high), 1)
+        high_stripped = sum(
+            1
+            for expected_byte, received_byte in zip(expected_high, received_high)
+            if expected_byte >= 0x80 and received_byte == (expected_byte & 0x7F)
+        )
+
+    metrics = ScoreMetrics(
+        exact_byte_match_ratio=exact_ratio,
+        line_integrity_ratio=1.0 if start_marker and end_marker else 0.0,
+        missing_bytes=missing,
+        extra_bytes=extra,
+        printable_ascii_ratio=ascii_ratio,
+        length_ratio=length_ratio,
+        start_marker_present=start_marker,
+        end_marker_present=end_marker,
+        high_bit_bytes_sent=high_sent,
+        high_bit_bytes_received=high_received,
+        high_bit_exact_ratio=high_exact_ratio,
+        high_bit_stripped_count=high_stripped,
+    )
+
+    if not received:
+        return ScoreResult(0.0, metrics, "no-data", ("NO DATA",))
+    if wrong_nonce:
+        return ScoreResult(0.0, metrics, "wrong-nonce", ("STALE / WRONG NONCE",))
+    if expected == received and high_sent > 0 and high_exact_ratio >= 1.0:
+        return ScoreResult(100.0, metrics, "eight-bit-clean", ("8-BIT CLEAN",))
+    if high_sent > 0 and high_stripped >= max(1, int(high_sent * 0.8)):
+        confidence = 35.0 * length_ratio + 25.0 * float(start_marker and end_marker)
+        return ScoreResult(
+            max(0.0, min(60.0, confidence)),
+            metrics,
+            "eight-bit-masked",
+            ("ASCII BYTE TRANSFER", "8-BIT NOT CLEAN"),
+        )
+    confidence = (
+        40.0 * exact_ratio
+        + 25.0 * high_exact_ratio
+        + 20.0 * length_ratio
+        + 15.0 * ((int(start_marker) + int(end_marker)) / 2)
+    )
+    classification = "eight-bit-not-clean" if high_exact_ratio < 1.0 else "partial"
+    evidence = ("8-BIT NOT CLEAN",) if classification == "eight-bit-not-clean" else ()
+    return ScoreResult(max(0.0, min(99.0, confidence)), metrics, classification, evidence)
+
+
 def score_received(expected: bytes, received: bytes) -> ScoreResult:
     """Score received bytes against the expected probe payload."""
+    if b"<<<SERIAL_PROBE_8BIT_BEGIN" in expected:
+        return score_eight_bit_received(expected, received)
+
     expected_len = len(expected)
     received_len = len(received)
     missing = max(expected_len - received_len, 0)
@@ -718,7 +1152,20 @@ def score_received(expected: bytes, received: bytes) -> ScoreResult:
     length_ratio = min(expected_len, received_len) / max(expected_len, received_len, 1)
     exact_ratio = exact_byte_match_ratio(expected, received)
     expected_lines = parse_valid_probe_lines(expected)
-    received_lines = parse_valid_probe_lines(received)
+    expected_nonce = expected_nonce_from_payload(expected)
+    received_parsed_lines = parse_probe_lines(received)
+    received_lines = {
+        line.line_number: line.checksum for line in received_parsed_lines
+    }
+    current_nonce_lines = sum(
+        1 for line in received_parsed_lines if nonce_matches(line.nonce, expected_nonce)
+    )
+    wrong_nonce_lines = sum(
+        1
+        for line in received_parsed_lines
+        if expected_nonce is not None
+        and not nonce_matches(line.nonce, expected_nonce)
+    )
     matching_lines = sum(
         1
         for line_number, checksum in received_lines.items()
@@ -732,6 +1179,12 @@ def score_received(expected: bytes, received: bytes) -> ScoreResult:
 
     if not received:
         confidence = 0.0
+        classification = "no-data"
+        evidence = ("NO DATA",)
+    elif wrong_nonce_lines > 0 and current_nonce_lines == 0:
+        confidence = 0.0
+        classification = "wrong-nonce"
+        evidence = ("STALE / WRONG NONCE",)
     else:
         confidence = (
             55.0 * exact_ratio
@@ -740,14 +1193,23 @@ def score_received(expected: bytes, received: bytes) -> ScoreResult:
             + 5.0 * length_ratio
             + 5.0 * marker_ratio
         )
+        classification = "ascii-transfer" if line_ratio > 0.0 else "partial"
+        evidence = ("ASCII BYTE TRANSFER",) if line_ratio > 0.0 else ()
+        if wrong_nonce_lines > 0:
+            confidence = min(confidence, 49.0)
+            classification = "mixed-nonce"
+            evidence = ("STALE / WRONG NONCE",)
         if (
             expected_len == received_len
             and exact_ratio == 1.0
             and line_ratio == 1.0
             and start_marker
             and end_marker
+            and wrong_nonce_lines == 0
         ):
             confidence = 100.0
+            classification = "exact"
+            evidence = ("BAUD ALIVE", "ASCII BYTE TRANSFER")
 
     metrics = ScoreMetrics(
         exact_byte_match_ratio=exact_ratio,
@@ -758,8 +1220,16 @@ def score_received(expected: bytes, received: bytes) -> ScoreResult:
         length_ratio=length_ratio,
         start_marker_present=start_marker,
         end_marker_present=end_marker,
+        valid_probe_line_count=len(received_parsed_lines),
+        current_nonce_line_count=current_nonce_lines,
+        wrong_nonce_line_count=wrong_nonce_lines,
     )
-    return ScoreResult(score=max(0.0, min(100.0, confidence)), metrics=metrics)
+    return ScoreResult(
+        score=max(0.0, min(100.0, confidence)),
+        metrics=metrics,
+        classification=classification,
+        evidence=evidence,
+    )
 
 
 def available_bauds(min_baud: int, max_baud: int) -> list[int]:
@@ -868,6 +1338,16 @@ def estimated_frame_bits(settings: SerialSettings | DualSerialSettings) -> float
     """Estimate serial frame width in bits per transmitted byte."""
     parity_bits = 0 if settings.parity == "none" else 1
     return 1 + settings.data_bits + parity_bits + settings.stop_bits
+
+
+def estimated_buffer_drain_seconds(
+    settings: SerialSettings | DualSerialSettings,
+    buffer_bytes: int = BUFFER_PURGE_CAPACITY_BYTES,
+    safety_factor: float = 1.2,
+) -> float:
+    """Estimate full FIFO drain time for a byte count at the selected frame."""
+    seconds = (buffer_bytes * estimated_frame_bits(settings)) / max(settings.baud, 1)
+    return seconds * max(safety_factor, 0.0)
 
 
 def write_chunk_size(settings: SerialSettings | DualSerialSettings) -> int:
@@ -1068,8 +1548,10 @@ def byte_size_label(byte_count: int) -> str:
 
 def result_indicator(score: float, status: str, error: str | None = None) -> str:
     """Return a short human-readable success indicator for console output."""
-    if status == "stale-output":
+    if status in STALE_STATUSES:
         return "STALE"
+    if status == "eight-bit-not-clean":
+        return "FAIL"
     if status == "partial-write":
         return "FAIL"
     if error or status == "error":
@@ -1085,7 +1567,10 @@ def result_indicator(score: float, status: str, error: str | None = None) -> str
     return "FAIL"
 
 
-def estimated_transmit_seconds(settings: SerialSettings, byte_count: int) -> float:
+def estimated_transmit_seconds(
+    settings: SerialSettings | DualSerialSettings,
+    byte_count: int,
+) -> float:
     """Estimate physical transmit time for byte_count at candidate settings."""
     return (byte_count * estimated_frame_bits(settings)) / max(settings.baud, 1)
 
@@ -1363,6 +1848,26 @@ def drain_output_until_quiet(
         return DrainResult(bytes_drained, elapsed, False, "error", str(exc))
 
 
+def payload_for_trial(
+    template: ProbePayload,
+    settings: SerialSettings | DualSerialSettings,
+    candidate_index: int,
+    burst_index: int,
+    run_id: str,
+    switch_hash: str | None,
+) -> ProbePayload:
+    """Return a nonce-bearing payload for the current candidate/trial."""
+    if template.nonce is not None:
+        return template
+    nonce = ProbeNonce(
+        run_id=sanitize_nonce_value(run_id or make_run_id()),
+        candidate_id=candidate_nonce_id(settings, candidate_index),
+        trial_id=trial_nonce_id(burst_index),
+        switch_note_hash=switch_hash,
+    )
+    return generate_probe_payload(template.byte_count, template.payload_mode, nonce)
+
+
 def execute_burst(
     in_serial: Any,
     out_serial: Any,
@@ -1382,9 +1887,19 @@ def execute_burst(
     max_drain_bytes: int,
     logger: logging.Logger,
     progress: ProgressCallback | None,
+    run_id: str = "",
+    switch_hash: str | None = None,
 ) -> TrialResult:
     """Send one probe burst and score the received bytes."""
     started = time.monotonic()
+    payload = payload_for_trial(
+        template=payload,
+        settings=settings,
+        candidate_index=candidate_index,
+        burst_index=burst_index,
+        run_id=run_id,
+        switch_hash=switch_hash,
+    )
     expected = payload.data
     received = bytearray()
     reader_errors: list[str] = []
@@ -1461,6 +1976,10 @@ def execute_burst(
                 ),
                 received_preview_ascii="",
                 received_preview_hex="",
+                score_classification=empty_score.classification,
+                evidence=empty_score.evidence,
+                nonce_summary=payload.nonce.compact() if payload.nonce else "",
+                payload_mode=payload.payload_mode,
             )
 
     def reader() -> None:
@@ -1572,8 +2091,12 @@ def execute_burst(
     error = write_error or (reader_errors[0] if reader_errors else None)
     if error:
         status = "error"
+    elif score.classification in {"wrong-nonce", "mixed-nonce"}:
+        status = score.classification
     elif not received_bytes:
         status = "no-data"
+    elif score.classification in {"eight-bit-masked", "eight-bit-not-clean"}:
+        status = "eight-bit-not-clean"
     elif score.score >= 99.0:
         status = "exact"
     elif score.score >= 90.0:
@@ -1614,6 +2137,10 @@ def execute_burst(
         ),
         received_preview_ascii=preview_ascii(received_bytes),
         received_preview_hex=preview_hex(received_bytes),
+        score_classification=score.classification,
+        evidence=score.evidence,
+        nonce_summary=payload.nonce.compact() if payload.nonce else "",
+        payload_mode=payload.payload_mode,
     )
 
 
@@ -1646,7 +2173,32 @@ def aggregate_metrics(trials: Sequence[TrialResult]) -> ScoreMetrics:
         length_ratio=statistics.fmean(trial.metrics.length_ratio for trial in trials),
         start_marker_present=all(trial.metrics.start_marker_present for trial in trials),
         end_marker_present=all(trial.metrics.end_marker_present for trial in trials),
+        valid_probe_line_count=sum(trial.metrics.valid_probe_line_count for trial in trials),
+        current_nonce_line_count=sum(
+            trial.metrics.current_nonce_line_count for trial in trials
+        ),
+        wrong_nonce_line_count=sum(trial.metrics.wrong_nonce_line_count for trial in trials),
+        high_bit_bytes_sent=sum(trial.metrics.high_bit_bytes_sent for trial in trials),
+        high_bit_bytes_received=sum(
+            trial.metrics.high_bit_bytes_received for trial in trials
+        ),
+        high_bit_exact_ratio=statistics.fmean(
+            trial.metrics.high_bit_exact_ratio for trial in trials
+        ),
+        high_bit_stripped_count=sum(
+            trial.metrics.high_bit_stripped_count for trial in trials
+        ),
     )
+
+
+def combined_evidence(trials: Sequence[TrialResult]) -> tuple[str, ...]:
+    """Return ordered evidence labels from multiple trials."""
+    labels: list[str] = []
+    for trial in trials:
+        for label in trial.evidence:
+            if label not in labels:
+                labels.append(label)
+    return tuple(labels)
 
 
 def aggregate_candidate_result(
@@ -1674,6 +2226,7 @@ def aggregate_candidate_result(
             timing=timing_with_other(elapsed_sec, elapsed_sec, 0.0, 0.0, 0.0),
             metrics=aggregate_metrics([]),
             trials=[],
+            evidence=(),
         )
 
     scores = [trial.score for trial in trials]
@@ -1681,15 +2234,17 @@ def aggregate_candidate_result(
     high_quality_trials = sum(1 for trial in trials if trial.score >= 98.0)
     repeatability = high_quality_trials / max(len(trials), 1)
     errors = [trial.error for trial in trials if trial.error]
-    stale_trials = [trial for trial in trials if trial.status == "stale-output"]
+    stale_trials = [trial for trial in trials if trial.status in STALE_STATUSES]
     metrics = aggregate_metrics(trials)
 
     if stale_trials:
-        status = "stale-output"
+        status = stale_trials[0].status
     elif errors:
         status = "error"
     elif not trials or sum(trial.bytes_received for trial in trials) == 0:
         status = "no-data"
+    elif any(trial.status == "eight-bit-not-clean" for trial in trials):
+        status = "eight-bit-not-clean"
     elif score >= 99.0 and repeatability == 1.0:
         status = "exact"
     elif score >= 90.0:
@@ -1722,6 +2277,7 @@ def aggregate_candidate_result(
         timing=timing,
         metrics=metrics,
         trials=trials,
+        evidence=combined_evidence(trials),
     )
 
 
@@ -1797,6 +2353,8 @@ def run_candidate(
                         max_drain_bytes=options.max_drain_bytes,
                         logger=logger,
                         progress=progress,
+                        run_id=options.run_id,
+                        switch_hash=switch_note_hash(options.switch_note),
                     )
                     trials.append(trial)
                     logger.debug(
@@ -1966,6 +2524,8 @@ def run_dual_candidate(
                         max_drain_bytes=options.max_drain_bytes,
                         logger=logger,
                         progress=progress,
+                        run_id=options.run_id,
+                        switch_hash=switch_note_hash(options.switch_note),
                     )
                     trials.append(trial)
                     logger.debug(
@@ -2182,6 +2742,70 @@ def scan_type_label(scan_mode: str) -> str:
     return "QUICK" if scan_mode == "quick" else "FULL"
 
 
+def frame_label(settings: SerialSettings | DualSerialSettings) -> str:
+    """Return data/parity/stop label for a result frame."""
+    return f"{settings.data_bits}{settings.parity_code()}{settings.stop_bits}"
+
+
+def clean_ascii_transfer(result: CandidateResult) -> bool:
+    """Return True when a result proves byte transfer but not necessarily frame."""
+    if result.error or result.status in STALE_STATUSES:
+        return False
+    if result.status in {"error", "no-data", "partial-write", "weak", "eight-bit-not-clean"}:
+        return False
+    return result.score >= 90.0 and result.metrics.line_integrity_ratio > 0.0
+
+
+def frame_ambiguity_lines(results: Sequence[CandidateResult]) -> list[str]:
+    """Return report lines explaining byte-level frame ambiguity."""
+    clean = [result for result in results if clean_ascii_transfer(result)]
+    if not clean:
+        return []
+    best_score = max(result.score for result in clean)
+    near_best = [
+        result for result in clean if (best_score - result.score) <= TIE_SCORE_TOLERANCE
+    ]
+    frames = sorted({frame_label(result.settings) for result in near_best})
+    flows = sorted({result.settings.flow_control for result in near_best})
+    stop_bits = sorted({result.settings.stop_bits for result in near_best})
+    parities = sorted({result.settings.parity for result in near_best})
+    lines: list[str] = []
+    if len(frames) > 1:
+        lines.append("EVIDENCE:        BAUD ALIVE; ASCII BYTE TRANSFER.")
+        lines.append(
+            "FRAME:           AMBIGUOUS AMONG "
+            + ", ".join(frames[:8])
+            + (" ..." if len(frames) > 8 else "")
+        )
+    if len(stop_bits) > 1:
+        lines.append("STOP BITS:       NOT BYTE-PROVABLE IN THIS TRANSFER.")
+    if len(parities) > 1:
+        lines.append("PARITY:          NOT DISTINGUISHED BY THIS PAYLOAD.")
+    if len(flows) > 1 or any(flow != "none" for flow in flows):
+        lines.append("FLOW:            NORMAL TRANSFER ONLY; FLOW NOT OBSERVED.")
+    return lines
+
+
+def stale_nonce_seen(results: Sequence[CandidateResult]) -> bool:
+    """Return True if wrong-run or stale candidate data was seen."""
+    return any(
+        result.status in STALE_STATUSES or result.metrics.wrong_nonce_line_count > 0
+        for result in results
+    )
+
+
+def best_drain_estimate_lines(result: CandidateResult | None) -> list[str]:
+    """Return full-buffer drain estimate lines for the best setting."""
+    if result is None:
+        return []
+    base = estimated_buffer_drain_seconds(result.settings, safety_factor=1.0)
+    safe = estimated_buffer_drain_seconds(result.settings)
+    return [
+        f"16K DRAIN EST.:  {format_duration(base)} RAW, {format_duration(safe)} WITH SAFETY.",
+        "PURGE NOTE:      SHORT QUIET DRAINS DO NOT PROVE A 16K BUFFER IS EMPTY.",
+    ]
+
+
 def text_report_summary_lines(
     results: Sequence[CandidateResult],
     metadata: dict[str, Any],
@@ -2201,6 +2825,10 @@ def text_report_summary_lines(
             f"BEST SCORE:      {best.score:.2f} "
             f"SENT/READ={best.bytes_sent}/{best.bytes_received}"
         )
+        lines.extend(best_drain_estimate_lines(best))
+    lines.extend(frame_ambiguity_lines(results))
+    if stale_nonce_seen(results):
+        lines.append("STALE DATA:      WRONG-NONCE OR OLD PROBE DATA WAS DETECTED.")
     if len(tied) > 1:
         lines.append(
             f"AMBIGUOUS:       {len(tied)} SETTINGS TIED WITHIN "
@@ -2208,7 +2836,7 @@ def text_report_summary_lines(
         )
         lines.append("ACTION:          DO NOT TREAT ROW 1 AS UNIQUE.")
     elif is_recommendable_result(best):
-        lines.append("ACTION:          RECORD THIS AS THE LIKELY SWITCH RESULT.")
+        lines.append("ACTION:          BAUD/ASCII TRANSFER LOOKS GOOD; REVIEW AMBIGUITIES.")
     elif has_any_signal(results):
         lines.append("ACTION:          PARTIAL RESULT ONLY; REPEAT OR CHECK WIRING.")
     else:
@@ -2244,8 +2872,9 @@ def write_text_report(
         border_line(REPORT_WIDTH),
         f"APPENDED:        {created}",
         f"STARTED UTC:     {metadata.get('started_at', '')}",
+        f"RUN ID:          {metadata.get('run_id', '')}",
         f"COM PATH:        {metadata.get('in_port')} -> BUFFER -> {metadata.get('out_port')}",
-        f"SWITCH NOTE:     {switch_note if switch_note else '(NOT ENTERED)'}",
+        f"DIP NOTE:        {switch_note if switch_note else '(NOT ENTERED)'}",
         f"SCAN TYPE:       {scan_type_label(str(metadata.get('scan_mode', '')))}",
         f"BAUD RANGE:      {options.get('min_baud')}..{options.get('max_baud')}",
         f"TEST BYTES:      {options.get('payload_bytes')} X {options.get('bursts')}",
@@ -2318,10 +2947,12 @@ def write_text_report(
         [
             "",
             "INTERPRETATION NOTES:",
-            "  BAUD RATE IS USUALLY THE MOST RELIABLE FIELD FROM THIS TEST.",
-            "  7/8 DATA BITS, PARITY, STOP BITS, AND FLOW CONTROL CAN TIE IF THE BUFFER",
-            "  OR TEST DATA DOES NOT FORCE THOSE FEATURES TO MATTER.",
-            "  TRUST FLOW CONTROL ONLY AFTER FLOW VALIDATION OR A STRESS/MEMORY TEST.",
+            "  BAUD RESULT IS THE STRONGEST EVIDENCE IN THIS DISCOVERY TEST.",
+            "  ASCII-ONLY TRANSFER DOES NOT PROVE 8-BIT CLEANLINESS.",
+            "  STOP-BIT COUNT CAN BE BYTE-INVISIBLE AND MAY REMAIN AMBIGUOUS.",
+            "  PARITY IS NOT PROVEN UNLESS IT CREATES AN OBSERVABLE BYTE DIFFERENCE.",
+            "  FLOW CONTROL REQUIRES HOLD/RELEASE OR BACKPRESSURE VALIDATION.",
+            "  WRONG-NONCE DATA MEANS STALE BUFFER OUTPUT OR A WRONG CANDIDATE/TRIAL.",
             border_line(REPORT_WIDTH),
         ]
     )
@@ -2414,7 +3045,16 @@ def is_recommendable_result(result: CandidateResult | None) -> bool:
     """Return True when a result is strong enough to call a recommendation."""
     if result is None or result.error:
         return False
-    if result.status in {"error", "no-data", "stale-output", "partial-write", "weak"}:
+    if result.status in {
+        "error",
+        "no-data",
+        "stale-output",
+        "wrong-nonce",
+        "mixed-nonce",
+        "partial-write",
+        "weak",
+        "eight-bit-not-clean",
+    }:
         return False
     return result.score >= RECOMMENDATION_MIN_SCORE
 
@@ -2451,7 +3091,8 @@ def has_any_signal(results: Sequence[CandidateResult]) -> bool:
     """Return True when any result had enough data quality to be useful."""
     return any(
         not result.error
-        and result.status not in {"error", "no-data", "stale-output", "partial-write"}
+        and result.status
+        not in {"error", "no-data", "stale-output", "wrong-nonce", "mixed-nonce", "partial-write"}
         and result.score >= 50.0
         for result in results
     )
@@ -2478,14 +3119,16 @@ def confidence_summary(result: CandidateResult | None, tied_count: int = 0) -> s
         return "NO SETTINGS TESTED."
     if result.status == "stale-output":
         return "NO MATCH. OUTPUT WAS NOT QUIET BEFORE TEST."
+    if result.status in {"wrong-nonce", "mixed-nonce"}:
+        return "NO MATCH. STALE OR WRONG-NONCE DATA WAS RECEIVED."
     if result.error:
         return "NO MATCH. BEST ROW ENDED WITH ERROR."
     if tied_count > 1:
         return "MULTIPLE TOP SETTINGS. REVIEW BEFORE SETTING SWITCHES."
     if is_recommendable_result(result) and result.score >= 99.0 and result.repeatability >= 1.0:
-        return "LIKELY CORRECT."
+        return "CLEAN BYTE TRANSFER OBSERVED."
     if is_recommendable_result(result):
-        return "STRONG MATCH. VERIFY BEFORE SETTING SWITCHES."
+        return "STRONG BYTE TRANSFER. REVIEW AMBIGUITIES."
     if result.score >= 50.0:
         return "PARTIAL MATCH ONLY. NOT RELIABLE."
     return "NO CONFIDENT MATCH. CHECK CABLES, PORTS, FLOW CONTROL."
@@ -2501,6 +3144,9 @@ def print_result_details(result: CandidateResult) -> None:
     )
     print(f"    STOP BITS:          {result.settings.stop_bits}")
     print(f"    FLOW CONTROL:       {flow_control_name(result.settings.flow_control)}")
+    print("    FRAME NOTE:         DATA/PARITY/STOP MAY BE BYTE-AMBIGUOUS.")
+    if result.settings.flow_control != "none":
+        print("    FLOW NOTE:          CLEAN TRANSFER IS NOT HANDSHAKE PROOF.")
     print_wrapped_value("    SETTING:            ", result.settings.label())
     print(
         f"    RESULT:             "
@@ -2518,6 +3164,15 @@ def print_result_details(result: CandidateResult) -> None:
         print("    NOTE:               OUTPUT NEVER WENT QUIET.")
         if result.error:
             print_wrapped_value("    DETAIL:             ", result.error)
+    elif result.status in {"wrong-nonce", "mixed-nonce"}:
+        print("    NOTE:               STALE OR WRONG-NONCE PROBE DATA WAS SEEN.")
+        print(
+            "    NONCE LINES:        "
+            f"CURRENT={result.metrics.current_nonce_line_count} "
+            f"WRONG={result.metrics.wrong_nonce_line_count}"
+        )
+    elif result.status == "eight-bit-not-clean":
+        print("    NOTE:               ASCII MAY PASS, BUT 8-BIT PATH IS NOT CLEAN.")
     elif result.error:
         print_wrapped_value("    ERROR:              ", result.error)
     elif result.metrics.extra_bytes > result.bytes_sent:
@@ -2679,16 +3334,20 @@ def print_scan_summary(
             f"{TIE_SCORE_TOLERANCE:.1f} SCORE POINTS."
         )
         print("    DO NOT TREAT ROW 1 AS THE ONLY POSSIBLE SWITCH SETTING.")
-        print("    USE A LARGER TEST MESSAGE OR REPEAT THESE SETTINGS.")
+        print("    BYTE TRANSFER DOES NOT DISTINGUISH THESE FRAME SETTINGS.")
         print()
         print_tied_results(ranked_top_results(tied, top))
         print(border_line(REPORT_WIDTH))
         return
 
     if is_recommendable_result(best):
-        print(bordered_text("RECOMMENDED SWITCH SETTING", REPORT_WIDTH))
+        print(bordered_text("BEST OBSERVED TRANSFER", REPORT_WIDTH))
         print(border_line(REPORT_WIDTH))
         print_result_details(best)
+        for line in frame_ambiguity_lines(results):
+            print_wrapped_value("    NOTE:               ", line)
+        for line in best_drain_estimate_lines(best):
+            print_wrapped_value("    NOTE:               ", line)
         if early_stopped:
             if early_stop_reason == "operator-ended-after-top-match":
                 print("    NOTE:               OPERATOR ENDED AFTER THIS TOP MATCH.")
@@ -2760,6 +3419,13 @@ def default_scan_options() -> ScanOptions:
         baud_focus_min_strong_results=BAUD_FOCUS_MIN_STRONG_RESULTS,
         baud_focus_min_samples=BAUD_FOCUS_MIN_SAMPLES,
     )
+
+
+def ensure_run_id(options: ScanOptions, prefix: str = "R") -> ScanOptions:
+    """Return options with a run id assigned for nonce-bearing payloads."""
+    if options.run_id:
+        return options
+    return dataclasses.replace(options, run_id=make_run_id(prefix))
 
 
 def validate_options(options: ScanOptions) -> None:
@@ -2838,11 +3504,26 @@ def phase0_baseline_settings(baud: int) -> SerialSettings:
     )
 
 
-def phase0_minimum_payload_size() -> int:
+def phase0_start_marker(nonce: ProbeNonce | None) -> bytes:
+    """Return the compact Phase 0 begin marker."""
+    return f"<<<SERIAL_PROBE_BEGIN PHASE0{nonce_field_text(nonce)}>>>\r\n".encode(
+        "ascii"
+    )
+
+
+def phase0_end_marker(nonce: ProbeNonce | None) -> bytes:
+    """Return the compact Phase 0 end marker."""
+    return f"<<<SERIAL_PROBE_END PHASE0{nonce_field_text(nonce)}>>>\r\n".encode(
+        "ascii"
+    )
+
+
+def phase0_minimum_payload_size(nonce: ProbeNonce | None = None) -> int:
     """Return the smallest structural payload usable by Phase 0."""
-    start = b"<<<SERIAL_PROBE_BEGIN PHASE0>>>\r\n"
-    end = b"<<<SERIAL_PROBE_END PHASE0>>>\r\n"
-    return len(start) + len(make_probe_line(1, "LIVE", "")) + len(end)
+    size_nonce = representative_nonce() if nonce is None else nonce
+    start = phase0_start_marker(size_nonce)
+    end = phase0_end_marker(size_nonce)
+    return len(start) + len(make_probe_line(1, "LIVE", "", size_nonce)) + len(end)
 
 
 def phase0_payload_bytes() -> int:
@@ -2850,17 +3531,20 @@ def phase0_payload_bytes() -> int:
     return max(PHASE0_PAYLOAD_BYTES, phase0_minimum_payload_size())
 
 
-def generate_phase0_payload(payload_bytes: int | None = None) -> ProbePayload:
+def generate_phase0_payload(
+    payload_bytes: int | None = None,
+    nonce: ProbeNonce | None = None,
+) -> ProbePayload:
     """Generate a compact structural probe payload for baud liveness."""
     byte_count = phase0_payload_bytes() if payload_bytes is None else payload_bytes
-    byte_count = max(byte_count, phase0_minimum_payload_size())
-    start = b"<<<SERIAL_PROBE_BEGIN PHASE0>>>\r\n"
-    end = b"<<<SERIAL_PROBE_END PHASE0>>>\r\n"
-    empty_line = make_probe_line(1, "LIVE", "")
+    byte_count = max(byte_count, phase0_minimum_payload_size(nonce))
+    start = phase0_start_marker(nonce)
+    end = phase0_end_marker(nonce)
+    empty_line = make_probe_line(1, "LIVE", "", nonce)
     data_len = byte_count - len(start) - len(empty_line) - len(end)
     if data_len < 0:
         raise ValueError("PHASE 0 PAYLOAD IS TOO SMALL")
-    line = make_probe_line(1, "LIVE", repeated_ascii_pattern(1, data_len))
+    line = make_probe_line(1, "LIVE", repeated_ascii_pattern(1, data_len), nonce)
     body = start + line
     payload = body + end
     if len(payload) != byte_count:
@@ -2873,6 +3557,8 @@ def generate_phase0_payload(payload_bytes: int | None = None) -> ProbePayload:
         line_count=1,
         byte_count=len(payload),
         body_hash=f"{body_hash:08X}",
+        payload_mode=PAYLOAD_MODE_PHASE0,
+        nonce=nonce,
     )
 
 
@@ -2925,6 +3611,10 @@ def buffer_purge_banner(reason: str, settings_count: int) -> None:
     print(
         "  METHOD:               READ BUFFER OUTPUT UNTIL QUIET "
         "BEFORE SENDING NEW TEST DATA."
+    )
+    print(
+        "  NOTE:                 SHORT QUIET TIME DOES NOT PROVE "
+        "A FULL 16K BUFFER IS EMPTY."
     )
     print(border_line(REPORT_WIDTH))
 
@@ -3004,6 +3694,89 @@ def purge_buffer_output(
     return result
 
 
+def run_known_baud_purge(
+    serial_module: Any,
+    options: ScanOptions,
+    logger: logging.Logger,
+    settings: SerialSettings,
+    max_seconds: float,
+    reason: str,
+) -> DrainResult:
+    """Run an explicit known-baud purge using the operator-selected frame."""
+    base_estimate = estimated_buffer_drain_seconds(settings, safety_factor=1.0)
+    safe_estimate = estimated_buffer_drain_seconds(settings)
+    print()
+    print_report_title("KNOWN-BAUD PURGE")
+    print_wrapped_value("  REASON:              ", reason)
+    print(f"  OUTPUT PORT:          {options.out_port}")
+    print(f"  SETTING:              {settings.label()}")
+    print(f"  16K DRAIN ESTIMATE:   {format_duration(base_estimate)} RAW")
+    print(f"  WITH SAFETY FACTOR:   {format_duration(safe_estimate)}")
+    print(f"  THIS RUN LIMIT:       {format_duration(max_seconds)}")
+    print("  NOTE:                 ONLY THIS EXPLICIT PURGE USES THE LONG LIMIT.")
+    print(border_line(REPORT_WIDTH))
+    started = time.monotonic()
+    try:
+        with open_serial_port(
+            serial_module,
+            options.out_port,
+            settings,
+            max(options.read_timeout, 1.0),
+        ) as out_serial:
+            result = drain_output_until_quiet(
+                out_serial=out_serial,
+                quiet_seconds=max(options.pre_drain_quiet, BUFFER_PURGE_QUIET_SECONDS),
+                max_seconds=max_seconds,
+                max_bytes=max(options.max_drain_bytes, BUFFER_PURGE_CAPACITY_BYTES * 2),
+                progress_interval=options.progress_interval,
+                progress=console_progress,
+                prefix=f"[KNOWN PURGE {settings.label()}]",
+                logger=logger,
+            )
+    except Exception as exc:
+        result = DrainResult(0, time.monotonic() - started, False, "error", str(exc))
+    print()
+    print_report_title("KNOWN-BAUD PURGE COMPLETE")
+    print(f"  BYTES DRAINED:        {result.bytes_drained}")
+    print(f"  RUN TIME:             {format_duration(result.elapsed_sec)}")
+    print(f"  STATUS:               {'QUIET' if result.quiet else result.reason.upper()}")
+    if result.error:
+        print_wrapped_value("  DETAIL:               ", result.error)
+    print(border_line(REPORT_WIDTH))
+    return result
+
+
+def run_deep_purge_menu(options: ScanOptions) -> None:
+    """Prompt for and run an explicit known-baud deep purge."""
+    settings = prompt_serial_setting(
+        SerialSettings(1200, 8, "none", 1, "none"),
+        title="KNOWN-BAUD PURGE SETTING",
+        intro="ENTER OUTPUT-SIDE SETTING TO DRAIN THE BUFFER.",
+    )
+    safe_estimate = estimated_buffer_drain_seconds(settings)
+    print()
+    print_report_title("DEEP PURGE ESTIMATE")
+    print(f"  SETTING:              {settings.label()}")
+    print(f"  FULL 16K ESTIMATE:    {format_duration(safe_estimate)} WITH SAFETY")
+    print("  ENTER A SHORTER LIMIT TO SAMPLE, OR THE FULL ESTIMATE TO WAIT IT OUT.")
+    print(border_line(REPORT_WIDTH))
+    max_seconds = prompt_float(
+        "PURGE TIME LIMIT, SECONDS",
+        min(safe_estimate, 30.0),
+        0.1,
+    )
+    logger = setup_logging(options.log_file)
+    serial_module = import_or_install_pyserial()
+    run_known_baud_purge(
+        serial_module=serial_module,
+        options=options,
+        logger=logger,
+        settings=settings,
+        max_seconds=max_seconds,
+        reason="OPERATOR REQUESTED EXPLICIT KNOWN-BAUD PURGE.",
+    )
+
+
 def phase0_extra_byte_limit(expected_byte_count: int) -> int:
     """Return the tolerated extra-byte limit for Phase 0 liveness."""
     ratio_limit = int(expected_byte_count * PHASE0_MAX_EXTRA_BYTES_RATIO)
@@ -3021,6 +3794,8 @@ def classify_phase0_liveness(
         return Phase0LivenessDecision(False, "PARTIAL WRITE")
     if result.status == "stale-output":
         return Phase0LivenessDecision(False, "OUTPUT NOT QUIET")
+    if result.status in {"wrong-nonce", "mixed-nonce"}:
+        return Phase0LivenessDecision(False, "STALE/WRONG NONCE")
     if result.status == "no-data" or result.bytes_received <= 0:
         return Phase0LivenessDecision(False, "NO DATA")
     if result.bytes_sent < expected_byte_count:
@@ -3182,8 +3957,8 @@ def next_unseen_candidate(
 
 def result_blocks_baud_focus(result: CandidateResult) -> str | None:
     """Return a reason when a result disables baud focus narrowing."""
-    if result.status == "stale-output":
-        return "STALE OUTPUT SEEN"
+    if result.status in STALE_STATUSES:
+        return "STALE OR WRONG-NONCE OUTPUT SEEN"
     if result.error or result.status in {"error", "partial-write"}:
         return "ERROR SEEN"
     return None
@@ -3206,7 +3981,8 @@ def baud_focus_stats(
         best[baud] = max(best[baud], result.score)
         if (
             not result.error
-            and result.status not in {"error", "no-data", "stale-output", "partial-write"}
+            and result.status
+            not in {"error", "no-data", "stale-output", "wrong-nonce", "mixed-nonce", "partial-write"}
             and result.score >= strong_score_threshold
         ):
             strong[baud] += 1
@@ -3275,7 +4051,7 @@ def is_exploratory_signal(result: CandidateResult) -> bool:
     """Return True when an exploratory result is useful enough for narrowing."""
     if result.error:
         return False
-    if result.status in {"error", "no-data", "stale-output", "partial-write"}:
+    if result.status in {"error", "no-data", "stale-output", "wrong-nonce", "mixed-nonce", "partial-write"}:
         return False
     return result.score >= EXPLORATORY_MIN_NARROW_SCORE
 
@@ -3307,11 +4083,11 @@ def select_exploratory_candidates(
         result.settings for result in ranked_results if is_phase2_viable_signal(result)
     ]
 
-    stale_count = sum(1 for result in results if result.status == "stale-output")
+    stale_count = sum(1 for result in results if result.status in STALE_STATUSES)
     no_data_count = sum(1 for result in results if result.status == "no-data")
     error_count = sum(1 for result in results if result.error or result.status == "error")
     if stale_count:
-        notes.append(f"STALE={stale_count}; OUTPUT WAS NOT QUIET FOR THOSE SETTINGS.")
+        notes.append(f"STALE={stale_count}; WRONG-RUN OR NOT-QUIET OUTPUT WAS SEEN.")
     if no_data_count:
         notes.append(f"NO DATA={no_data_count}; NOTHING USEFUL WAS READ.")
     if error_count:
@@ -4080,7 +4856,8 @@ def select_dual_phase0_pairs(
         result
         for result in results
         if not result.error
-        and result.status not in {"error", "no-data", "stale-output", "partial-write"}
+        and result.status
+        not in {"error", "no-data", "stale-output", "wrong-nonce", "mixed-nonce", "partial-write"}
         and result.score > 0.0
     ]
     signaled.sort(
@@ -4157,13 +4934,14 @@ def run_dual_phase0_baud_matrix(
     ]
     print()
     print_report_title("DUAL PHASE 0 BAUD MATRIX")
-    print("MODE: ADVANCED INPUT/OUTPUT BAUD MATRIX; PC PORT BAUDS MAY DIFFER.")
+    print("MODE: INPUT AND OUTPUT PORT BAUDS ARE TESTED INDEPENDENTLY.")
     print(
         f"PORTS: IN {options.in_port} -> BUFFER -> OUT {options.out_port}; "
         f"TEST={phase0_payload.byte_count} BYTES X {phase0_options.bursts}"
     )
     print("FIXED FRAME: 8E1 FLOW=NONE ON BOTH SIDES.")
-    print(f"BAUD PAIRS: {len(pairs)}.")
+    print(f"BAUD PAIRS: {len(pairs)} INPUT X OUTPUT COMBINATIONS.")
+    print("LIVE PAIRS ARE RECORDED; PHASE 0 CONTINUES AUTOMATICALLY.")
     print(border_line(REPORT_WIDTH))
     logger.info("dual phase 0 baud matrix started pairs=%s", len(pairs))
 
@@ -4201,18 +4979,6 @@ def run_dual_phase0_baud_matrix(
             candidate_result.bytes_drained_before,
             candidate_result.error,
         )
-        if decision.alive:
-            if not prompt_yes_no_question(
-                "Live dual baud pair found. Continue Phase 0 matrix?",
-                False,
-            ):
-                logger.info(
-                    "dual phase 0 stopped after live pair in=%s out=%s",
-                    input_baud,
-                    output_baud,
-                )
-                break
-
     elapsed_sec = sum(result.elapsed_sec for result in results)
     alive_pairs = [
         (result.input_baud, result.output_baud)
@@ -4391,7 +5157,7 @@ def print_dual_scan_summary(
         print(border_line(REPORT_WIDTH))
         return
     if is_recommendable_result(best):
-        print(bordered_text("RECOMMENDED DUAL-BANK SETTING", REPORT_WIDTH))
+        print(bordered_text("BEST OBSERVED DUAL-BANK TRANSFER", REPORT_WIDTH))
     else:
         print(bordered_text("BEST OBSERVED DUAL-BANK RESULT", REPORT_WIDTH))
     print(border_line(REPORT_WIDTH))
@@ -4452,7 +5218,7 @@ def dual_text_summary_lines(results: Sequence[CandidateResult]) -> list[str]:
     if len(tied) > 1:
         lines.append(f"AMBIGUOUS:       {len(tied)} INPUT/OUTPUT PAIRS TIED.")
     elif is_recommendable_result(best):
-        lines.append("ACTION:          RECORD THIS AS THE LIKELY BANK PAIR.")
+        lines.append("ACTION:          CLEAN PAIR OBSERVED; DO NOT INFER DIP MEANING ALONE.")
     elif has_any_signal(results):
         lines.append("ACTION:          PARTIAL RESULT ONLY; REPEAT OR CHECK WIRING.")
     else:
@@ -4483,9 +5249,10 @@ def write_dual_bank_text_report(
         border_line(REPORT_WIDTH),
         f"APPENDED:        {created}",
         f"STARTED UTC:     {metadata.get('started_at', '')}",
+        f"RUN ID:          {metadata.get('run_id', '')}",
         f"COM PATH:        {metadata.get('in_port')} -> BUFFER -> {metadata.get('out_port')}",
-        f"SWITCH NOTE:     {switch_note if switch_note else '(NOT ENTERED)'}",
-        "SCAN MODEL:      DUAL BANK INPUT/OUTPUT SETTINGS",
+        f"DIP NOTE:        {switch_note if switch_note else '(NOT ENTERED)'}",
+        "SCAN MODEL:      INPUT/OUTPUT PAIR TESTED; DIP MEANING NOT ASSUMED",
         (
             "PHASE 0 PAIRS:   "
             f"{len(phase0.alive_pairs)} ALIVE / "
@@ -4534,8 +5301,9 @@ def write_dual_bank_text_report(
             "  ADVANCED MODE DOES NOT TREAT SW1/SW2 AS COMPLETE PORT PROFILES.",
             "  INPUT VALUES ARE FOR THE PC TRANSMIT PORT INTO THE BUFFER.",
             "  OUTPUT VALUES ARE FOR THE PC RECEIVE PORT FROM THE BUFFER.",
-            "  INPUT FLOW AND OUTPUT FLOW ARE TESTED AS SEPARATE PORT SETTINGS.",
-            "  FLOW TRANSFER MATCHES CAN STILL TIE UNLESS THE BUFFER CREATES BACKPRESSURE.",
+            "  THIS IS ONE POSSIBLE MODEL; SHARED FRAMING/FLOW IS ALSO POSSIBLE.",
+            "  FLOW TRANSFER MATCHES DO NOT PROVE HANDSHAKE WITHOUT HOLD/BACKPRESSURE.",
+            "  WRONG-NONCE DATA MEANS STALE BUFFER OUTPUT OR A WRONG CANDIDATE/TRIAL.",
             border_line(REPORT_WIDTH),
         ]
     )
@@ -4878,6 +5646,30 @@ def prompt_phase0_only_sweep() -> bool:
     )
 
 
+def prompt_start_scan_workflow() -> str:
+    """Ask which automated workflow option 1 should run."""
+    print()
+    print_report_title("START SCAN WORKFLOW")
+    print("  1 AUTOMATED DISCOVERY")
+    print("  2 BANK 2 SWITCH-STATE TEST USING KNOWN BAUD")
+    print("  3 PHASE 0 BAUD LIVENESS ONLY")
+    print(border_line(REPORT_WIDTH))
+    while True:
+        try:
+            choice = read_operator_input("ENTER SELECTION [1]: ").lstrip("\ufeff").strip().lower()
+        except EOFError:
+            return "discovery"
+        if choice == "":
+            return "discovery"
+        if choice in {"1", "d", "discovery", "auto", "automatic"}:
+            return "discovery"
+        if choice in {"2", "b", "bank", "bank2", "switch"}:
+            return "bank2"
+        if choice in {"3", "p", "phase0", "baud"}:
+            return "phase0"
+        print("ENTER 1, 2, OR 3.")
+
+
 def print_menu_help() -> None:
     """Print short help for the interactive CLI."""
     print_paged_lines(
@@ -4898,22 +5690,24 @@ def print_menu_help() -> None:
             "  USE 11 MEMORY TEST AFTER A GOOD SETTING IS FOUND.",
             "",
             "OPERATOR NOTES:",
-            "  START SCAN:      FIRST ASKS WHETHER TO RUN ONLY PHASE 0.",
+            "  START SCAN:      CHOOSE AUTOMATED DISCOVERY, BANK 2 TEST, OR PHASE 0.",
             "  SWITCHES:        SW1/SW2 ARE NOT TREATED AS TWO COMPLETE PORT PROFILES.",
-            "  SCAN TYPE:       FULL OR QUICK AT SCAN START; BLANK=FULL.",
-            "  FULL MODE:       MOST RELIABLE FOR SWITCH MAPPING; QUICK MODE ASKS.",
-            "  QUICK MODE:      RUNS DISCOVERY AND MAY NARROW PHASE 2.",
+            "  BANK 2 TEST:     AFTER A MANUAL SWITCH CHANGE, OPTION 1 RUNS THE TEST.",
+            "  PHASE 0:         TESTS INPUT/OUTPUT BAUD PAIRS AT 8E1 FLOW=NONE.",
+            "  BAUD PAIRS:      INPUT AND OUTPUT PORT SPEEDS MAY DIFFER.",
+            "  FRAME TEST:      AFTER PHASE 0, TESTS FRAME AND FLOW AROUND LIVE PAIRS.",
             "  DEVICE PATH:     COM1 -> BUFFER INPUT -> BUFFER OUTPUT -> COM5.",
             "  PORT SETTINGS:   PROGRAM SETS COM PORTS; DEVICE MANAGER IS IGNORED.",
             "  TEST SIZE:       BYTES SENT FOR EACH SETTING.",
             "  TEST COUNT:      NUMBER OF TRIES PER SETTING.",
-            "  DISCOVERY:       QUICK=YES; FULL ASKS; FIXED INTERNAL SETTINGS.",
-            "  PHASE 0:         TESTS SHARED BAUD AT 8E1 FLOW=NONE.",
+            "  DISCOVERY:       STAGED DUAL-PORT TEST BEFORE FULL MATRIX FALLBACK.",
             "  TURBO:           FASTER DISCOVERY TIMING.",
-            "  QUICK BAUD FOCUS: QUICK-ONLY SPEED-UP; FULL DOES NOT NEED IT.",
             "  ASK ON MATCH:    PAUSE AFTER PASS; ASK CONTINUE.",
             "  FLOW VALIDATE:   AFTER BEST FRAME, TEST NONE/XON/RTS/DSR BEHAVIOR.",
             "  CLEAR OUTPUT:    DISCARD OLD BUFFER DATA FIRST.",
+            "  DEEP PURGE:      OPTIONAL PROMPT INSIDE BANK 2 KNOWN-BAUD TEST.",
+            "  NONCES:          EACH TRIAL PAYLOAD HAS RUN/CANDIDATE/TRIAL IDS.",
+            "  8-BIT TEST:      SEPARATE HIGH-BIT CHALLENGE; ASCII PASS IS NOT ENOUGH.",
             "  MAX CLEAR:       DEFAULT 32768 BYTES.",
             "  TOP ROWS:        BEST RESULTS SHOWN AT END.",
             "  MEMORY TEST:     COMMAND 11 AFTER SCAN.",
@@ -4952,7 +5746,7 @@ def print_configuration(options: ScanOptions) -> None:
         overhead = 0.0
         range_error = str(exc)
     lines: list[str] = ["", *banner_lines(), "CURRENT SETTINGS"]
-    lines.extend(setting_lines("SCAN TYPE:", "ASK AT START; BLANK=FULL"))
+    lines.extend(setting_lines("START SCAN:", "DISCOVERY / BANK 2 KNOWN-BAUD / PHASE 0"))
     lines.extend(setting_lines("PORTS:", f"{options.in_port} -> {options.out_port}"))
     lines.extend(
         setting_lines("BAUD RANGE:", f"{options.min_baud}..{options.max_baud}")
@@ -5052,9 +5846,10 @@ def print_configuration(options: ScanOptions) -> None:
     )
     lines.extend(setting_lines("TOP ROWS:", options.top))
     lines.extend(setting_lines("MEMORY TEST:", "USE 11 AFTER SCAN"))
+    lines.extend(setting_lines("BANK 2 TEST:", "AVAILABLE INSIDE START SCAN"))
     lines.extend(setting_lines("REPORT FILE:", options.text_report))
     lines.extend(
-        setting_lines("SWITCH NOTE:", options.switch_note or "(ASK AT SCAN START)")
+        setting_lines("DIP SETTING NOTE:", options.switch_note or "(ASK AT SCAN START)")
     )
     lines.extend(setting_lines("LOG FILE:", options.log_file))
     lines.extend(setting_lines("SEND TIME:", format_duration(wire).upper()))
@@ -5141,6 +5936,10 @@ def configure_timing(options: ScanOptions) -> ScanOptions:
         "TURBO DISCOVERY MODE",
         options.turbo_discovery_enabled,
     )
+    pre_drain_enabled = prompt_yes_no(
+        "CLEAR OLD OUTPUT BEFORE EACH TEST",
+        not options.no_pre_drain,
+    )
     read_timeout = prompt_float(
         "OUTPUT WAIT AFTER SEND, SECONDS",
         options.read_timeout,
@@ -5170,6 +5969,7 @@ def configure_timing(options: ScanOptions) -> ScanOptions:
     return dataclasses.replace(
         options,
         turbo_discovery_enabled=turbo_enabled,
+        no_pre_drain=not pre_drain_enabled,
         read_timeout=read_timeout,
         settle_ms=settle_ms,
         pre_drain_quiet=pre_drain_quiet,
@@ -5179,26 +5979,11 @@ def configure_timing(options: ScanOptions) -> ScanOptions:
     )
 
 
-def configure_pre_drain(options: ScanOptions) -> ScanOptions:
-    """Prompt for stale-output drain settings."""
-    enabled = prompt_yes_no("CLEAR OLD OUTPUT BEFORE EACH TEST", not options.no_pre_drain)
-    pre_drain_quiet = prompt_float("QUIET TIME BEFORE SEND, SECONDS", options.pre_drain_quiet, 0.05)
-    pre_drain_timeout = prompt_float("TIME LIMIT FOR CLEARING OLD OUTPUT, SECONDS", options.pre_drain_timeout, 0.0)
-    max_drain_bytes = prompt_int("MAX OLD BYTES TO CLEAR BEFORE STALE", options.max_drain_bytes, 1)
-    return dataclasses.replace(
-        options,
-        no_pre_drain=not enabled,
-        pre_drain_quiet=pre_drain_quiet,
-        pre_drain_timeout=pre_drain_timeout,
-        max_drain_bytes=max_drain_bytes,
-    )
-
-
 def configure_reports(options: ScanOptions) -> ScanOptions:
     """Prompt for result and report settings."""
     top = prompt_int("NUMBER OF TOP ROWS TO SHOW", options.top, 1)
     text_report = prompt_path("APPEND TEXT REPORT FILE", options.text_report)
-    switch_note = prompt_text("DEFAULT SWITCH/JUMPER NOTE", options.switch_note)
+    switch_note = prompt_text("DEFAULT DIP SETTING NOTE", options.switch_note)
     log_file = prompt_path("LOG FILE", options.log_file)
     return dataclasses.replace(
         options,
@@ -5296,12 +6081,16 @@ def prompt_flow_control(current: str) -> str:
         print("ENTER 1, 2, 3, OR 4.")
 
 
-def prompt_serial_setting(default: SerialSettings) -> SerialSettings:
-    """Prompt for the known-good serial setting used by the memory test."""
+def prompt_serial_setting(
+    default: SerialSettings,
+    title: str = "MEMORY TEST SERIAL SETTING",
+    intro: str = "ENTER SETTING FROM SCAN REPORT.",
+) -> SerialSettings:
+    """Prompt for a known-good serial setting."""
     print()
     print_banner()
-    print("MEMORY TEST SERIAL SETTING")
-    print("ENTER SETTING FROM SCAN REPORT.")
+    print(title)
+    print(intro)
     baud = prompt_int("BAUD RATE", default.baud, 1)
     while baud not in BAUD_RATES:
         print("BAUD RATE NOT IN PROGRAM LIST.")
@@ -5537,7 +6326,17 @@ def run_memory_hold_release_test(
     logger: logging.Logger,
 ) -> MemoryTestResult:
     """Run one memory test by holding output during the input transfer."""
-    payload = generate_payload(size_bytes)
+    payload = generate_payload(
+        size_bytes,
+        ProbeNonce(
+            run_id=options.run_id or make_run_id("M"),
+            candidate_id=sanitize_nonce_value(
+                f"MEM{index:02d}_{settings_nonce_id(settings)}"
+            ),
+            trial_id="HOLD",
+            switch_note_hash=switch_note_hash(options.switch_note),
+        ),
+    )
     started = time.monotonic()
     prefix = f"[MEM {index:02d}/{total:02d} {settings.label()} {byte_size_label(size_bytes)}]"
     console_progress(border_line(PROGRESS_WIDTH))
@@ -5717,7 +6516,17 @@ def run_memory_size_test(
             logger=logger,
         )
 
-    payload = generate_payload(size_bytes)
+    payload = generate_payload(
+        size_bytes,
+        ProbeNonce(
+            run_id=options.run_id or make_run_id("M"),
+            candidate_id=sanitize_nonce_value(
+                f"MEM{index:02d}_{settings_nonce_id(settings)}"
+            ),
+            trial_id="LIVE",
+            switch_note_hash=switch_note_hash(options.switch_note),
+        ),
+    )
     started = time.monotonic()
     console_progress(border_line(PROGRESS_WIDTH))
     console_progress(
@@ -5759,6 +6568,8 @@ def run_memory_size_test(
                     max_drain_bytes=options.max_drain_bytes,
                     logger=logger,
                     progress=console_progress,
+                    run_id=options.run_id,
+                    switch_hash=switch_note_hash(options.switch_note),
                 )
     except Exception as exc:
         empty_score = score_received(payload.data, b"")
@@ -5875,6 +6686,7 @@ def print_memory_report(
         print("  NOTE: READ-WHILE-SENDING DOES NOT PROVE RAM SIZE.")
     if any(result.bytes_seen_before_release > 0 for result in results):
         print("  NOTE: EARLY BYTES ARRIVED BEFORE RELEASE.")
+    print("  NOTE: HOLD-RELEASE WITH >16K IS THE INPUT-SIDE BACKPRESSURE CHECK.")
     print()
     print_report_title("MEMORY TEST FILES")
     print_wrapped_value("  TEXT REPORT: ", f"{text_report} (APPENDED)")
@@ -5917,6 +6729,7 @@ def write_memory_text_report(
             f"{format_duration(result.elapsed_sec):>6}"
         )
     lines.append(border_line(REPORT_WIDTH))
+    lines.append("NOTE: HOLD-RELEASE WITH >16K IS THE INPUT-SIDE BACKPRESSURE CHECK.")
     with text_report.open("a", encoding="utf-8") as report_file:
         report_file.write("\n".join(lines) + "\n")
 
@@ -5966,8 +6779,11 @@ def flow_validation_result_from_candidate(
         status = "partial-write"
         reason = "PAYLOAD WAS NOT FULLY SENT."
     elif clean:
-        status = "validated"
-        reason = "CLEAN TRANSFER WITH THIS FLOW SETTING."
+        status = "transfer-good"
+        if flow_control == "none":
+            reason = "CLEAN TRANSFER; NO FLOW HANDSHAKE WAS REQUESTED."
+        else:
+            reason = "CLEAN TRANSFER ONLY; FLOW NOT OBSERVED OR PROVEN."
     elif result.score >= 90.0:
         status = "transfer-good"
         reason = "TRANSFER WAS GOOD BUT NOT BYTE-PERFECT."
@@ -6101,6 +6917,14 @@ def run_flow_control_pause_validation(
     """Validate an output-side pause/release handshake behavior."""
     started = time.monotonic()
     flow_control = settings.flow_control
+    payload = payload_for_trial(
+        template=payload,
+        settings=settings,
+        candidate_index=index,
+        burst_index=1,
+        run_id=options.run_id or make_run_id("F"),
+        switch_hash=switch_note_hash(options.switch_note),
+    )
     method = {
         "xon/xoff": "xoff-xon-pause",
         "rts/cts": "rts-hold-release",
@@ -6339,6 +7163,11 @@ def flow_control_validation_recommendation(
         return f"MULTIPLE HANDSHAKES VALIDATED: {flows}."
     if any(result.flow_control == "none" for result in proven):
         return "CLEAN TRANSFER WITHOUT HANDSHAKE; NO HANDSHAKE MODE PROVEN."
+    if any(
+        result.flow_control == "none" and result.status == "transfer-good"
+        for result in results
+    ):
+        return "CLEAN TRANSFER WITHOUT HANDSHAKE; NO HANDSHAKE MODE PROVEN."
     if results:
         return "NO FLOW CONTROL MODE VALIDATED."
     return "FLOW CONTROL VALIDATION WAS NOT RUN."
@@ -6366,6 +7195,12 @@ def flow_validation_report_lines(
             f"{result.method:<18} "
             f"{result.reason[:28]}"
         )
+    lines.extend(
+        [
+            "NOTE: OUTPUT-SIDE HOLD/RELEASE PROVES ONLY OBSERVED PAUSE/RESUME.",
+            "NOTE: INPUT-SIDE BACKPRESSURE REQUIRES >16K HELD-OUTPUT MEMORY TEST.",
+        ]
+    )
     lines.append(border_line(REPORT_WIDTH))
     return lines
 
@@ -6397,6 +7232,8 @@ def print_flow_control_validation_report(
             f"{result.method:<18} "
             f"{result.reason[:28]}"
         )
+    print("NOTE: OUTPUT-SIDE HOLD/RELEASE PROVES ONLY OBSERVED PAUSE/RESUME.")
+    print("NOTE: INPUT-SIDE BACKPRESSURE REQUIRES >16K HELD-OUTPUT MEMORY TEST.")
     print(border_line(REPORT_WIDTH))
 
 
@@ -6422,6 +7259,7 @@ def run_flow_control_validation(
         options=options,
         logger=logger,
         reason="CLEAR VALIDATION DATA BEFORE FLOW-CONTROL TESTS.",
+        settings_list=[frame],
     )
     payload = generate_payload(options.flow_validate_size_bytes)
     settings_list = flow_validation_settings_for_frame(frame)
@@ -6503,8 +7341,380 @@ def run_flow_control_validation(
     return flow_results, None
 
 
+def bank2_frame_serial_settings(baud: int) -> list[SerialSettings]:
+    """Return the targeted frame list used for second-bank characterization."""
+    frame_specs = [
+        (8, "none", 1),
+        (7, "even", 1),
+        (7, "odd", 1),
+        (8, "even", 1),
+        (8, "odd", 1),
+        (7, "none", 1),
+        (7, "even", 2),
+        (8, "none", 2),
+    ]
+    return [
+        SerialSettings(
+            baud=baud,
+            data_bits=data_bits,
+            parity=parity,
+            stop_bits=stop_bits,
+            flow_control="none",
+        )
+        for data_bits, parity, stop_bits in frame_specs
+    ]
+
+
+def bank2_frame_candidates(
+    input_baud: int,
+    output_baud: int,
+) -> list[SerialSettings | DualSerialSettings]:
+    """Return targeted frame candidates for known same-baud or baud-pair tests."""
+    input_frames = bank2_frame_serial_settings(input_baud)
+    if input_baud == output_baud:
+        return list(input_frames)
+    output_frames = bank2_frame_serial_settings(output_baud)
+    return [
+        DualSerialSettings(input_settings=input_frame, output_settings=output_frame)
+        for input_frame, output_frame in zip(input_frames, output_frames)
+    ]
+
+
+def run_bank2_candidate(
+    serial_module: Any,
+    index: int,
+    total: int,
+    settings: SerialSettings | DualSerialSettings,
+    options: ScanOptions,
+    payload: ProbePayload,
+    logger: logging.Logger,
+) -> CandidateResult:
+    """Run one same-setting or input/output-pair candidate."""
+    if isinstance(settings, DualSerialSettings):
+        return run_dual_candidate(
+            serial_module=serial_module,
+            index=index,
+            total=total,
+            settings=settings,
+            options=options,
+            payload=payload,
+            logger=logger,
+            progress=console_progress,
+        )
+    return run_candidate(
+        serial_module=serial_module,
+        index=index,
+        total=total,
+        settings=settings,
+        options=options,
+        payload=payload,
+        logger=logger,
+        progress=console_progress,
+    )
+
+
+def ascii_pass_frame_labels(results: Sequence[CandidateResult]) -> list[str]:
+    """Return compact labels for clean ASCII frame candidates."""
+    labels: list[str] = []
+    for result in results:
+        if not clean_ascii_transfer(result):
+            continue
+        label = frame_label(result.settings)
+        if label not in labels:
+            labels.append(label)
+    return labels
+
+
+def likely_bank2_ascii_results(results: Sequence[CandidateResult]) -> list[CandidateResult]:
+    """Return likely frames for the eight-bit challenge."""
+    clean = [result for result in results if clean_ascii_transfer(result)]
+    if not clean:
+        return []
+    best_score = max(result.score for result in clean)
+    return [
+        result for result in clean if (best_score - result.score) <= TIE_SCORE_TOLERANCE
+    ]
+
+
+def eight_bit_result_summary(results: Sequence[CandidateResult]) -> str:
+    """Return a concise high-bit challenge conclusion."""
+    if not results:
+        return "NOT RUN"
+    clean = [
+        result
+        for result in results
+        if result.score >= 99.0
+        and result.metrics.high_bit_bytes_sent > 0
+        and result.metrics.high_bit_exact_ratio >= 1.0
+    ]
+    if clean:
+        return "8-BIT CLEAN"
+    masked = [
+        result for result in results if result.metrics.high_bit_stripped_count > 0
+    ]
+    if masked:
+        return "8-BIT NOT CLEAN; 7-BIT/MASKED DATA DETECTED"
+    if any(result.bytes_received > 0 for result in results):
+        return "8-BIT NOT CLEAN OR INCONCLUSIVE"
+    return "NO 8-BIT DATA RECEIVED"
+
+
+def bank2_flow_summary(results: Sequence[FlowControlValidationResult]) -> str:
+    """Return a concise flow validation summary for bank-2 reports."""
+    if not results:
+        return "NOT RUN"
+    return flow_control_validation_recommendation(results)
+
+
+def bank2_conclusion(
+    ascii_results: Sequence[CandidateResult],
+    eight_bit_results: Sequence[CandidateResult],
+    flow_results: Sequence[FlowControlValidationResult],
+) -> str:
+    """Return compact conclusion text for a second-bank switch state."""
+    if stale_nonce_seen(ascii_results) or stale_nonce_seen(eight_bit_results):
+        return "Stale/wrong-nonce data detected"
+    pass_frames = ascii_pass_frame_labels(ascii_results)
+    if not pass_frames:
+        return "No clean ASCII transfer observed"
+    eight_summary = eight_bit_result_summary(eight_bit_results)
+    if len(pass_frames) > 1:
+        return "Ambiguous; byte transfer does not distinguish these settings"
+    if "NOT CLEAN" in eight_summary or "MASKED" in eight_summary:
+        return "ASCII transfer passes, but 8-bit path is not clean"
+    if any(result.status == "validated" for result in flow_results):
+        return "Flow behavior changed or was validated; compare prior blocks"
+    if not flow_results and not eight_bit_results:
+        return "ASCII frame unchanged; no 8-bit or flow phase run"
+    return "No observable change except listed byte-transfer evidence"
+
+
+def write_bank2_text_report(
+    path: Path,
+    result: Bank2CharacterizationResult,
+) -> None:
+    """Append a concise second-bank characterization block."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    created = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    pass_frames = ascii_pass_frame_labels(result.ascii_results)
+    lines = [
+        "",
+        border_line(REPORT_WIDTH),
+        bordered_text("SECOND BANK CHARACTERIZATION", REPORT_WIDTH),
+        border_line(REPORT_WIDTH),
+        f"APPENDED:        {created}",
+        f"RUN ID:          {result.run_id}",
+        f"DIP NOTE:        {result.switch_note or '(NOT ENTERED)'}",
+        f"KNOWN BAUD/PAIR: {result.known_baud_text}",
+        f"ASCII PASS:      {', '.join(pass_frames) if pass_frames else '(NONE)'}",
+        f"8-BIT RESULT:    {eight_bit_result_summary(result.eight_bit_results)}",
+        f"FLOW RESULT:     {bank2_flow_summary(result.flow_results)}",
+        f"STALE DATA SEEN: {'YES' if result.stale_data_seen else 'NO'}",
+        f"CONCLUSION:      {result.conclusion}",
+        "",
+        "TABLE:",
+        "DIP NOTE | KNOWN BAUD/PAIR | ASCII PASS FRAMES | 8-BIT RESULT | FLOW RESULT | STALE | CONCLUSION",
+        border_line(REPORT_WIDTH),
+        (
+            f"{result.switch_note or '(NOT ENTERED)'} | "
+            f"{result.known_baud_text} | "
+            f"{', '.join(pass_frames) if pass_frames else '(NONE)'} | "
+            f"{eight_bit_result_summary(result.eight_bit_results)} | "
+            f"{bank2_flow_summary(result.flow_results)} | "
+            f"{'YES' if result.stale_data_seen else 'NO'} | "
+            f"{result.conclusion}"
+        ),
+        border_line(REPORT_WIDTH),
+        "",
+        "INTERPRETATION:",
+        "  FRAME PASS HERE MEANS CLEAN ASCII BYTE TRANSFER, NOT UNIQUE PARITY/STOP PROOF.",
+        "  FLOW IS PROVEN ONLY WHEN THE HOLD/RELEASE VALIDATION CHANGES BEHAVIOR.",
+        "  COMPARE THIS APPENDED BLOCK TO OTHER SWITCH-NOTE BLOCKS MANUALLY.",
+        border_line(REPORT_WIDTH),
+    ]
+    with path.open("a", encoding="utf-8") as report_file:
+        report_file.write("\n".join(lines) + "\n")
+
+
+def print_bank2_report(
+    result: Bank2CharacterizationResult,
+    report_path: Path,
+) -> None:
+    """Print the second-bank characterization conclusion."""
+    print()
+    print_report_title("SECOND BANK CHARACTERIZATION")
+    print_wrapped_value("  DIP NOTE:          ", result.switch_note or "(NOT ENTERED)")
+    print(f"  KNOWN BAUD/PAIR:    {result.known_baud_text}")
+    print_wrapped_value(
+        "  ASCII PASS FRAMES:  ",
+        ", ".join(ascii_pass_frame_labels(result.ascii_results)) or "(NONE)",
+    )
+    print_wrapped_value("  8-BIT RESULT:       ", eight_bit_result_summary(result.eight_bit_results))
+    print_wrapped_value("  FLOW RESULT:        ", bank2_flow_summary(result.flow_results))
+    print(f"  STALE DATA SEEN:    {'YES' if result.stale_data_seen else 'NO'}")
+    print_wrapped_value("  CONCLUSION:         ", result.conclusion)
+    print_wrapped_value("  TEXT REPORT:        ", f"{report_path} (APPENDED)")
+    print(border_line(REPORT_WIDTH))
+
+
+def prompt_bank2_known_baud(default: int) -> tuple[int, int]:
+    """Prompt for known input/output baud values."""
+    input_baud = prompt_int("KNOWN INPUT BAUD", default, 1)
+    output_baud = prompt_int("KNOWN OUTPUT BAUD (BLANK=SAME)", input_baud, 1)
+    return input_baud, output_baud
+
+
+def run_second_bank_characterization(options: ScanOptions) -> None:
+    """Run a targeted known-baud switch-state characterization."""
+    print()
+    print_report_title("SECOND BANK CHARACTERIZATION")
+    print("AUTOMATED TEST FOR THE CURRENT SECOND-BANK DIP SETTING.")
+    print(f"PORTS: {options.in_port} -> BUFFER -> {options.out_port}")
+    print("SEQUENCE: PURGE, ASCII FRAME TEST, 8-BIT CHALLENGE, FLOW VALIDATION.")
+    print(border_line(REPORT_WIDTH))
+    default_baud = options.min_baud if options.min_baud == options.max_baud else 1200
+    input_baud, output_baud = prompt_bank2_known_baud(default_baud)
+    switch_note = prompt_text("DIP SETTING NOTE FOR REPORT", options.switch_note)
+    payload_bytes = max(options.payload_bytes, minimum_payload_size())
+
+    bank_options = dataclasses.replace(
+        options,
+        min_baud=min(input_baud, output_baud),
+        max_baud=max(input_baud, output_baud),
+        payload_bytes=payload_bytes,
+        bursts=1,
+        switch_note=switch_note,
+        turbo_discovery_enabled=False,
+        ask_on_top_match=False,
+        no_pre_drain=False,
+        run_id=make_run_id("B2"),
+    )
+    try:
+        ensure_distinct_ports(bank_options.in_port, bank_options.out_port)
+    except ValueError as exc:
+        print(f"SETTINGS ERROR: {exc}")
+        return
+
+    logger = setup_logging(bank_options.log_file)
+    serial_module = import_or_install_pyserial()
+    known_text = (
+        f"IN {input_baud} / OUT {output_baud}"
+        if input_baud != output_baud
+        else str(input_baud)
+    )
+    purge_setting = phase0_baseline_settings(output_baud)
+    purge_limit = estimated_buffer_drain_seconds(purge_setting)
+    run_known_baud_purge(
+        serial_module=serial_module,
+        options=bank_options,
+        logger=logger,
+        settings=purge_setting,
+        max_seconds=purge_limit,
+        reason="AUTOMATED BANK-2 PRE-SCAN PURGE.",
+    )
+
+    ascii_results: list[CandidateResult] = []
+    ascii_payload = generate_payload(payload_bytes)
+    frames = bank2_frame_candidates(input_baud, output_baud)
+    print()
+    print_report_title("BANK 2 ASCII FRAME TEST")
+    print(f"KNOWN BAUD/PAIR: {known_text}")
+    print("TESTING TARGETED FRAME LIST.")
+    print(border_line(REPORT_WIDTH))
+    for index, settings in enumerate(frames, start=1):
+        try:
+            result = run_bank2_candidate(
+                serial_module=serial_module,
+                index=index,
+                total=len(frames),
+                settings=settings,
+                options=bank_options,
+                payload=ascii_payload,
+                logger=logger,
+            )
+        except KeyboardInterrupt:
+            action = prompt_operator_break_action("BANK 2 ASCII TEST")
+            if action == "resume":
+                continue
+            break
+        ascii_results.append(result)
+        if isinstance(result.settings, DualSerialSettings):
+            print(format_dual_progress(result), flush=True)
+        else:
+            print(format_progress(result), flush=True)
+
+    eight_bit_results: list[CandidateResult] = []
+    if ascii_results:
+        likely_results = likely_bank2_ascii_results(ascii_results)
+        eight_targets = likely_results or sorted(ascii_results, key=result_sort_key, reverse=True)[:1]
+        eight_payload_bytes = max(
+            DEFAULT_EIGHT_BIT_PAYLOAD_BYTES,
+            payload_bytes,
+            minimum_eight_bit_payload_size(),
+        )
+        eight_payload = generate_eight_bit_payload(eight_payload_bytes)
+        print()
+        print_report_title("BANK 2 8-BIT CHALLENGE")
+        print(f"TARGETS: {len(eight_targets)} LIKELY FRAME(S).")
+        print("ASCII PASS ALONE DOES NOT PROVE THIS PHASE.")
+        print(border_line(REPORT_WIDTH))
+        for index, prior in enumerate(eight_targets, start=1):
+            result = run_bank2_candidate(
+                serial_module=serial_module,
+                index=index,
+                total=len(eight_targets),
+                settings=prior.settings,
+                options=dataclasses.replace(
+                    bank_options,
+                    payload_bytes=eight_payload_bytes,
+                    read_timeout=max(bank_options.read_timeout, 2.0),
+                ),
+                payload=eight_payload,
+                logger=logger,
+            )
+            eight_bit_results.append(result)
+            if isinstance(result.settings, DualSerialSettings):
+                print(format_dual_progress(result), flush=True)
+            else:
+                print(format_progress(result), flush=True)
+            if result.status == "eight-bit-not-clean":
+                print("ASCII TRANSFER PASSES, BUT 8-BIT PATH IS NOT CLEAN.")
+
+    flow_results: list[FlowControlValidationResult] = []
+    if input_baud != output_baud:
+        print()
+        print_report_title("BANK 2 FLOW VALIDATION")
+        print("SKIPPED: FLOW VALIDATION CURRENTLY USES SAME-BAUD SERIAL SETTINGS.")
+        print("RESULT: NOT OBSERVABLE IN THIS KNOWN-PAIR MODE.")
+        print(border_line(REPORT_WIDTH))
+    else:
+        flow_results, _break_action = run_flow_control_validation(
+            serial_module=serial_module,
+            options=bank_options,
+            results=ascii_results,
+            validation_results=[],
+            logger=logger,
+        )
+
+    stale_seen = stale_nonce_seen(ascii_results) or stale_nonce_seen(eight_bit_results)
+    conclusion = bank2_conclusion(ascii_results, eight_bit_results, flow_results)
+    result = Bank2CharacterizationResult(
+        switch_note=switch_note,
+        known_baud_text=known_text,
+        ascii_results=ascii_results,
+        eight_bit_results=eight_bit_results,
+        flow_results=flow_results,
+        stale_data_seen=stale_seen,
+        conclusion=conclusion,
+        run_id=bank_options.run_id,
+    )
+    write_bank2_text_report(bank_options.text_report, result)
+    print_bank2_report(result, bank_options.text_report)
+
+
 def run_memory_test(options: ScanOptions) -> None:
     """Prompt for and run a memory transfer test."""
+    options = dataclasses.replace(options, run_id=make_run_id("M"))
     try:
         ensure_distinct_ports(options.in_port, options.out_port)
     except ValueError as exc:
@@ -6579,16 +7789,30 @@ def run_memory_test(options: ScanOptions) -> None:
 
 def print_commands() -> None:
     """Print the main command menu."""
+    def menu_line(left: str = "", right: str = "") -> None:
+        inner_width = SCREEN_WIDTH - 4
+        if right:
+            text = f"{left:<32}  {right:<34}"
+        else:
+            text = left
+        print(f"* {text[:inner_width].ljust(inner_width)} *")
+
     print()
     print_banner()
-    print("MAIN MENU")
-    print("  1 START SCAN                 7 SET REPORT FILES")
-    print("  2 SET COM PORTS              8 RESET REPORT FILES")
-    print("  3 SET BAUD RANGE             9 CURRENT SETTINGS")
-    print("  4 SET TEST SIZE/COUNT       10 QUICK BAUD FOCUS")
-    print("  5 SET TIMING/TURBO          11 MEMORY TEST")
-    print("  6 CLEAR OLD OUTPUT          12 HELP")
-    print("  0 QUIT")
+    print(bordered_text("MAIN MENU", SCREEN_WIDTH))
+    print(border_line(SCREEN_WIDTH))
+    menu_line("OPERATION", "SETUP")
+    menu_line("  1  START SCAN", "  3  SET COM PORTS")
+    menu_line("  2  MEMORY TEST", "  4  SET BAUD RANGE")
+    menu_line("", "  5  TEST SIZE / COUNT")
+    menu_line("", "  6  TIMING / TURBO / CLEAR")
+    menu_line("", "  7  QUICK BAUD FOCUS")
+    menu_line()
+    menu_line("REPORTS", "REFERENCE")
+    menu_line("  8  SET REPORT FILES", " 10  CURRENT SETTINGS")
+    menu_line("  9  RESET REPORT FILES", " 11  HELP")
+    menu_line("", "  0  QUIT")
+    print(border_line(SCREEN_WIDTH))
 
 
 def interactive_menu(options: ScanOptions | None = None) -> ScanOptions | None:
@@ -6598,7 +7822,7 @@ def interactive_menu(options: ScanOptions | None = None) -> ScanOptions | None:
     while True:
         print_commands()
         try:
-            choice = read_operator_input("ENTER SELECTION: ").lstrip("\ufeff").strip().lower()
+            choice = read_operator_input("COMMAND (?=HELP): ").lstrip("\ufeff").strip().lower()
         except EOFError:
             return None
 
@@ -6610,40 +7834,38 @@ def interactive_menu(options: ScanOptions | None = None) -> ScanOptions | None:
                 continue
             return options
         if choice == "2":
+            run_memory_test(options)
+        elif choice == "3":
             options = dataclasses.replace(
                 options,
                 in_port=prompt_text("Input/transmit port", options.in_port),
                 out_port=prompt_text("Output/read port", options.out_port),
             )
-        elif choice == "3":
-            options = configure_baud_range(options)
         elif choice == "4":
-            options = configure_payload(options)
+            options = configure_baud_range(options)
         elif choice == "5":
-            options = configure_timing(options)
+            options = configure_payload(options)
         elif choice == "6":
-            options = configure_pre_drain(options)
+            options = configure_timing(options)
         elif choice == "7":
-            options = configure_reports(options)
+            options = configure_baud_focus(options)
         elif choice == "8":
+            options = configure_reports(options)
+        elif choice == "9":
             default_text_report, default_log = default_report_paths()
             options = dataclasses.replace(
                 options,
                 text_report=default_text_report,
                 log_file=default_log,
             )
-        elif choice == "9":
-            print_configuration(options)
         elif choice == "10":
-            options = configure_baud_focus(options)
-        elif choice == "11":
-            run_memory_test(options)
-        elif choice == "12":
+            print_configuration(options)
+        elif choice in {"11", "h", "help", "?"}:
             print_menu_help()
         elif choice in {"0", "q", "quit", "exit"}:
             return None
         else:
-            print("ENTER A NUMBER FROM 0 TO 12.")
+            print("ENTER 0-11, OR ? FOR HELP.")
 
 
 def prompt_after_scan_action(title: str = "RUN COMPLETE") -> str:
@@ -6764,14 +7986,17 @@ def run_dual_bank_scan(
             options.turbo_discovery_enabled,
         )
         switch_note = prompt_text(
-            "Switch/jumper note for report",
+            "DIP setting note for report",
             options.switch_note,
         )
         options = dataclasses.replace(
             options,
             turbo_discovery_enabled=turbo_enabled,
             switch_note=switch_note,
+            run_id=make_run_id("D"),
         )
+    else:
+        options = dataclasses.replace(options, run_id=make_run_id("D"))
     logger.info("dual-bank scan started phase0_only=%s", phase0_only)
     logger.info("options: %s", options)
 
@@ -7085,6 +8310,7 @@ def run_dual_bank_scan(
         "in_port": options.in_port,
         "out_port": options.out_port,
         "switch_note": options.switch_note,
+        "run_id": options.run_id,
         "top": options.top,
         "options": dataclass_to_jsonable(options),
         "phase0_dual_baud_liveness": dataclass_to_jsonable(phase0_report),
@@ -7197,6 +8423,7 @@ def metadata_for_scan(
         "out_port": options.out_port,
         "mode": "scan",
         "scan_mode": scan_mode,
+        "run_id": options.run_id,
         "candidate_count": candidate_count,
         "completed_candidates": None,
         "early_stopped": early_stopped,
@@ -7214,35 +8441,47 @@ def metadata_for_scan(
 
 def run_scan(options: ScanOptions) -> int:
     """Run the serial probe scan and write reports."""
-    phase0_only = prompt_phase0_only_sweep()
+    workflow = prompt_start_scan_workflow()
+    if workflow == "bank2":
+        run_second_bank_characterization(options)
+        return 0
+    phase0_only = workflow == "phase0"
     serial_module = import_or_install_pyserial()
     logger = setup_logging(options.log_file)
-    pyserial_version = str(getattr(serial_module, "VERSION", "unknown"))
     logger.info("serial_probe started")
-    logger.info("switch-bank prompt skipped; using same-baud staged discovery model")
+    logger.info("using dual input/output baud discovery model workflow=%s", workflow)
 
-    if phase0_only:
-        return run_phase0_only_sweep(
-            serial_module=serial_module,
-            options=options,
-            logger=logger,
-        )
+    return run_dual_bank_scan(
+        serial_module=serial_module,
+        options=options,
+        logger=logger,
+        phase0_only=phase0_only,
+    )
 
+
+def run_same_settings_scan(
+    serial_module: Any,
+    options: ScanOptions,
+    logger: logging.Logger,
+) -> int:
+    """Run the legacy same-settings scan path."""
+    pyserial_version = str(getattr(serial_module, "VERSION", "unknown"))
     scan_mode = prompt_scan_mode()
     turbo_enabled = prompt_yes_no_question(
         "Turbo discovery mode?",
         options.turbo_discovery_enabled,
     )
     switch_note = prompt_text(
-        "Switch/jumper note for report",
+        "DIP setting note for report",
         options.switch_note,
     )
     options = dataclasses.replace(
         options,
         turbo_discovery_enabled=turbo_enabled,
         switch_note=switch_note,
+        run_id=make_run_id("S"),
     )
-    logger.info("scan-start turbo discovery=%s", turbo_enabled)
+    logger.info("legacy same-settings scan-start turbo discovery=%s", turbo_enabled)
 
     all_candidates = prioritize_discovery_candidates(
         generate_candidates(options.min_baud, options.max_baud),
@@ -7368,7 +8607,7 @@ def run_scan(options: ScanOptions) -> int:
     print("SWITCH MODEL: BAUD FIRST; SW1/SW2 ARE NOT TWO COMPLETE PORT PROFILES.")
     print("NOTE: PROGRAM SETS COM PORTS; DEVICE MANAGER DEFAULTS ARE NOT USED.")
     if options.switch_note:
-        print(f"SWITCH NOTE: {options.switch_note}")
+        print(f"DIP SETTING NOTE: {options.switch_note}")
     print(
         "TURBO DISCOVERY: "
         + ("ON; ADAPTIVE TIMING AND PRIORITY ORDER." if options.turbo_discovery_enabled else "OFF.")
@@ -7800,6 +9039,100 @@ def run_scan(options: ScanOptions) -> int:
     return 0
 
 
+def assert_approx(value: float, expected: float, tolerance: float, label: str) -> None:
+    """Raise AssertionError if a numeric self-test value is out of range."""
+    if abs(value - expected) > tolerance:
+        raise AssertionError(f"{label}: got {value:.3f}, expected {expected:.3f}")
+
+
+def fake_clean_candidate_result(
+    settings: SerialSettings,
+    payload: ProbePayload,
+) -> CandidateResult:
+    """Return a clean in-memory candidate result for self-tests."""
+    score = score_received(payload.data, payload.data)
+    return CandidateResult(
+        index=1,
+        total=1,
+        settings=settings,
+        bytes_sent=payload.byte_count,
+        bytes_received=payload.byte_count,
+        bytes_drained_before=0,
+        score=score.score,
+        repeatability=1.0,
+        status="exact",
+        error=None,
+        elapsed_sec=0.0,
+        timing=zero_timing_breakdown(),
+        metrics=score.metrics,
+        trials=[],
+        evidence=score.evidence,
+    )
+
+
+def run_self_tests() -> int:
+    """Run pure-Python self-tests that do not require serial hardware."""
+    print("RUNNING SERIAL PROBE SELF-TESTS")
+    nonce_a = ProbeNonce("RUNTEST", "CAND_A", "TRIAL_1", "NOTE0001")
+    nonce_b = ProbeNonce("RUNTEST", "CAND_B", "TRIAL_1", "NOTE0001")
+    payload_a = generate_payload(512, nonce_a)
+    payload_b = generate_payload(512, nonce_b)
+
+    score_a = score_received(payload_a.data, payload_a.data)
+    assert score_a.score == 100.0, "nonced exact payload did not score 100"
+    assert score_a.classification == "exact", "exact payload was not classified exact"
+
+    wrong = score_received(payload_b.data, payload_a.data)
+    assert wrong.score == 0.0, "wrong nonce must not score above zero"
+    assert wrong.classification == "wrong-nonce", "wrong nonce not classified stale"
+
+    eight = generate_eight_bit_payload(512, nonce_a)
+    eight_score = score_received(eight.data, eight.data)
+    assert eight_score.score == 100.0, "eight-bit exact payload did not score 100"
+    assert (
+        eight_score.classification == "eight-bit-clean"
+    ), "eight-bit exact payload was not clean"
+
+    masked = bytes(byte & 0x7F for byte in eight.data)
+    masked_score = score_received(eight.data, masked)
+    assert masked_score.score < 100.0, "masked eight-bit payload scored perfect"
+    assert (
+        masked_score.classification == "eight-bit-masked"
+    ), "masked high-bit payload was not classified masked"
+    assert (
+        masked_score.metrics.high_bit_stripped_count > 0
+    ), "masked high-bit stripped bytes were not counted"
+
+    frame_1200 = SerialSettings(1200, 8, "none", 1, "none")
+    frame_300 = SerialSettings(300, 8, "none", 1, "none")
+    assert_approx(
+        estimated_buffer_drain_seconds(frame_1200, safety_factor=1.0),
+        (16 * 1024 * 10) / 1200,
+        0.5,
+        "1200 baud drain estimate",
+    )
+    assert_approx(
+        estimated_buffer_drain_seconds(frame_300, safety_factor=1.0),
+        (16 * 1024 * 10) / 300,
+        0.5,
+        "300 baud drain estimate",
+    )
+
+    flow_settings = SerialSettings(1200, 8, "none", 1, "xon/xoff")
+    clean_flow = fake_clean_candidate_result(flow_settings, payload_a)
+    flow_row = flow_validation_result_from_candidate(
+        "xon/xoff",
+        "large-transfer",
+        clean_flow,
+        payload_a,
+    )
+    assert flow_row.status != "validated", "normal transfer incorrectly proved flow"
+    assert "NOT OBSERVED" in flow_row.reason, "flow reason did not mark not observed"
+
+    print("SELF-TESTS PASSED")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Program entry point."""
     enable_terminal_style()
@@ -7807,6 +9140,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("PYTHON 3.10 OR NEWER IS REQUIRED.")
         return 2
     args = list(sys.argv[1:] if argv is None else argv)
+    if any(arg in {"--self-test", "self-test"} for arg in args):
+        return run_self_tests()
     if any(arg in {"-h", "--help", "help"} for arg in args):
         print_menu_help()
         return 0
