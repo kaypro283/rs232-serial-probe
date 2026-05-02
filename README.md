@@ -89,7 +89,7 @@ If quick exploratory mode finds no usable signal, produces only low-confidence r
 
 When quick exploratory mode runs, the tool first tests each selected baud once using fixed baseline settings:
 
-- `8` data bits, no parity, `1` stop bit.
+- `8` data bits, mark parity, `1` stop bit.
 - Flow control off.
 - Compact structural liveness payload.
 - `0.25` second output quiet wait after sending.
