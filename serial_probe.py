@@ -128,6 +128,16 @@ PERFECT_SCORE = 100.0
 OPERATOR_BREAK_EXIT_CODE = 130
 
 
+def flow_control_code(flow_control: str) -> str:
+    """Return a short flow-control code for compact dual-bank displays."""
+    return {
+        "none": "NONE",
+        "xon/xoff": "XON",
+        "rts/cts": "RTS",
+        "dsr/dtr": "DSR",
+    }[flow_control]
+
+
 class ReturnToMainMenuAfterReport(Exception):
     """Signal that the operator asked for the main menu after report writing."""
 
@@ -202,19 +212,21 @@ class DualSerialSettings:
         return self.input_settings.parity_code()
 
     def input_mode(self) -> str:
-        """Return compact input-side baud/frame text."""
+        """Return compact input-side baud/frame/flow text."""
         return (
             f"{self.input_settings.baud} "
             f"{self.input_settings.data_bits}{self.input_settings.parity_code()}"
-            f"{self.input_settings.stop_bits}"
+            f"{self.input_settings.stop_bits} "
+            f"{flow_control_code(self.input_settings.flow_control)}"
         )
 
     def output_mode(self) -> str:
-        """Return compact output-side baud/frame text."""
+        """Return compact output-side baud/frame/flow text."""
         return (
             f"{self.output_settings.baud} "
             f"{self.output_settings.data_bits}{self.output_settings.parity_code()}"
-            f"{self.output_settings.stop_bits}"
+            f"{self.output_settings.stop_bits} "
+            f"{flow_control_code(self.output_settings.flow_control)}"
         )
 
     def label(self) -> str:
@@ -3931,6 +3943,38 @@ def dual_input_frame_sweep_for_pair(
     )
 
 
+def dual_flow_candidates_for_frame(
+    settings: DualSerialSettings,
+) -> list[DualSerialSettings]:
+    """Return all input/output flow combinations for one dual-bank frame pair."""
+    return unique_dual_candidates(
+        [
+            DualSerialSettings(
+                dataclasses.replace(settings.input_settings, flow_control=input_flow),
+                dataclasses.replace(settings.output_settings, flow_control=output_flow),
+            )
+            for input_flow in FLOW_CONTROLS
+            for output_flow in FLOW_CONTROLS
+        ]
+    )
+
+
+def best_dual_settings(
+    results: Sequence[CandidateResult],
+    fallback: DualSerialSettings,
+) -> DualSerialSettings:
+    """Return the best observed dual setting, or the fallback seed."""
+    eligible = [
+        result
+        for result in results
+        if isinstance(result.settings, DualSerialSettings)
+        and result.score > 0.0
+    ]
+    if not eligible:
+        return fallback
+    return dual_result_settings(sorted(eligible, key=result_sort_key, reverse=True)[0])
+
+
 def best_dual_output_settings(
     results: Sequence[CandidateResult],
     seed: DualSerialSettings,
@@ -4221,6 +4265,12 @@ def ranked_dual_top_results(
     return ranked[: max(top, perfect_count)]
 
 
+def dual_side_table_label(settings: SerialSettings) -> str:
+    """Return compact baud/frame/flow text for dual-bank tables."""
+    frame = f"{settings.data_bits}{settings.parity_code()}{settings.stop_bits}"
+    return f"{settings.baud} {frame} {flow_control_code(settings.flow_control)}"
+
+
 def format_dual_progress(result: CandidateResult) -> str:
     """Return one console progress line for a dual-bank candidate."""
     settings = dual_result_settings(result)
@@ -4232,7 +4282,7 @@ def format_dual_progress(result: CandidateResult) -> str:
     indicator = result_indicator(result.score, result.status, result.error)
     return (
         f"[{result.index:04d}/{result.total:04d}] RESULT {indicator} "
-        f"{settings.label():38s} "
+        f"{settings.label():48s} "
         f"SENT={result.bytes_sent:7d} READ={result.bytes_received:7d} "
         f"CLR={result.bytes_drained_before:7d} "
         f"SCORE={result.score:6.2f} {status}"
@@ -4250,7 +4300,7 @@ def print_dual_ranked_table(
     print_report_title(report_title)
     print("TOP OBSERVED INPUT/OUTPUT PAIRS (NON-ZERO SCORES)")
     print(border_line(REPORT_WIDTH))
-    print("RK SCORE  IN BAUD MODE  OUT BAUD MODE  SENT   READ  CLR  EXCT LINE RESULT")
+    print("RK SCORE  IN SETTING      OUT SETTING      SENT   READ  CLR EXCT LINE RES")
     print(border_line(REPORT_WIDTH))
     for rank, result in enumerate(ranked, start=1):
         settings = dual_result_settings(result)
@@ -4258,18 +4308,14 @@ def print_dual_ranked_table(
         print(
             f"{rank:>2} "
             f"{result.score:>5.1f} "
-            f"{settings.input_settings.baud:>7} "
-            f"{settings.input_settings.data_bits}{settings.input_settings.parity_code()}"
-            f"{settings.input_settings.stop_bits:<4} "
-            f"{settings.output_settings.baud:>8} "
-            f"{settings.output_settings.data_bits}{settings.output_settings.parity_code()}"
-            f"{settings.output_settings.stop_bits:<5} "
+            f"{dual_side_table_label(settings.input_settings):<15} "
+            f"{dual_side_table_label(settings.output_settings):<15} "
             f"{result.bytes_sent:>6} "
             f"{result.bytes_received:>6} "
             f"{result.bytes_drained_before:>4} "
             f"{result.metrics.exact_byte_match_ratio:>4.2f} "
             f"{result.metrics.line_integrity_ratio:>4.2f} "
-            f"{indicator}"
+            f"{indicator[:3]}"
         )
     print(border_line(REPORT_WIDTH))
     if not ranked:
@@ -4286,12 +4332,20 @@ def print_dual_result_details(result: CandidateResult) -> None:
         f"{settings.input_settings.parity_code()}"
         f"{settings.input_settings.stop_bits}"
     )
+    print(
+        f"    INPUT FLOW:         "
+        f"{flow_control_name(settings.input_settings.flow_control)}"
+    )
     print(f"    OUTPUT BAUD:        {settings.output_settings.baud}")
     print(
         f"    OUTPUT MODE:        "
         f"{settings.output_settings.data_bits}"
         f"{settings.output_settings.parity_code()}"
         f"{settings.output_settings.stop_bits}"
+    )
+    print(
+        f"    OUTPUT FLOW:        "
+        f"{flow_control_name(settings.output_settings.flow_control)}"
     )
     print_wrapped_value("    SETTING:            ", settings.label())
     print(
@@ -4321,7 +4375,7 @@ def print_dual_scan_summary(
     print()
     print_report_title("DUAL BANK SUMMARY")
     print(f"  RUN TIME:             {format_duration(elapsed_sec)}")
-    print(f"  PAIRS TESTED:         {len(results)}/{total_candidates}")
+    print(f"  SETTINGS TESTED:      {len(results)}/{total_candidates}")
     print(f"  ENDED EARLY:          {'YES' if early_stopped else 'NO'}")
     print(f"  FINDING:              {confidence_summary(best, len(tied))}")
     if best is None:
@@ -4354,7 +4408,7 @@ def dual_candidate_table_lines(
     lines = [
         title,
         border_line(REPORT_WIDTH),
-        "RK SCORE  IN BAUD MODE  OUT BAUD MODE  SENT   READ  CLR  EXCT LINE RESULT",
+        "RK SCORE  IN SETTING      OUT SETTING      SENT   READ  CLR EXCT LINE RES",
         border_line(REPORT_WIDTH),
     ]
     for rank, result in enumerate(ranked, start=1):
@@ -4363,18 +4417,14 @@ def dual_candidate_table_lines(
         lines.append(
             f"{rank:>2} "
             f"{result.score:>5.1f} "
-            f"{settings.input_settings.baud:>7} "
-            f"{settings.input_settings.data_bits}{settings.input_settings.parity_code()}"
-            f"{settings.input_settings.stop_bits:<4} "
-            f"{settings.output_settings.baud:>8} "
-            f"{settings.output_settings.data_bits}{settings.output_settings.parity_code()}"
-            f"{settings.output_settings.stop_bits:<5} "
+            f"{dual_side_table_label(settings.input_settings):<15} "
+            f"{dual_side_table_label(settings.output_settings):<15} "
             f"{result.bytes_sent:>6} "
             f"{result.bytes_received:>6} "
             f"{result.bytes_drained_before:>4} "
             f"{result.metrics.exact_byte_match_ratio:>4.2f} "
             f"{result.metrics.line_integrity_ratio:>4.2f} "
-            f"{indicator}"
+            f"{indicator[:3]}"
         )
     lines.append(border_line(REPORT_WIDTH))
     if not ranked:
@@ -4443,6 +4493,10 @@ def write_dual_bank_text_report(
         f"PHASE 1 PAIRS:   {selected_pairs if selected_pairs else '(NONE)'}",
         f"STAGED TESTS:    {metadata.get('staged_candidate_count', 0)} PLANNED",
         (
+            "FLOW DISCOVERY: "
+            + ("ON" if metadata.get("dual_flow_discovery_enabled") else "OFF")
+        ),
+        (
             "FULL MATRIX:     "
             + (
                 "RUN"
@@ -4479,7 +4533,8 @@ def write_dual_bank_text_report(
             "  DUAL-BANK MODE DOES NOT ASSUME SW1 AND SW2 USE THE SAME SETTING.",
             "  INPUT VALUES ARE FOR THE PC TRANSMIT PORT INTO THE BUFFER.",
             "  OUTPUT VALUES ARE FOR THE PC RECEIVE PORT FROM THE BUFFER.",
-            "  FLOW CONTROL SHOULD BE VALIDATED AFTER THE FRAME PAIR IS KNOWN.",
+            "  INPUT FLOW AND OUTPUT FLOW ARE TESTED AS SEPARATE PORT SETTINGS.",
+            "  FLOW TRANSFER MATCHES CAN STILL TIE UNLESS THE BUFFER CREATES BACKPRESSURE.",
             border_line(REPORT_WIDTH),
         ]
     )
@@ -6748,8 +6803,10 @@ def run_dual_bank_scan(
         print(border_line(REPORT_WIDTH))
         return 1
 
+    dual_flow_discovery_enabled = options.auto_validate_flow_control
     full_candidates: list[DualSerialSettings] = []
     staged_preview_candidates: list[DualSerialSettings] = []
+    staged_flow_candidate_count = 0
     for input_baud, output_baud in selected_pairs:
         full_candidates.extend(dual_frame_candidates_for_pair(input_baud, output_baud))
         seed = dual_phase0_settings(input_baud, output_baud)
@@ -6757,8 +6814,15 @@ def run_dual_bank_scan(
         staged_preview_candidates.extend(
             dual_input_frame_sweep_for_pair(input_baud, seed.output_settings)
         )
+        if dual_flow_discovery_enabled:
+            staged_flow_candidate_count += max(
+                0,
+                len(dual_flow_candidates_for_frame(seed)) - 1,
+            )
     full_candidates = unique_dual_candidates(full_candidates)
     staged_preview_candidates = unique_dual_candidates(staged_preview_candidates)
+    candidate_total = len(full_candidates) + staged_flow_candidate_count
+    staged_total = len(staged_preview_candidates) + staged_flow_candidate_count
     payload = generate_payload(options.payload_bytes)
     purge_buffer_output(
         serial_module=serial_module,
@@ -6782,7 +6846,7 @@ def run_dual_bank_scan(
         ),
     )
     print(
-        f"STAGED SETTINGS: {len(staged_preview_candidates)} "
+        f"STAGED SETTINGS: {staged_total} "
         f"BEFORE FULL MATRIX FALLBACK."
     )
     print(f"FULL MATRIX: {len(full_candidates)} INPUT/OUTPUT FRAME PAIRS IF NEEDED.")
@@ -6791,8 +6855,12 @@ def run_dual_bank_scan(
         f"TEST={payload.byte_count} BYTES X {options.bursts}"
     )
     print("DISCOVERY ORDER: PHASE 0 FRAME, OUTPUT SWEEP, INPUT SWEEP.")
+    if dual_flow_discovery_enabled:
+        print("FLOW DISCOVERY: INPUT/OUTPUT FLOW COMBINATIONS AFTER BEST FRAME.")
+    else:
+        print("FLOW DISCOVERY: OFF.")
     print("FULL MATRIX RUNS ONLY IF STAGED DISCOVERY DOES NOT FIND A GOOD PAIR.")
-    print("FLOW CONTROL: NONE DURING DUAL FRAME DISCOVERY.")
+    print("FRAME SWEEPS USE FLOW=NONE; FLOW SWEEP TESTS HANDSHAKE SETTINGS.")
     if options.auto_validate_top_matches:
         print(f"VALIDATION: ON; SIZE1={options.validate_size_1_bytes} BYTES.")
     else:
@@ -6803,7 +6871,14 @@ def run_dual_bank_scan(
     print(f"REPORT: {options.text_report} (APPEND)")
     print(f"DEBUG LOG: {options.log_file}")
     staged_rough_total = 0.0
-    for candidate in staged_preview_candidates:
+    staged_estimate_candidates = list(staged_preview_candidates)
+    if dual_flow_discovery_enabled:
+        for input_baud, output_baud in selected_pairs:
+            staged_estimate_candidates.extend(
+                dual_flow_candidates_for_frame(dual_phase0_settings(input_baud, output_baud))
+            )
+    staged_estimate_candidates = unique_dual_candidates(staged_estimate_candidates)
+    for candidate in staged_estimate_candidates:
         timing = effective_discovery_timing(
             options,
             candidate.input_settings,
@@ -6879,7 +6954,7 @@ def run_dual_bank_scan(
                 result = run_dual_candidate(
                     serial_module=serial_module,
                     index=display_index,
-                    total=len(full_candidates),
+                    total=candidate_total,
                     settings=settings,
                     options=options,
                     payload=payload,
@@ -6893,7 +6968,7 @@ def run_dual_bank_scan(
                         "operator resumed %s at %s/%s %s",
                         stage_name.lower(),
                         display_index,
-                        len(full_candidates),
+                        candidate_total,
                         settings.label(),
                     )
                     continue
@@ -6905,7 +6980,7 @@ def run_dual_bank_scan(
                     stage_name.lower(),
                     action,
                     len(results),
-                    len(full_candidates),
+                    candidate_total,
                 )
                 break
             results.append(result)
@@ -6913,7 +6988,7 @@ def run_dual_bank_scan(
             tested_settings.add(settings)
             print(format_dual_progress(result), flush=True)
             print(
-                format_scan_eta(len(results), len(full_candidates), scan_started),
+                format_scan_eta(len(results), candidate_total, scan_started),
                 flush=True,
             )
             if options.ask_on_top_match and is_top_match_result(result):
@@ -6953,11 +7028,21 @@ def run_dual_bank_scan(
             [*seed_results, *output_results],
             seed,
         )
-        run_dual_sequence(
+        input_results = run_dual_sequence(
             "DUAL INPUT FRAME SWEEP",
             "DUAL INPUT FRAME SWEEP",
             dual_input_frame_sweep_for_pair(input_baud, best_output),
         )
+        if dual_flow_discovery_enabled:
+            best_frame = best_dual_settings(
+                [*seed_results, *output_results, *input_results],
+                seed,
+            )
+            run_dual_sequence(
+                "DUAL FLOW DISCOVERY",
+                "DUAL FLOW DISCOVERY",
+                dual_flow_candidates_for_frame(best_frame),
+            )
 
     if not early_stopped and operator_break_action is None:
         if has_recommendable_dual_result(results):
@@ -6975,11 +7060,24 @@ def run_dual_bank_scan(
             ]
             if fallback_candidates:
                 full_matrix_ran = True
-                run_dual_sequence(
+                fallback_results = run_dual_sequence(
                     "DUAL FULL MATRIX FALLBACK",
                     "DUAL FULL MATRIX FALLBACK",
                     fallback_candidates,
                 )
+                if (
+                    dual_flow_discovery_enabled
+                    and fallback_results
+                    and has_recommendable_dual_result(results)
+                    and not early_stopped
+                    and operator_break_action is None
+                ):
+                    best_frame = best_dual_settings(results, fallback_candidates[0])
+                    run_dual_sequence(
+                        "DUAL FLOW DISCOVERY",
+                        "DUAL FLOW DISCOVERY",
+                        dual_flow_candidates_for_frame(best_frame),
+                    )
 
     elapsed_sec = time.monotonic() - scan_started
     completed_at = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -6998,8 +7096,10 @@ def run_dual_bank_scan(
         "options": dataclass_to_jsonable(options),
         "phase0_dual_baud_liveness": dataclass_to_jsonable(phase0_report),
         "completed_candidates": len(results),
-        "candidate_count": len(full_candidates),
-        "staged_candidate_count": len(staged_preview_candidates),
+        "candidate_count": candidate_total,
+        "full_frame_candidate_count": len(full_candidates),
+        "staged_candidate_count": staged_total,
+        "dual_flow_discovery_enabled": dual_flow_discovery_enabled,
         "full_matrix_ran": full_matrix_ran,
         "full_matrix_skipped": full_matrix_skipped,
         "early_stopped": early_stopped,
@@ -7025,7 +7125,7 @@ def run_dual_bank_scan(
     print_dual_ranked_table(results, options.top)
     print_dual_scan_summary(
         results=results,
-        total_candidates=len(full_candidates),
+        total_candidates=candidate_total,
         elapsed_sec=elapsed_sec,
         early_stopped=early_stopped,
         top=options.top,
@@ -7056,9 +7156,9 @@ def run_dual_bank_scan(
     if options.auto_validate_flow_control:
         print()
         print_report_title("DUAL FLOW CONTROL NOTE")
-        print("FLOW CONTROL IS NOT MIXED INTO DUAL FRAME DISCOVERY.")
-        print("AFTER THE FRAME PAIR IS KNOWN, USE MEMORY TEST OR A DEDICATED")
-        print("OUTPUT-SIDE HANDSHAKE TEST FOR THE RECOMMENDED PAIR.")
+        print("FLOW CONTROL WAS INCLUDED AFTER THE BEST DUAL FRAME PAIR.")
+        print("INPUT FLOW IS THE PC TRANSMIT SIDE INTO THE BUFFER.")
+        print("OUTPUT FLOW IS THE PC RECEIVE SIDE FROM THE BUFFER.")
         print(border_line(REPORT_WIDTH))
 
     write_dual_bank_text_report(
