@@ -28,24 +28,16 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 BAUD_RATES: list[int] = [
-    50,
     75,
-    100,
     110,
     150,
-    200,
     300,
     600,
     1200,
-    1800,
     2400,
-    3600,
     4800,
-    7200,
     9600,
-    14400,
     19200,
-    28800,
     38400,
 ]
 DATA_BITS: list[int] = [8, 7]
@@ -2740,7 +2732,7 @@ def default_scan_options() -> ScanOptions:
     return ScanOptions(
         in_port="COM1",
         out_port="COM5",
-        min_baud=50,
+        min_baud=75,
         max_baud=38400,
         payload_bytes=DEFAULT_PAYLOAD_BYTES,
         read_timeout=DEFAULT_READ_TIMEOUT,
