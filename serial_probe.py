@@ -64,6 +64,10 @@ FLOW_VALIDATE_PAYLOAD_BYTES = 1024
 FLOW_VALIDATE_READ_TIMEOUT = 2.0
 FLOW_VALIDATE_HOLD_SECONDS = 1.0
 FLOW_VALIDATE_RELEASE_SETTLE_SECONDS = 0.15
+RECEIVE_DEADLINE_SAFETY_FACTOR = 2.0
+RECEIVE_DEADLINE_MARGIN_SECONDS = 2.0
+DEFAULT_BANK2_JOB_TIMEOUT_OBSERVE_SECONDS = 10.0
+BANK2_BEHAVIOR_MAX_TIED_TARGETS = 3
 TURBO_SETTLE_MS = 10
 TURBO_PRE_DRAIN_TIMEOUT = 0.25
 TURBO_PRE_DRAIN_QUIET = 0.05
@@ -468,6 +472,25 @@ class FlowControlValidationResult:
 
 
 @dataclass(frozen=True)
+class Bank2BehaviorProbeResult:
+    """Byte-level printer-job behavior observation for one Bank 2 probe."""
+
+    name: str
+    settings: SerialSettings | DualSerialSettings
+    bytes_sent: int
+    bytes_received: int
+    exact_match: bool
+    form_feed_inserted: bool
+    cr_lf_changed: bool
+    received_preview_ascii: str
+    received_preview_hex: str
+    status: str
+    reason: str
+    error: str | None
+    elapsed_sec: float
+
+
+@dataclass(frozen=True)
 class Bank2CharacterizationResult:
     """Append-only result block for one second-bank switch state."""
 
@@ -476,9 +499,11 @@ class Bank2CharacterizationResult:
     ascii_results: list[CandidateResult]
     eight_bit_results: list[CandidateResult]
     flow_results: list[FlowControlValidationResult]
+    behavior_results: list[Bank2BehaviorProbeResult]
     stale_data_seen: bool
     conclusion: str
     run_id: str
+    flow_skip_reason: str | None = None
 
 
 def fnv1a32(data: bytes) -> int:
@@ -1155,10 +1180,33 @@ def serial_constants(serial_module: Any, settings: SerialSettings) -> dict[str, 
     }
 
 
-def estimated_frame_bits(settings: SerialSettings | DualSerialSettings) -> float:
-    """Estimate serial frame width in bits per transmitted byte."""
+def transmit_side_settings(
+    settings: SerialSettings | DualSerialSettings,
+) -> SerialSettings:
+    """Return the settings used to write into the buffer input side."""
+    if isinstance(settings, DualSerialSettings):
+        return settings.input_settings
+    return settings
+
+
+def receive_side_settings(
+    settings: SerialSettings | DualSerialSettings,
+) -> SerialSettings:
+    """Return the settings used to read from the buffer output side."""
+    if isinstance(settings, DualSerialSettings):
+        return settings.output_settings
+    return settings
+
+
+def serial_frame_bits(settings: SerialSettings) -> float:
+    """Estimate serial frame width in bits per byte for one concrete setting."""
     parity_bits = 0 if settings.parity == "none" else 1
     return 1 + settings.data_bits + parity_bits + settings.stop_bits
+
+
+def estimated_frame_bits(settings: SerialSettings | DualSerialSettings) -> float:
+    """Estimate transmit-side serial frame width in bits per byte."""
+    return serial_frame_bits(transmit_side_settings(settings))
 
 
 def estimated_buffer_drain_seconds(
@@ -1167,13 +1215,20 @@ def estimated_buffer_drain_seconds(
     safety_factor: float = 1.2,
 ) -> float:
     """Estimate full FIFO drain time for a byte count at the selected frame."""
-    seconds = (buffer_bytes * estimated_frame_bits(settings)) / max(settings.baud, 1)
+    receive_settings = receive_side_settings(settings)
+    seconds = (
+        buffer_bytes * serial_frame_bits(receive_settings)
+    ) / max(receive_settings.baud, 1)
     return seconds * max(safety_factor, 0.0)
 
 
 def write_chunk_size(settings: SerialSettings | DualSerialSettings) -> int:
     """Choose a write chunk size that behaves well at very low baud rates."""
-    bytes_per_second = max(1.0, settings.baud / estimated_frame_bits(settings))
+    transmit_settings = transmit_side_settings(settings)
+    bytes_per_second = max(
+        1.0,
+        transmit_settings.baud / serial_frame_bits(transmit_settings),
+    )
     quarter_second = int(bytes_per_second * 0.25)
     return max(8, min(2048, quarter_second))
 
@@ -1199,6 +1254,25 @@ def reset_serial_buffers(serial_port: Any) -> None:
     """Best-effort reset of serial input and output buffers."""
     serial_port.reset_input_buffer()
     serial_port.reset_output_buffer()
+
+
+def modem_line_snapshot(serial_port: Any) -> dict[str, bool]:
+    """Best-effort modem-control and status line snapshot for a serial port."""
+    snapshot: dict[str, bool] = {}
+    for name in ("cts", "dsr", "cd", "ri", "rts", "dtr"):
+        try:
+            snapshot[name] = bool(getattr(serial_port, name))
+        except Exception:
+            snapshot[name] = False
+    return snapshot
+
+
+def modem_line_snapshot_label(snapshot: dict[str, bool]) -> str:
+    """Return compact modem-line state text for logs and progress output."""
+    return " ".join(
+        f"{name.upper()}={1 if snapshot.get(name, False) else 0}"
+        for name in ("cts", "dsr", "cd", "ri", "rts", "dtr")
+    )
 
 
 def preview_ascii(data: bytes, limit: int = 96) -> str:
@@ -1386,7 +1460,21 @@ def estimated_transmit_seconds(
     byte_count: int,
 ) -> float:
     """Estimate physical transmit time for byte_count at candidate settings."""
-    return (byte_count * estimated_frame_bits(settings)) / max(settings.baud, 1)
+    transmit_settings = transmit_side_settings(settings)
+    return (
+        byte_count * serial_frame_bits(transmit_settings)
+    ) / max(transmit_settings.baud, 1)
+
+
+def estimated_receive_seconds(
+    settings: SerialSettings | DualSerialSettings,
+    byte_count: int,
+) -> float:
+    """Estimate output-side receive time for byte_count at candidate settings."""
+    receive_settings = receive_side_settings(settings)
+    return (
+        byte_count * serial_frame_bits(receive_settings)
+    ) / max(receive_settings.baud, 1)
 
 
 def zero_timing_breakdown() -> TimingBreakdown:
@@ -1681,6 +1769,8 @@ def execute_burst(
         f"[{candidate_index:04d}/{candidate_total:04d} {settings.label()}] "
         f"TEST {burst_index}/{burst_total}"
     )
+    transmit_settings = transmit_side_settings(settings)
+    receive_settings = receive_side_settings(settings)
     chunk_size = write_chunk_size(settings)
 
     setup_started = time.monotonic()
@@ -1787,7 +1877,7 @@ def execute_burst(
     if progress:
         estimated = estimated_transmit_seconds(settings, len(expected))
         progress(
-            f"{prefix}: SEND {len(expected)} BYTES ON {settings.label()} "
+            f"{prefix}: SEND {len(expected)} BYTES ON {transmit_settings.label()} "
             f"(CHUNK={chunk_size}, ABOUT {format_duration(estimated)})"
         )
     try:
@@ -1823,10 +1913,21 @@ def execute_burst(
     if progress:
         progress(
             f"{prefix}: WRITE DONE, SENT={bytes_sent}; "
-            f"WAIT {read_timeout:.2f}S QUIET ON {settings.label()}"
+            f"WAIT {read_timeout:.2f}S QUIET ON {receive_settings.label()}"
         )
 
-    wait_deadline = time.monotonic() + max(read_timeout + (settle_ms / 1000.0) + 2.0, 2.0)
+    receive_estimate = estimated_receive_seconds(settings, len(expected))
+    wait_limit = max(
+        read_timeout + (settle_ms / 1000.0) + RECEIVE_DEADLINE_MARGIN_SECONDS,
+        (
+            receive_estimate * RECEIVE_DEADLINE_SAFETY_FACTOR
+            + read_timeout
+            + (settle_ms / 1000.0)
+            + RECEIVE_DEADLINE_MARGIN_SECONDS
+        ),
+        2.0,
+    )
+    wait_deadline = time.monotonic() + wait_limit
     next_wait_progress_at = time.monotonic() + progress_interval
     read_wait_started = time.monotonic()
     while reader_thread.is_alive():
@@ -2224,7 +2325,7 @@ def run_dual_candidate(
     output_settings = settings.output_settings
     effective_timing = effective_discovery_timing(
         options,
-        input_settings,
+        output_settings,
         payload.byte_count,
     )
     logger.info("dual candidate %s/%s: %s", index, total, settings.label())
@@ -2456,6 +2557,15 @@ def frame_label(settings: SerialSettings | DualSerialSettings) -> str:
     return f"{settings.data_bits}{settings.parity_code()}{settings.stop_bits}"
 
 
+def frame_or_pair_label(settings: SerialSettings | DualSerialSettings) -> str:
+    """Return one frame label or a compact input/output frame pair label."""
+    if isinstance(settings, DualSerialSettings):
+        input_frame = frame_label(settings.input_settings)
+        output_frame = frame_label(settings.output_settings)
+        return f"IN {input_frame} -> OUT {output_frame}"
+    return frame_label(settings)
+
+
 def clean_ascii_transfer(result: CandidateResult) -> bool:
     """Return True when a result proves byte transfer but not necessarily frame."""
     if result.error or result.status in STALE_STATUSES:
@@ -2474,7 +2584,7 @@ def frame_ambiguity_lines(results: Sequence[CandidateResult]) -> list[str]:
     near_best = [
         result for result in clean if (best_score - result.score) <= TIE_SCORE_TOLERANCE
     ]
-    frames = sorted({frame_label(result.settings) for result in near_best})
+    frames = sorted({frame_or_pair_label(result.settings) for result in near_best})
     flows = sorted({result.settings.flow_control for result in near_best})
     stop_bits = sorted({result.settings.stop_bits for result in near_best})
     parities = sorted({result.settings.parity for result in near_best})
@@ -4224,7 +4334,7 @@ def write_payload_only(
 
 def read_until_quiet(
     out_serial: Any,
-    settings: SerialSettings,
+    settings: SerialSettings | DualSerialSettings,
     expected_bytes: int,
     read_timeout: float,
     progress_interval: float,
@@ -4237,7 +4347,7 @@ def read_until_quiet(
     last_data_time = time.monotonic()
     read_timeout = max(read_timeout, 0.1)
     max_seconds = max(
-        estimated_transmit_seconds(settings, expected_bytes) * 2.0 + read_timeout + 10.0,
+        estimated_receive_seconds(settings, expected_bytes) * 2.0 + read_timeout + 10.0,
         read_timeout + 10.0,
     )
     deadline = started + max_seconds
@@ -4584,10 +4694,30 @@ def run_flow_control_pause_validation(
                             metrics=empty_score.metrics,
                         )
 
+                before_hold_lines = modem_line_snapshot(out_serial)
+                logger.debug(
+                    "%s modem lines before hold: %s",
+                    prefix,
+                    before_hold_lines,
+                )
+                console_progress(
+                    f"{prefix}: LINES BEFORE HOLD "
+                    f"{modem_line_snapshot_label(before_hold_lines)}"
+                )
                 console_progress(f"{prefix}: ASSERT {flow_control.upper()} HOLD")
                 apply_flow_control_hold(out_serial, flow_control)
                 hold_applied = True
                 time.sleep(FLOW_VALIDATE_RELEASE_SETTLE_SECONDS)
+                after_hold_lines = modem_line_snapshot(out_serial)
+                logger.debug(
+                    "%s modem lines after hold: %s",
+                    prefix,
+                    after_hold_lines,
+                )
+                console_progress(
+                    f"{prefix}: LINES AFTER HOLD "
+                    f"{modem_line_snapshot_label(after_hold_lines)}"
+                )
 
                 bytes_sent, write_error, _write_elapsed = write_payload_only(
                     in_serial=in_serial,
@@ -4597,6 +4727,16 @@ def run_flow_control_pause_validation(
                     prefix=prefix,
                     logger=logger,
                 )
+                after_write_lines = modem_line_snapshot(out_serial)
+                logger.debug(
+                    "%s modem lines after write: %s",
+                    prefix,
+                    after_write_lines,
+                )
+                console_progress(
+                    f"{prefix}: LINES AFTER WRITE "
+                    f"{modem_line_snapshot_label(after_write_lines)}"
+                )
                 held_bytes, hold_error, _hold_elapsed = read_for_fixed_window(
                     out_serial=out_serial,
                     seconds=FLOW_VALIDATE_HOLD_SECONDS,
@@ -4604,10 +4744,30 @@ def run_flow_control_pause_validation(
                     prefix=prefix,
                     logger=logger,
                 )
+                before_release_lines = modem_line_snapshot(out_serial)
+                logger.debug(
+                    "%s modem lines before release: %s",
+                    prefix,
+                    before_release_lines,
+                )
+                console_progress(
+                    f"{prefix}: LINES BEFORE RELEASE "
+                    f"{modem_line_snapshot_label(before_release_lines)}"
+                )
                 console_progress(f"{prefix}: RELEASE {flow_control.upper()} HOLD")
                 release_flow_control_hold(out_serial, flow_control)
                 hold_applied = False
                 time.sleep(FLOW_VALIDATE_RELEASE_SETTLE_SECONDS)
+                after_release_lines = modem_line_snapshot(out_serial)
+                logger.debug(
+                    "%s modem lines after release: %s",
+                    prefix,
+                    after_release_lines,
+                )
+                console_progress(
+                    f"{prefix}: LINES AFTER RELEASE "
+                    f"{modem_line_snapshot_label(after_release_lines)}"
+                )
 
                 release_bytes, read_error, _read_elapsed = read_until_quiet(
                     out_serial=out_serial,
@@ -4934,7 +5094,11 @@ def bank2_frame_serial_settings(baud: int) -> list[SerialSettings]:
         (8, "odd", 1),
         (7, "none", 1),
         (7, "even", 2),
+        (7, "odd", 2),
+        (7, "none", 2),
         (8, "none", 2),
+        (8, "even", 2),
+        (8, "odd", 2),
     ]
     return [
         SerialSettings(
@@ -4951,15 +5115,18 @@ def bank2_frame_serial_settings(baud: int) -> list[SerialSettings]:
 def bank2_frame_candidates(
     input_baud: int,
     output_baud: int,
+    independent_frames: bool = True,
 ) -> list[SerialSettings | DualSerialSettings]:
     """Return targeted frame candidates for known same-baud or baud-pair tests."""
     input_frames = bank2_frame_serial_settings(input_baud)
-    if input_baud == output_baud:
+    independent_frames = independent_frames or input_baud != output_baud
+    if not independent_frames and input_baud == output_baud:
         return list(input_frames)
     output_frames = bank2_frame_serial_settings(output_baud)
     return [
         DualSerialSettings(input_settings=input_frame, output_settings=output_frame)
-        for input_frame, output_frame in zip(input_frames, output_frames)
+        for input_frame in input_frames
+        for output_frame in output_frames
     ]
 
 
@@ -5002,7 +5169,7 @@ def ascii_pass_frame_labels(results: Sequence[CandidateResult]) -> list[str]:
     for result in results:
         if not clean_ascii_transfer(result):
             continue
-        label = frame_label(result.settings)
+        label = frame_or_pair_label(result.settings)
         if label not in labels:
             labels.append(label)
     return labels
@@ -5049,27 +5216,680 @@ def bank2_flow_summary(results: Sequence[FlowControlValidationResult]) -> str:
     return flow_control_validation_recommendation(results)
 
 
+def same_baud_frame(left: SerialSettings, right: SerialSettings) -> bool:
+    """Return True when two concrete settings use the same baud and frame."""
+    return (
+        left.baud == right.baud
+        and left.data_bits == right.data_bits
+        and left.parity == right.parity
+        and left.stop_bits == right.stop_bits
+    )
+
+
+def compact_label_list(labels: Sequence[str], limit: int = 10) -> str:
+    """Return a compact comma list with an old-terminal friendly overflow note."""
+    unique: list[str] = []
+    for label in labels:
+        if label not in unique:
+            unique.append(label)
+    if not unique:
+        return "(NONE)"
+    shown = unique[: max(limit, 1)]
+    suffix = f" +{len(unique) - len(shown)} MORE" if len(unique) > len(shown) else ""
+    return ", ".join(shown) + suffix
+
+
+def bank2_settings_same_frame(settings: SerialSettings | DualSerialSettings) -> bool:
+    """Return True when a Bank 2 setting uses the same baud/frame on both sides."""
+    if not isinstance(settings, DualSerialSettings):
+        return True
+    return same_baud_frame(settings.input_settings, settings.output_settings)
+
+
+def is_8e1(settings: SerialSettings) -> bool:
+    """Return True for the observed all-off baseline frame."""
+    return (
+        settings.data_bits == 8
+        and settings.parity == "even"
+        and settings.stop_bits == 1
+    )
+
+
+def is_eight_bit_clean_result(result: CandidateResult) -> bool:
+    """Return True when the high-bit challenge was byte-clean."""
+    if result.error or result.status in STALE_STATUSES:
+        return False
+    return (
+        result.score >= 99.0
+        and result.metrics.high_bit_bytes_sent > 0
+        and result.metrics.high_bit_exact_ratio >= 1.0
+    )
+
+
+def bank2_eight_bit_clean_results(
+    results: Sequence[CandidateResult],
+) -> list[CandidateResult]:
+    """Return Bank 2 high-bit-clean candidates."""
+    return [result for result in results if is_eight_bit_clean_result(result)]
+
+
+def bank2_side_frame_labels(
+    results: Sequence[CandidateResult],
+    side: str,
+) -> list[str]:
+    """Return ordered input or output frame labels from result settings."""
+    labels: list[str] = []
+    for result in results:
+        if side == "input":
+            settings = transmit_side_settings(result.settings)
+        elif side == "output":
+            settings = receive_side_settings(result.settings)
+        else:
+            raise ValueError(f"unknown side {side!r}")
+        label = frame_label(settings)
+        if label not in labels:
+            labels.append(label)
+    return labels
+
+
+def bank2_compact_result_summary(
+    results: Sequence[CandidateResult],
+    label_limit: int = 10,
+) -> str:
+    """Return compact human-readable settings evidence for Bank 2 reports."""
+    if not results:
+        return "(NONE)"
+    labels = [frame_or_pair_label(result.settings) for result in results]
+    if any(isinstance(result.settings, DualSerialSettings) for result in results):
+        input_frames = bank2_side_frame_labels(results, "input")
+        output_frames = bank2_side_frame_labels(results, "output")
+        return (
+            f"{len(labels)} PAIR(S); "
+            f"IN {compact_label_list(input_frames, label_limit)}; "
+            f"OUT {compact_label_list(output_frames, label_limit)}"
+        )
+    return compact_label_list(labels, label_limit)
+
+
+def bank2_ascii_pass_summary(results: Sequence[CandidateResult]) -> str:
+    """Return a compact summary of clean ASCII Bank 2 transfer candidates."""
+    clean = [result for result in results if clean_ascii_transfer(result)]
+    return bank2_compact_result_summary(clean)
+
+
+def bank2_eight_bit_detail_summary(results: Sequence[CandidateResult]) -> str:
+    """Return a compact summary of high-bit Bank 2 transfer candidates."""
+    clean = bank2_eight_bit_clean_results(results)
+    if clean:
+        return "8-BIT CLEAN; " + bank2_compact_result_summary(clean, label_limit=8)
+    return eight_bit_result_summary(results)
+
+
+def bank2_target_sort_key(result: CandidateResult) -> tuple[bool, bool, bool, bool, bool, bool, bool, float, float, float, int]:
+    """Return a stable preference key for Bank 2 follow-up targets."""
+    transmit = transmit_side_settings(result.settings)
+    receive = receive_side_settings(result.settings)
+    same_frame = bank2_settings_same_frame(result.settings)
+    baseline = same_frame and is_8e1(transmit) and is_8e1(receive)
+    return (
+        not result.error and result.status not in STALE_STATUSES,
+        is_eight_bit_clean_result(result),
+        is_recommendable_result(result),
+        same_frame,
+        baseline,
+        is_8e1(transmit),
+        is_8e1(receive),
+        result.score,
+        result.metrics.line_integrity_ratio,
+        result.metrics.exact_byte_match_ratio,
+        -result.index,
+    )
+
+
+def best_bank2_followup_target(
+    ascii_results: Sequence[CandidateResult],
+    eight_bit_results: Sequence[CandidateResult],
+) -> CandidateResult | None:
+    """Return the best Bank 2 target for raw probes and same-frame flow validation."""
+    sources = [
+        bank2_eight_bit_clean_results(eight_bit_results),
+        likely_bank2_ascii_results(ascii_results),
+        list(ascii_results),
+    ]
+    for source in sources:
+        eligible = [
+            result
+            for result in source
+            if not result.error and result.status not in STALE_STATUSES
+        ]
+        if eligible:
+            return sorted(eligible, key=bank2_target_sort_key, reverse=True)[0]
+    return None
+
+
+def best_bank2_ascii_target(
+    results: Sequence[CandidateResult],
+) -> CandidateResult | None:
+    """Return the best likely Bank 2 ASCII target for follow-up probes."""
+    likely = likely_bank2_ascii_results(results)
+    source = likely or list(results)
+    if not source:
+        return None
+    return sorted(source, key=result_sort_key, reverse=True)[0]
+
+
+def bank2_behavior_targets(
+    ascii_results: Sequence[CandidateResult],
+    eight_bit_results: Sequence[CandidateResult],
+) -> list[CandidateResult]:
+    """Return a small target set for optional raw behavior probes."""
+    clean_8bit = bank2_eight_bit_clean_results(eight_bit_results)
+    if clean_8bit:
+        ranked = sorted(clean_8bit, key=bank2_target_sort_key, reverse=True)
+        if len(ranked) <= BANK2_BEHAVIOR_MAX_TIED_TARGETS:
+            return ranked
+        return ranked[:1]
+    likely = likely_bank2_ascii_results(ascii_results)
+    if not likely:
+        return []
+    ranked = sorted(likely, key=bank2_target_sort_key, reverse=True)
+    if len(ranked) <= BANK2_BEHAVIOR_MAX_TIED_TARGETS:
+        return ranked
+    return ranked[:1]
+
+
+def bank2_flow_skip_reason(
+    target: CandidateResult | None,
+    input_baud: int,
+    output_baud: int,
+) -> str | None:
+    """Return a conservative Bank 2 flow-validation skip reason, if any."""
+    if input_baud != output_baud:
+        return (
+            "Known input/output baud differs and current flow "
+            "validation supports same-frame settings only"
+        )
+    if target is None or not isinstance(target.settings, DualSerialSettings):
+        return None
+    if same_baud_frame(
+        target.settings.input_settings,
+        target.settings.output_settings,
+    ):
+        return None
+    return (
+        "Best observed frame is dual/asymmetric and current "
+        "flow validation supports same-frame settings only"
+    )
+
+
+def bank2_flow_validation_seed(
+    target: CandidateResult | None,
+) -> list[CandidateResult]:
+    """Return a same-frame seed row for existing flow validation."""
+    if target is None:
+        return []
+    if isinstance(target.settings, DualSerialSettings):
+        return [dataclasses.replace(target, settings=target.settings.input_settings)]
+    return [target]
+
+
+def bank2_behavior_marker(
+    run_id: str,
+    target_index: int,
+    probe_name: str,
+    switch_hash: str | None,
+) -> bytes:
+    """Return a unique marker embedded in raw Bank 2 behavior payloads."""
+    note = f" NOTE={switch_hash}" if switch_hash else ""
+    marker = (
+        f"<<<BANK2_RAW RUN={sanitize_nonce_value(run_id or make_run_id('B2R'))} "
+        f"CAND=B2T{target_index:02d} PROBE={sanitize_nonce_value(probe_name)}"
+        f"{note}>>>"
+    )
+    return marker.encode("ascii")
+
+
+def bank2_behavior_probe_payloads(
+    run_id: str,
+    target_index: int,
+    switch_hash: str | None,
+) -> list[tuple[str, bytes]]:
+    """Return the small raw byte payload set for Bank 2 behavior probing."""
+    payloads: list[tuple[str, bytes]] = []
+    for name, separator in (
+        ("CR_ONLY", b"\r"),
+        ("LF_ONLY", b"\n"),
+        ("CRLF", b"\r\n"),
+    ):
+        marker = bank2_behavior_marker(run_id, target_index, name, switch_hash)
+        payloads.append(
+            (
+                name,
+                separator.join(
+                    [
+                        marker,
+                        b"LINE=ONE",
+                        b"LINE=TWO",
+                        b"END=RAW-BEHAVIOR",
+                    ]
+                )
+                + separator,
+            )
+        )
+    marker = bank2_behavior_marker(run_id, target_index, "TIMEOUT_FF", switch_hash)
+    payloads.append(
+        (
+            "TIMEOUT_FF",
+            marker + b"\r\nSHORT-JOB=TRUE\r\nWAITING-FOR-TIMEOUT\r\n",
+        )
+    )
+    return payloads
+
+
+def cr_lf_change_observed(sent: bytes, received: bytes) -> bool:
+    """Return True when byte differences look like CR/LF conversion."""
+    if sent == received or not received:
+        return False
+    sent_without = sent.replace(b"\r", b"").replace(b"\n", b"")
+    received_without = received.replace(b"\r", b"").replace(b"\n", b"")
+    if sent_without == received_without and (
+        sent.count(b"\r") != received.count(b"\r")
+        or sent.count(b"\n") != received.count(b"\n")
+    ):
+        return True
+    normalize = lambda data: data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return normalize(sent) == normalize(received)
+
+
+def classify_bank2_behavior_bytes(
+    sent: bytes,
+    received: bytes,
+    error: str | None = None,
+) -> tuple[bool, bool, bool, str, str]:
+    """Classify one raw behavior probe without assigning DIP-switch meaning."""
+    exact_match = received == sent
+    form_feed_inserted = b"\x0c" in received and b"\x0c" not in sent
+    cr_lf_changed = cr_lf_change_observed(sent, received)
+    if error:
+        return exact_match, form_feed_inserted, cr_lf_changed, "error", error
+    if not received:
+        return exact_match, form_feed_inserted, cr_lf_changed, "no-data", "NO DATA RECEIVED."
+    if exact_match:
+        return exact_match, form_feed_inserted, cr_lf_changed, "exact", "EXACT BYTE MATCH."
+    if form_feed_inserted and cr_lf_changed:
+        return (
+            exact_match,
+            form_feed_inserted,
+            cr_lf_changed,
+            "transformed",
+            "FORM FEED AND CR/LF BYTE CHANGES OBSERVED.",
+        )
+    if form_feed_inserted:
+        return (
+            exact_match,
+            form_feed_inserted,
+            cr_lf_changed,
+            "transformed",
+            "FORM FEED BYTE OBSERVED IN OUTPUT.",
+        )
+    if cr_lf_changed:
+        return (
+            exact_match,
+            form_feed_inserted,
+            cr_lf_changed,
+            "transformed",
+            "CR/LF BYTE CHANGE OBSERVED.",
+        )
+    if len(received) < len(sent):
+        return exact_match, form_feed_inserted, cr_lf_changed, "partial", "PARTIAL OUTPUT."
+    return exact_match, form_feed_inserted, cr_lf_changed, "transformed", "OUTPUT BYTES DIFFER."
+
+
+def write_raw_bytes_only(
+    in_serial: Any,
+    settings: SerialSettings | DualSerialSettings,
+    data: bytes,
+    progress_interval: float,
+    prefix: str,
+    logger: logging.Logger,
+) -> tuple[int, str | None, float]:
+    """Write raw bytes without applying probe-payload scoring."""
+    started = time.monotonic()
+    chunk_size = write_chunk_size(settings)
+    bytes_sent = 0
+    error: str | None = None
+    estimated = estimated_transmit_seconds(settings, len(data))
+    console_progress(
+        f"{prefix}: SEND RAW {len(data)} BYTES "
+        f"(CHUNK={chunk_size}, ABOUT {format_duration(estimated)})"
+    )
+    try:
+        next_progress_at = time.monotonic() + max(progress_interval, 0.1)
+        while bytes_sent < len(data):
+            chunk = data[bytes_sent : bytes_sent + chunk_size]
+            written = in_serial.write(chunk)
+            if written is None:
+                written = len(chunk)
+            if written <= 0:
+                raise RuntimeError("serial write returned zero bytes")
+            bytes_sent += int(written)
+            now = time.monotonic()
+            if now >= next_progress_at:
+                percent = (bytes_sent / len(data)) * 100.0
+                console_progress(
+                    f"{prefix}: WRITING RAW {bytes_sent}/{len(data)} BYTES "
+                    f"({percent:5.1f}%)"
+                )
+                next_progress_at = now + max(progress_interval, 0.1)
+        in_serial.flush()
+    except Exception as exc:  # pyserial raises driver-specific subclasses.
+        error = str(exc)
+        logger.debug("%s raw write failed: %s", prefix, error)
+    return bytes_sent, error, time.monotonic() - started
+
+
+def run_bank2_behavior_probe(
+    serial_module: Any,
+    index: int,
+    total: int,
+    name: str,
+    settings: SerialSettings | DualSerialSettings,
+    options: ScanOptions,
+    payload: bytes,
+    observe_seconds: float,
+    logger: logging.Logger,
+) -> Bank2BehaviorProbeResult:
+    """Run one raw Bank 2 printer-job behavior probe."""
+    started = time.monotonic()
+    transmit_settings = transmit_side_settings(settings)
+    receive_settings = receive_side_settings(settings)
+    read_timeout = max(options.read_timeout, 0.5)
+    quiet_seconds = observe_seconds if name == "TIMEOUT_FF" else read_timeout
+    prefix = f"[B2 RAW {index:02d}/{total:02d} {name} {settings.label()}]"
+    received = b""
+    bytes_sent = 0
+    error: str | None = None
+    try:
+        console_progress(border_line(PROGRESS_WIDTH))
+        console_progress(
+            bordered_text(
+                f"BANK 2 RAW {index}/{total} {name}",
+                PROGRESS_WIDTH,
+            )
+        )
+        console_progress(border_line(PROGRESS_WIDTH))
+        with open_serial_port(
+            serial_module,
+            options.out_port,
+            receive_settings,
+            quiet_seconds,
+        ) as out_serial:
+            with open_serial_port(
+                serial_module,
+                options.in_port,
+                transmit_settings,
+                read_timeout,
+            ) as in_serial:
+                reset_serial_buffers(out_serial)
+                reset_serial_buffers(in_serial)
+                time.sleep(options.settle_ms / 1000.0)
+
+                if not options.no_pre_drain:
+                    drain = drain_output_until_quiet(
+                        out_serial=out_serial,
+                        quiet_seconds=options.pre_drain_quiet,
+                        max_seconds=max(
+                            options.pre_drain_timeout,
+                            estimated_receive_seconds(settings, len(payload))
+                            + options.pre_drain_quiet,
+                        ),
+                        max_bytes=options.max_drain_bytes,
+                        progress_interval=options.progress_interval,
+                        progress=console_progress,
+                        prefix=prefix,
+                        logger=logger,
+                    )
+                    if not drain.quiet:
+                        error = (
+                            "OUTPUT DID NOT GO QUIET BEFORE RAW PROBE "
+                            f"(REASON={drain.reason.upper()}, "
+                            f"CLEARED={drain.bytes_drained})"
+                        )
+
+                if error is None:
+                    bytes_sent, write_error, _write_elapsed = write_raw_bytes_only(
+                        in_serial=in_serial,
+                        settings=settings,
+                        data=payload,
+                        progress_interval=options.progress_interval,
+                        prefix=prefix,
+                        logger=logger,
+                    )
+                    received, read_error, _read_elapsed = read_until_quiet(
+                        out_serial=out_serial,
+                        settings=settings,
+                        expected_bytes=len(payload),
+                        read_timeout=quiet_seconds,
+                        progress_interval=options.progress_interval,
+                        prefix=prefix,
+                        logger=logger,
+                    )
+                    error = write_error or read_error
+    except Exception as exc:
+        logger.exception("Bank 2 behavior probe failed for %s %s", name, settings.label())
+        error = str(exc)
+
+    exact, form_feed, cr_lf, status, reason = classify_bank2_behavior_bytes(
+        payload,
+        received,
+        error,
+    )
+    result = Bank2BehaviorProbeResult(
+        name=name,
+        settings=settings,
+        bytes_sent=bytes_sent,
+        bytes_received=len(received),
+        exact_match=exact,
+        form_feed_inserted=form_feed,
+        cr_lf_changed=cr_lf,
+        received_preview_ascii=preview_ascii(received),
+        received_preview_hex=preview_hex(received),
+        status=status,
+        reason=reason,
+        error=error,
+        elapsed_sec=time.monotonic() - started,
+    )
+    logger.info(
+        "Bank 2 behavior %s %s: status=%s sent=%s read=%s exact=%s ff=%s crlf=%s reason=%s error=%s",
+        name,
+        settings.label(),
+        result.status,
+        result.bytes_sent,
+        result.bytes_received,
+        result.exact_match,
+        result.form_feed_inserted,
+        result.cr_lf_changed,
+        result.reason,
+        result.error,
+    )
+    logger.debug(
+        "Bank 2 behavior %s preview ascii=%r hex=%s",
+        name,
+        result.received_preview_ascii,
+        result.received_preview_hex,
+    )
+    return result
+
+
+def format_bank2_behavior_progress(
+    result: Bank2BehaviorProbeResult,
+    index: int,
+    total: int,
+) -> str:
+    """Return one compact console line for a raw behavior probe."""
+    frame_text = frame_or_pair_label(result.settings)[:24]
+    flags = []
+    if result.exact_match:
+        flags.append("EXACT")
+    if result.form_feed_inserted:
+        flags.append("FF")
+    if result.cr_lf_changed:
+        flags.append("CRLF")
+    flag_text = ",".join(flags) if flags else "-"
+    return (
+        f"RAW [{index:02d}/{total:02d}] {result.status.upper():<11} "
+        f"{frame_text:24s} "
+        f"SENT={result.bytes_sent:4d} READ={result.bytes_received:4d} "
+        f"FLAGS={flag_text:<10} {result.reason}"
+    )
+
+
+def run_bank2_behavior_probes(
+    serial_module: Any,
+    options: ScanOptions,
+    targets: Sequence[CandidateResult],
+    observe_seconds: float,
+    logger: logging.Logger,
+) -> list[Bank2BehaviorProbeResult]:
+    """Run optional raw Bank 2 behavior probes against a small target set."""
+    if not targets:
+        return []
+    print()
+    print_report_title("BANK 2 RAW JOB-BEHAVIOR PROBES")
+    print(f"TARGETS: {len(targets)} FOLLOW-UP FRAME(S).")
+    print(f"TIMEOUT OBSERVE WINDOW: {observe_seconds:.1f}S.")
+    print("BYTE-LEVEL OBSERVATIONS ONLY; COMPARE SWITCH-STATE REPORT BLOCKS.")
+    print(border_line(REPORT_WIDTH))
+    total = len(targets) * len(bank2_behavior_probe_payloads("COUNT", 1, None))
+    results: list[Bank2BehaviorProbeResult] = []
+    index = 0
+    for target_index, target in enumerate(targets, start=1):
+        payloads = bank2_behavior_probe_payloads(
+            options.run_id,
+            target_index,
+            switch_note_hash(options.switch_note),
+        )
+        for name, payload in payloads:
+            index += 1
+            result = run_bank2_behavior_probe(
+                serial_module=serial_module,
+                index=index,
+                total=total,
+                name=name,
+                settings=target.settings,
+                options=options,
+                payload=payload,
+                observe_seconds=observe_seconds,
+                logger=logger,
+            )
+            results.append(result)
+            print(format_bank2_behavior_progress(result, index, total), flush=True)
+    return results
+
+
+def bank2_behavior_summary(
+    results: Sequence[Bank2BehaviorProbeResult],
+) -> str:
+    """Return a concise summary of raw Bank 2 behavior observations."""
+    if not results:
+        return "NOT RUN"
+    if any(result.form_feed_inserted for result in results):
+        return "FORM FEED OBSERVED"
+    if any(result.cr_lf_changed for result in results):
+        return "CR/LF TRANSFORMATION OBSERVED"
+    if any(result.status == "transformed" for result in results):
+        return "RAW BYTE TRANSFORMATION OBSERVED"
+    if all(result.status == "exact" for result in results):
+        return "RAW BYTES EXACT"
+    if any(result.status == "no-data" for result in results):
+        return "RAW PROBE NO DATA OR PARTIAL"
+    if any(result.status == "error" for result in results):
+        return "RAW PROBE ERROR"
+    return "RAW BYTE BEHAVIOR INCONCLUSIVE"
+
+
+def bank2_behavior_report_lines(
+    results: Sequence[Bank2BehaviorProbeResult],
+) -> list[str]:
+    """Return compact raw behavior lines for reports."""
+    lines = [
+        "BEHAVIOR RESULT:",
+        f"SUMMARY:         {bank2_behavior_summary(results)}",
+        "",
+        "PROBE       STATUS      SENT  READ  EXACT FF CRLF FRAME/PAIR              REASON",
+        border_line(REPORT_WIDTH),
+    ]
+    if not results:
+        lines.append("(NOT RUN)")
+    for result in results:
+        lines.append(
+            f"{result.name:<11} "
+            f"{result.status:<11} "
+            f"{result.bytes_sent:>4} "
+            f"{result.bytes_received:>5} "
+            f"{'Y' if result.exact_match else 'N':<5} "
+            f"{'Y' if result.form_feed_inserted else 'N':<2} "
+            f"{'Y' if result.cr_lf_changed else 'N':<4} "
+            f"{frame_or_pair_label(result.settings)[:23]:<23} "
+            f"{result.reason[:24]}"
+        )
+    lines.extend(
+        [
+            "NOTE: RAW BEHAVIOR PROBES ARE BYTE-LEVEL OBSERVATIONS ONLY.",
+            "NOTE: SWITCH MEANING REQUIRES COMPARING MULTIPLE SWITCH-STATE BLOCKS.",
+            border_line(REPORT_WIDTH),
+        ]
+    )
+    return lines
+
+
 def bank2_conclusion(
     ascii_results: Sequence[CandidateResult],
     eight_bit_results: Sequence[CandidateResult],
     flow_results: Sequence[FlowControlValidationResult],
+    behavior_results: Sequence[Bank2BehaviorProbeResult],
 ) -> str:
     """Return compact conclusion text for a second-bank switch state."""
-    if stale_nonce_seen(ascii_results) or stale_nonce_seen(eight_bit_results):
-        return "Stale/wrong-nonce data detected"
+    stale_seen = stale_nonce_seen(ascii_results) or stale_nonce_seen(eight_bit_results)
+
+    def with_stale_warning(text: str) -> str:
+        if stale_seen:
+            return f"{text}; stale row seen"
+        return text
+
     pass_frames = ascii_pass_frame_labels(ascii_results)
     if not pass_frames:
-        return "No clean ASCII transfer observed"
+        return with_stale_warning("No clean ASCII transfer observed")
     eight_summary = eight_bit_result_summary(eight_bit_results)
-    if len(pass_frames) > 1:
-        return "Ambiguous; byte transfer does not distinguish these settings"
     if "NOT CLEAN" in eight_summary or "MASKED" in eight_summary:
-        return "ASCII transfer passes, but 8-bit path is not clean"
+        return with_stale_warning("ASCII transfer passes, but 8-bit path is not clean")
+    if any(result.form_feed_inserted for result in behavior_results):
+        return with_stale_warning(
+            "Form feed observed after timeout window; compare prior blocks"
+        )
+    if any(result.cr_lf_changed for result in behavior_results):
+        return with_stale_warning("CR/LF transformation observed; compare prior blocks")
+    if any(result.status == "transformed" for result in behavior_results):
+        return with_stale_warning(
+            "Raw byte behavior changed or transformed; compare prior blocks"
+        )
+    if bank2_eight_bit_clean_results(eight_bit_results):
+        if behavior_results and all(
+            result.status == "exact" for result in behavior_results
+        ):
+            return with_stale_warning("8-bit clean; raw bytes exact")
+        return with_stale_warning("8-bit path clean; frame still ambiguous")
+    if len(pass_frames) > 1:
+        return with_stale_warning(
+            "Ambiguous; byte transfer does not distinguish these settings"
+        )
     if any(result.status == "validated" for result in flow_results):
-        return "Flow behavior changed or was validated; compare prior blocks"
+        return with_stale_warning(
+            "Flow behavior changed or was validated; compare prior blocks"
+        )
     if not flow_results and not eight_bit_results:
-        return "ASCII frame unchanged; no 8-bit or flow phase run"
-    return "No observable change except listed byte-transfer evidence"
+        return with_stale_warning("ASCII frame unchanged; no 8-bit or flow phase run")
+    return with_stale_warning("No observable change except listed byte-transfer evidence")
 
 
 def write_bank2_text_report(
@@ -5079,7 +5899,17 @@ def write_bank2_text_report(
     """Append a concise second-bank characterization block."""
     path.parent.mkdir(parents=True, exist_ok=True)
     created = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-    pass_frames = ascii_pass_frame_labels(result.ascii_results)
+    ascii_summary = bank2_ascii_pass_summary(result.ascii_results)
+    eight_detail = bank2_eight_bit_detail_summary(result.eight_bit_results)
+    flow_summary = bank2_flow_summary(result.flow_results)
+    if result.flow_skip_reason:
+        flow_summary = f"SKIPPED: {result.flow_skip_reason}"
+    behavior_summary = bank2_behavior_summary(result.behavior_results)
+    target = best_bank2_followup_target(
+        result.ascii_results,
+        result.eight_bit_results,
+    )
+    target_label = frame_or_pair_label(target.settings) if target else "(NONE)"
     lines = [
         "",
         border_line(REPORT_WIDTH),
@@ -5089,29 +5919,45 @@ def write_bank2_text_report(
         f"RUN ID:          {result.run_id}",
         f"DIP NOTE:        {result.switch_note or '(NOT ENTERED)'}",
         f"KNOWN BAUD/PAIR: {result.known_baud_text}",
-        f"ASCII PASS:      {', '.join(pass_frames) if pass_frames else '(NONE)'}",
-        f"8-BIT RESULT:    {eight_bit_result_summary(result.eight_bit_results)}",
-        f"FLOW RESULT:     {bank2_flow_summary(result.flow_results)}",
+        f"ASCII PASS:      {ascii_summary}",
+        f"8-BIT RESULT:    {eight_detail}",
+        f"FOLLOW-UP FRAME: {target_label}",
+        f"FLOW RESULT:     {flow_summary}",
+        f"BEHAVIOR RESULT: {behavior_summary}",
         f"STALE DATA SEEN: {'YES' if result.stale_data_seen else 'NO'}",
         f"CONCLUSION:      {result.conclusion}",
         "",
         "TABLE:",
-        "DIP NOTE | KNOWN BAUD/PAIR | ASCII PASS FRAMES | 8-BIT RESULT | FLOW RESULT | STALE | CONCLUSION",
+        "DIP NOTE | KNOWN | ASCII SUMMARY | 8-BIT SUMMARY | RAW | FLOW | STALE | CONCLUSION",
         border_line(REPORT_WIDTH),
         (
             f"{result.switch_note or '(NOT ENTERED)'} | "
             f"{result.known_baud_text} | "
-            f"{', '.join(pass_frames) if pass_frames else '(NONE)'} | "
-            f"{eight_bit_result_summary(result.eight_bit_results)} | "
-            f"{bank2_flow_summary(result.flow_results)} | "
+            f"{ascii_summary} | "
+            f"{eight_detail} | "
+            f"{behavior_summary} | "
+            f"{flow_summary} | "
             f"{'YES' if result.stale_data_seen else 'NO'} | "
             f"{result.conclusion}"
         ),
         border_line(REPORT_WIDTH),
         "",
+        "EVIDENCE:",
+        f"  ASCII:          {ascii_summary}",
+        f"  8-BIT:          {eight_detail}",
+        f"  FOLLOW-UP:      {target_label}",
+        f"  RAW BYTES:      {behavior_summary}",
+        f"  FLOW:           {flow_summary}",
+        f"  STALE WARNING:  {'YES' if result.stale_data_seen else 'NO'}",
+        "",
+        *bank2_behavior_report_lines(result.behavior_results),
+        "",
         "INTERPRETATION:",
         "  FRAME PASS HERE MEANS CLEAN ASCII BYTE TRANSFER, NOT UNIQUE PARITY/STOP PROOF.",
+        "  8-BIT CLEAN IS STRONGER EVIDENCE FOR AN 8-BIT DATA PATH.",
         "  FLOW IS PROVEN ONLY WHEN THE HOLD/RELEASE VALIDATION CHANGES BEHAVIOR.",
+        "  BEHAVIOR PROBES OBSERVE BYTES ONLY; THEY DO NOT ASSIGN SWITCH MEANING.",
+        "  STALE WARNING MEANS ONE ROW HAD WRONG-RUN DATA; IT IS NOT A SWITCH MEANING.",
         "  COMPARE THIS APPENDED BLOCK TO OTHER SWITCH-NOTE BLOCKS MANUALLY.",
         border_line(REPORT_WIDTH),
     ]
@@ -5128,12 +5974,40 @@ def print_bank2_report(
     print_report_title("SECOND BANK CHARACTERIZATION")
     print_wrapped_value("  DIP NOTE:          ", result.switch_note or "(NOT ENTERED)")
     print(f"  KNOWN BAUD/PAIR:    {result.known_baud_text}")
-    print_wrapped_value(
-        "  ASCII PASS FRAMES:  ",
-        ", ".join(ascii_pass_frame_labels(result.ascii_results)) or "(NONE)",
+    target = best_bank2_followup_target(
+        result.ascii_results,
+        result.eight_bit_results,
     )
-    print_wrapped_value("  8-BIT RESULT:       ", eight_bit_result_summary(result.eight_bit_results))
-    print_wrapped_value("  FLOW RESULT:        ", bank2_flow_summary(result.flow_results))
+    print_wrapped_value("  ASCII PASS:        ", bank2_ascii_pass_summary(result.ascii_results))
+    print_wrapped_value(
+        "  8-BIT RESULT:      ",
+        bank2_eight_bit_detail_summary(result.eight_bit_results),
+    )
+    print_wrapped_value(
+        "  FOLLOW-UP FRAME:   ",
+        frame_or_pair_label(target.settings) if target else "(NONE)",
+    )
+    flow_summary = bank2_flow_summary(result.flow_results)
+    if result.flow_skip_reason:
+        flow_summary = f"SKIPPED: {result.flow_skip_reason}"
+    print_wrapped_value("  FLOW RESULT:       ", flow_summary)
+    print_wrapped_value(
+        "  BEHAVIOR RESULT:   ",
+        bank2_behavior_summary(result.behavior_results),
+    )
+    if result.behavior_results:
+        print(border_line(REPORT_WIDTH))
+        print("  RAW PROBE     STATUS       SENT  READ  EXACT FF CRLF")
+        for probe in result.behavior_results:
+            print(
+                f"  {probe.name:<12} "
+                f"{probe.status:<11} "
+                f"{probe.bytes_sent:>5} "
+                f"{probe.bytes_received:>5} "
+                f"{'Y' if probe.exact_match else 'N':<5} "
+                f"{'Y' if probe.form_feed_inserted else 'N':<2} "
+                f"{'Y' if probe.cr_lf_changed else 'N':<4}"
+            )
     print(f"  STALE DATA SEEN:    {'YES' if result.stale_data_seen else 'NO'}")
     print_wrapped_value("  CONCLUSION:         ", result.conclusion)
     print_wrapped_value("  TEXT REPORT:        ", f"{report_path} (APPENDED)")
@@ -5153,11 +6027,23 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
     print_report_title("SECOND BANK CHARACTERIZATION")
     print("AUTOMATED TEST FOR THE CURRENT SECOND-BANK DIP SETTING.")
     print(f"PORTS: {options.in_port} -> BUFFER -> {options.out_port}")
-    print("SEQUENCE: PURGE, ASCII FRAME TEST, 8-BIT CHALLENGE, FLOW VALIDATION.")
+    print("SEQUENCE: PURGE, ASCII FRAME TEST, 8-BIT CHALLENGE, RAW BEHAVIOR, FLOW VALIDATION.")
     print(border_line(REPORT_WIDTH))
     default_baud = options.min_baud if options.min_baud == options.max_baud else 1200
     input_baud, output_baud = prompt_bank2_known_baud(default_baud)
     switch_note = prompt_text("DIP SETTING NOTE FOR REPORT", options.switch_note)
+    independent_frames = prompt_yes_no("TEST INPUT/OUTPUT FRAMES INDEPENDENTLY", True)
+    if input_baud != output_baud:
+        print("INPUT/OUTPUT BAUD DIFFER; INDEPENDENT FRAME TESTING FORCED ON.")
+        independent_frames = True
+    run_behavior = prompt_yes_no("RUN RAW JOB-BEHAVIOR PROBES", True)
+    job_timeout_observe = DEFAULT_BANK2_JOB_TIMEOUT_OBSERVE_SECONDS
+    if run_behavior:
+        job_timeout_observe = prompt_float(
+            "JOB TIMEOUT OBSERVE SECONDS",
+            DEFAULT_BANK2_JOB_TIMEOUT_OBSERVE_SECONDS,
+            0.5,
+        )
     payload_bytes = max(options.payload_bytes, minimum_payload_size())
 
     bank_options = dataclasses.replace(
@@ -5198,10 +6084,15 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
 
     ascii_results: list[CandidateResult] = []
     ascii_payload = generate_payload(payload_bytes)
-    frames = bank2_frame_candidates(input_baud, output_baud)
+    frames = bank2_frame_candidates(
+        input_baud,
+        output_baud,
+        independent_frames=independent_frames,
+    )
     print()
     print_report_title("BANK 2 ASCII FRAME TEST")
     print(f"KNOWN BAUD/PAIR: {known_text}")
+    print(f"FRAME CANDIDATES: {len(frames)}")
     print("TESTING TARGETED FRAME LIST.")
     print(border_line(REPORT_WIDTH))
     for index, settings in enumerate(frames, start=1):
@@ -5263,33 +6154,60 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
             if result.status == "eight-bit-not-clean":
                 print("ASCII TRANSFER PASSES, BUT 8-BIT PATH IS NOT CLEAN.")
 
+    behavior_results: list[Bank2BehaviorProbeResult] = []
+    followup_target = best_bank2_followup_target(ascii_results, eight_bit_results)
+    if run_behavior:
+        behavior_targets = bank2_behavior_targets(ascii_results, eight_bit_results)
+        if behavior_targets:
+            behavior_results = run_bank2_behavior_probes(
+                serial_module=serial_module,
+                options=bank_options,
+                targets=behavior_targets,
+                observe_seconds=job_timeout_observe,
+                logger=logger,
+            )
+        else:
+            print()
+            print_report_title("BANK 2 RAW JOB-BEHAVIOR PROBES")
+            print("SKIPPED: NO CLEAN ASCII TARGET WAS FOUND.")
+            print(border_line(REPORT_WIDTH))
+
     flow_results: list[FlowControlValidationResult] = []
-    if input_baud != output_baud:
+    flow_skip_reason = bank2_flow_skip_reason(followup_target, input_baud, output_baud)
+    if flow_skip_reason:
         print()
         print_report_title("BANK 2 FLOW VALIDATION")
-        print("SKIPPED: FLOW VALIDATION CURRENTLY USES SAME-BAUD SERIAL SETTINGS.")
-        print("RESULT: NOT OBSERVABLE IN THIS KNOWN-PAIR MODE.")
+        print(f"SKIPPED: {flow_skip_reason}.")
+        print("RESULT: NOT OBSERVABLE IN THIS BANK-2 RUN.")
         print(border_line(REPORT_WIDTH))
+        logger.info("Bank 2 flow validation skipped: %s", flow_skip_reason)
     else:
         flow_results, _break_action = run_flow_control_validation(
             serial_module=serial_module,
             options=bank_options,
             results=ascii_results,
-            validation_results=[],
+            validation_results=bank2_flow_validation_seed(followup_target),
             logger=logger,
         )
 
     stale_seen = stale_nonce_seen(ascii_results) or stale_nonce_seen(eight_bit_results)
-    conclusion = bank2_conclusion(ascii_results, eight_bit_results, flow_results)
+    conclusion = bank2_conclusion(
+        ascii_results,
+        eight_bit_results,
+        flow_results,
+        behavior_results,
+    )
     result = Bank2CharacterizationResult(
         switch_note=switch_note,
         known_baud_text=known_text,
         ascii_results=ascii_results,
         eight_bit_results=eight_bit_results,
         flow_results=flow_results,
+        behavior_results=behavior_results,
         stale_data_seen=stale_seen,
         conclusion=conclusion,
         run_id=bank_options.run_id,
+        flow_skip_reason=flow_skip_reason,
     )
     write_bank2_text_report(bank_options.text_report, result)
     print_bank2_report(result, bank_options.text_report)
@@ -5597,7 +6515,7 @@ def run_dual_bank_scan(
     for candidate in staged_estimate_candidates:
         timing = effective_discovery_timing(
             options,
-            candidate.input_settings,
+            candidate.output_settings,
             options.payload_bytes,
         )
         staged_rough_total += estimated_transmit_seconds(
@@ -5612,7 +6530,7 @@ def run_dual_bank_scan(
     for candidate in full_candidates:
         timing = effective_discovery_timing(
             options,
-            candidate.input_settings,
+            candidate.output_settings,
             options.payload_bytes,
         )
         full_rough_total += estimated_transmit_seconds(
@@ -5924,7 +6842,7 @@ def assert_approx(value: float, expected: float, tolerance: float, label: str) -
 
 
 def fake_clean_candidate_result(
-    settings: SerialSettings,
+    settings: SerialSettings | DualSerialSettings,
     payload: ProbePayload,
 ) -> CandidateResult:
     """Return a clean in-memory candidate result for self-tests."""
@@ -5995,6 +6913,145 @@ def run_self_tests() -> int:
         0.5,
         "300 baud drain estimate",
     )
+
+    expected_bank2_frames = [
+        "8N1",
+        "7E1",
+        "7O1",
+        "8E1",
+        "8O1",
+        "7N1",
+        "7E2",
+        "7O2",
+        "7N2",
+        "8N2",
+        "8E2",
+        "8O2",
+    ]
+    actual_bank2_frames = [
+        frame_label(settings) for settings in bank2_frame_serial_settings(1200)
+    ]
+    assert actual_bank2_frames == expected_bank2_frames, "Bank 2 frame order changed"
+
+    dual_bank2 = bank2_frame_candidates(1200, 2400, independent_frames=True)
+    assert len(dual_bank2) == 144, "Bank 2 independent frame product must be 144"
+    assert all(
+        isinstance(settings, DualSerialSettings) for settings in dual_bank2
+    ), "Bank 2 baud-pair candidates must be dual settings"
+
+    def has_dual_frame_pair(input_frame: str, output_frame: str) -> bool:
+        return any(
+            isinstance(settings, DualSerialSettings)
+            and frame_label(settings.input_settings) == input_frame
+            and frame_label(settings.output_settings) == output_frame
+            for settings in dual_bank2
+        )
+
+    assert has_dual_frame_pair("7E1", "8N1"), "missing mixed 7E1 -> 8N1 pair"
+    assert has_dual_frame_pair("8N1", "7O2"), "missing mixed 8N1 -> 7O2 pair"
+
+    legacy_bank2 = bank2_frame_candidates(1200, 1200, independent_frames=False)
+    assert len(legacy_bank2) == 12, "legacy same-frame Bank 2 list must be 12"
+    assert all(
+        isinstance(settings, SerialSettings) for settings in legacy_bank2
+    ), "legacy same-frame Bank 2 list must use SerialSettings"
+    assert [
+        frame_label(settings) for settings in legacy_bank2
+    ] == expected_bank2_frames, "legacy same-frame Bank 2 order changed"
+
+    dual_settings = DualSerialSettings(
+        input_settings=SerialSettings(9600, 8, "none", 1, "none"),
+        output_settings=SerialSettings(1200, 7, "even", 2, "none"),
+    )
+    assert (
+        transmit_side_settings(dual_settings) == dual_settings.input_settings
+    ), "transmit side did not return dual input settings"
+    assert (
+        receive_side_settings(dual_settings) == dual_settings.output_settings
+    ), "receive side did not return dual output settings"
+    assert_approx(
+        estimated_receive_seconds(dual_settings, 120),
+        (120 * 11) / 1200,
+        0.0001,
+        "dual receive estimate",
+    )
+    assert (
+        frame_or_pair_label(dual_settings) == "IN 8N1 -> OUT 7E2"
+    ), "dual frame label did not include both sides"
+
+    asym_followup = DualSerialSettings(
+        SerialSettings(38400, 8, "even", 1, "none"),
+        SerialSettings(38400, 8, "none", 1, "none"),
+    )
+    same_followup = DualSerialSettings(
+        SerialSettings(38400, 8, "even", 1, "none"),
+        SerialSettings(38400, 8, "even", 1, "none"),
+    )
+    asym_eight = dataclasses.replace(
+        fake_clean_candidate_result(asym_followup, eight),
+        index=1,
+    )
+    same_eight = dataclasses.replace(
+        fake_clean_candidate_result(same_followup, eight),
+        index=2,
+    )
+    preferred = best_bank2_followup_target([], [asym_eight, same_eight])
+    assert preferred is not None, "Bank 2 follow-up target was not selected"
+    assert (
+        preferred.settings == same_followup
+    ), "Bank 2 target did not prefer same-frame 8E1 over asymmetric 8-bit clean"
+    assert (
+        bank2_flow_skip_reason(preferred, 38400, 38400) is None
+    ), "same-frame Bank 2 target incorrectly skipped flow validation"
+    assert "PAIR(S)" in bank2_ascii_pass_summary(
+        [fake_clean_candidate_result(same_followup, payload_a)]
+    ), "Bank 2 ASCII summary did not compact dual pairs"
+
+    exact, form_feed, cr_lf, status, _reason = classify_bank2_behavior_bytes(
+        b"RAW\r\n",
+        b"RAW\r\n",
+    )
+    assert exact and not form_feed and not cr_lf and status == "exact", "raw exact classification failed"
+    exact, form_feed, cr_lf, status, _reason = classify_bank2_behavior_bytes(
+        b"RAW\r\n",
+        b"RAW\r\n\x0c",
+    )
+    assert (
+        not exact and form_feed and status == "transformed"
+    ), "raw form-feed insertion classification failed"
+    exact, form_feed, cr_lf, status, _reason = classify_bank2_behavior_bytes(
+        b"A\rB\r",
+        b"A\r\nB\r\n",
+    )
+    assert (
+        not exact and not form_feed and cr_lf and status == "transformed"
+    ), "raw CR/LF transformation classification failed"
+
+    exact_behavior = Bank2BehaviorProbeResult(
+        name="CR_ONLY",
+        settings=same_followup,
+        bytes_sent=5,
+        bytes_received=5,
+        exact_match=True,
+        form_feed_inserted=False,
+        cr_lf_changed=False,
+        received_preview_ascii="ABCDE",
+        received_preview_hex="41 42 43 44 45",
+        status="exact",
+        reason="EXACT BYTE MATCH.",
+        error=None,
+        elapsed_sec=0.0,
+    )
+    stale_eight = dataclasses.replace(asym_eight, status="wrong-nonce", score=0.0)
+    conclusion = bank2_conclusion(
+        ascii_results=[fake_clean_candidate_result(same_followup, payload_a)],
+        eight_bit_results=[same_eight, stale_eight],
+        flow_results=[],
+        behavior_results=[exact_behavior],
+    )
+    assert (
+        conclusion == "8-bit clean; raw bytes exact; stale row seen"
+    ), "Bank 2 stale warning incorrectly dominated useful evidence"
 
     flow_settings = SerialSettings(1200, 8, "none", 1, "xon/xoff")
     clean_flow = fake_clean_candidate_result(flow_settings, payload_a)
