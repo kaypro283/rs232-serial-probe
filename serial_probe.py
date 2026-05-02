@@ -4613,19 +4613,30 @@ def run_scan(options: ScanOptions) -> int:
     """Run the serial probe scan and write reports."""
     serial_module = import_or_install_pyserial()
     logger = setup_logging(options.log_file)
+    pyserial_version = str(getattr(serial_module, "VERSION", "unknown"))
+    logger.info("serial_probe started")
+
+    scan_mode = prompt_scan_mode()
+    turbo_enabled = prompt_yes_no_question(
+        "Turbo discovery mode?",
+        options.turbo_discovery_enabled,
+    )
+    options = dataclasses.replace(
+        options,
+        turbo_discovery_enabled=turbo_enabled,
+    )
+    logger.info("scan-start turbo discovery=%s", turbo_enabled)
+
     all_candidates = prioritize_discovery_candidates(
         generate_candidates(options.min_baud, options.max_baud),
         options,
     )
     candidates = list(all_candidates)
     payload = generate_payload(options.payload_bytes)
-    pyserial_version = str(getattr(serial_module, "VERSION", "unknown"))
-    logger.info("serial_probe started")
     logger.info("options: %s", options)
     logger.info("payload: %s bytes, %s lines", payload.byte_count, payload.line_count)
     logger.info("candidates: %s", len(all_candidates))
 
-    scan_mode = prompt_scan_mode()
     auto_mode = scan_mode == "auto"
     if auto_mode:
         exploratory_requested = True
