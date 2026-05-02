@@ -6,6 +6,10 @@ The intended setup is:
 
 - Input side: `COM1`, where the tool transmits test data.
 - Output side: `COM5`, where the tool reads data from the buffer.
+- Physical path: `COM1 -> buffer input -> buffer output -> COM5`.
+- Switch-mapping assumption: set both buffer switch banks the same way for a scan.
+
+The program sets the COM port baud/data/parity/stop/flow options itself when it opens the ports. Device Manager defaults are not used as fixed test settings.
 
 ## Run
 
@@ -21,7 +25,7 @@ Usage screen:
 python serial_probe.py --help
 ```
 
-The first screen is the command menu. Use `9 CURRENT SETTINGS` to view ports, baud range, number of settings to test, test message size, repeat count, timing, old-output clearing, Phase 0 liveness settings, baud focus rules, report files, and estimated scan time. It also shows that scan mode is asked at scan start and that blank means `AUTO`. Use `11 MEMORY TEST` after you have a likely switch setting. The normal full scan still tests every selected combination unless quick exploratory findings are accepted for phase 2.
+The first screen is the command menu. Use `9 CURRENT SETTINGS` to view ports, baud range, number of settings to test, test message size, repeat count, timing, old-output clearing, Phase 0 liveness settings, baud focus rules, report files, and estimated scan time. It also shows that scan mode is asked at scan start and that blank means `FULL`. Use `11 MEMORY TEST` after you have a likely switch setting. The normal full scan tests every selected combination unless you explicitly choose quick exploratory narrowing.
 
 The terminal UI is written for an 80-column early terminal style. Screens use terse uppercase operator text and bright green text when the console supports ANSI color. PyCharm runs are treated as color-capable. Set `NO_COLOR=1` before running if you want plain console text.
 
@@ -40,22 +44,24 @@ Use the default settings, then select `1. Start scan`.
 When a scan starts, the tool asks:
 
 ```text
-SCAN MODE: AUTO OR MANUAL [AUTO]:
+SCAN MODE: FULL OR AUTO [FULL]:
 ```
 
-Accepted answers are `A`, `AUTO`, `M`, and `MANUAL`. Press Enter for `AUTO`.
+Accepted answers are `F`, `FULL`, `M`, `MANUAL`, `A`, and `AUTO`. Press Enter for `FULL`.
 
-`AUTO` is the default. It runs Phase 0 baud liveness, then quick exploratory mode, and accepts phase-2 full analysis from the quick findings without asking the two follow-up yes/no questions:
+`FULL` is the default and is the safest mode for switch mapping. It asks whether to run quick exploratory mode, and pressing Enter answers `N`, so the normal path is a complete scan over every selected setting.
+
+`AUTO` runs Phase 0 baud liveness, then quick exploratory mode, and accepts phase-2 full analysis from the quick findings without asking the two follow-up yes/no questions:
 
 ```text
 AUTO MODE: EXPLORATORY=YES PHASE2=YES
 ```
 
-`MANUAL` preserves the old operator flow. It asks whether to run quick exploratory mode and, when quick findings are usable, later asks whether to use them for phase 2.
+`MANUAL` is accepted as an alias for `FULL`.
 
 ## Quick Exploratory Mode
 
-In `MANUAL` mode, the tool asks:
+In `FULL` mode, the tool asks:
 
 ```text
 RUN QUICK EXPLORATORY MODE FIRST? (Y/N) [N]:
@@ -112,14 +118,14 @@ Default gates:
 - Minimum strong results at the baud: `3`.
 - Minimum early samples per baud: `8`.
 
-Stale output, partial writes, or driver errors before a clean hit pattern do not permanently block focus; they are treated as noise until a baud proves itself. Once focus is engaged, any stale output, partial write, driver error, or confidence drop cancels focus and returns to the normal full baud sweep. The full brute-force scan still exists: choose `MANUAL`, answer `N` to quick mode, or decline quick narrowing; the tool then tests every selected baud/data/parity/stop/flow combination. If `AUTO` accepts a narrowed phase 2, the report records that choice.
+Stale output, partial writes, or driver errors before a clean hit pattern do not permanently block focus; they are treated as noise until a baud proves itself. Once focus is engaged, any stale output, partial write, driver error, or confidence drop cancels focus and returns to the normal full baud sweep. The full brute-force scan is the default: choose `FULL` or press Enter at scan mode, then answer `N` or press Enter at quick mode. If `AUTO` accepts a narrowed phase 2, the report records that choice.
 
 Use menu command `12 BAUD FOCUS` to change the focus thresholds. Use `9 CURRENT SETTINGS` to view the active values.
 
 Example operator lines:
 
 ```text
-SCAN MODE: AUTO OR MANUAL [AUTO]:
+SCAN MODE: FULL OR AUTO [FULL]:
 AUTO MODE: EXPLORATORY=YES PHASE2=YES
 BAUD FOCUS ENGAGED: 38400 SCORE=100.0 GAP=50.0 GOOD=4 SAMPLES=8
 OTHER BAUDS DEFERRED BY CONFIDENCE RULE
@@ -135,19 +141,19 @@ RETURNING TO FULL BAUD SWEEP
 Prompt-path checks:
 
 ```text
-Scan mode MANUAL, quick prompt N:
+Scan mode FULL, quick prompt N:
   Skip quick mode. Full scan runs all selected settings.
 
-Scan mode MANUAL, quick prompt Y, phase-2 prompt N:
+Scan mode FULL, quick prompt Y, phase-2 prompt N:
   Quick summary is shown. Full scan still runs all selected settings.
 
-Scan mode MANUAL, quick prompt Y, phase-2 prompt Y:
+Scan mode FULL, quick prompt Y, phase-2 prompt Y:
   Quick summary is shown. Full scan runs the narrowed candidate list using full-scan settings.
 
 Scan mode AUTO:
   Phase 0 and quick mode run. Phase 2 uses quick findings if they are usable; otherwise full scan runs all selected settings.
 
-Scan mode MANUAL, quick prompt Y, no usable quick findings:
+Scan mode FULL, quick prompt Y, no usable quick findings:
   Quick summary explains the fallback. Full scan runs all selected settings.
 ```
 
@@ -242,13 +248,12 @@ At the end, the tool prints:
 
 It also writes:
 
-- Full JSON report.
-- CSV summary.
-- Debug log.
+- One append-only text report, `serial_probe_report.txt` by default.
+- One append-only debug log, `serial_probe_debug.log` by default.
 
 The report paths are configured from the menu.
 
-The scan start screen, final summary note, debug log, JSON metadata, and CSV rows indicate the selected scan mode, whether Phase 0 and quick exploratory mode ran, which bauds Phase 0 marked alive, whether Phase 0 fell back to all bauds, whether the full analysis candidate list was narrowed, whether baud focus engaged, which baud was focused, whether other bauds were deferred, and why focus was engaged or released.
+Each scan appends a compact run block with the switch/jumper note, selected scan mode, phase summary, top results, validation results when run, and interpretation notes.
 
 ## Memory Test
 

@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 """Discover likely serial settings for a serial-to-serial printer buffer.
 
-The script opens an input serial port and an output serial port with matching
-candidate settings, sends deterministic ASCII probe payloads, scores what is
-received, and reports ranked candidates.
+The script assumes a device under test sits between the transmit and receive
+ports. It opens both PC serial ports with matching candidate settings, sends
+deterministic probe payloads into the buffer input, scores what is received
+from the buffer output, and appends a compact text report for each run.
 """
 
 from __future__ import annotations
 
 import atexit
 import base64
-import csv
 import ctypes
 import dataclasses
 import datetime as dt
-import json
 import logging
 import os
 import platform
@@ -249,9 +248,9 @@ class ScanOptions:
     read_timeout: float
     settle_ms: int
     top: int
-    json_report: Path
-    csv_report: Path
+    text_report: Path
     log_file: Path
+    switch_note: str
     bursts: int
     progress_interval: float
     no_pre_drain: bool
@@ -1747,120 +1746,181 @@ def dataclass_to_jsonable(value: Any) -> Any:
     return value
 
 
-def write_json_report(
+def candidate_table_lines(
+    results: Sequence[CandidateResult],
+    top: int,
+    title: str,
+) -> list[str]:
+    """Return compact ranked result table lines for text reports."""
+    ranked = ranked_top_results(results, top)
+    lines = [
+        title,
+        border_line(REPORT_WIDTH),
+        "RK SCORE   BAUD MODE FLOW       SENT   READ  CLR  EXCT LINE RESULT",
+        border_line(REPORT_WIDTH),
+    ]
+    for rank, result in enumerate(ranked, start=1):
+        mode = (
+            f"{result.settings.data_bits}"
+            f"{result.settings.parity_code()}"
+            f"{result.settings.stop_bits}"
+        )
+        indicator = result_indicator(result.score, result.status, result.error)
+        lines.append(
+            f"{rank:>2} "
+            f"{result.score:>5.1f} "
+            f"{result.settings.baud:>6} "
+            f"{mode:<4} "
+            f"{result.settings.flow_control.upper():<8} "
+            f"{result.bytes_sent:>6} "
+            f"{result.bytes_received:>6} "
+            f"{result.bytes_drained_before:>4} "
+            f"{result.metrics.exact_byte_match_ratio:>4.2f} "
+            f"{result.metrics.line_integrity_ratio:>4.2f} "
+            f"{indicator}"
+        )
+    lines.append(border_line(REPORT_WIDTH))
+    if not ranked:
+        lines.append("NO NON-ZERO RESULTS.")
+    return lines
+
+
+def result_count_summary(results: Sequence[CandidateResult]) -> str:
+    """Return PASS/GOOD/PARTIAL/FAIL/STALE/ERROR counts."""
+    counts: dict[str, int] = {}
+    for result in results:
+        indicator = result_indicator(result.score, result.status, result.error)
+        counts[indicator] = counts.get(indicator, 0) + 1
+    return ", ".join(
+        f"{name}={counts.get(name, 0)}"
+        for name in ("PASS", "GOOD", "PARTIAL", "FAIL", "STALE", "ERROR")
+    )
+
+
+def text_report_summary_lines(
+    results: Sequence[CandidateResult],
+    metadata: dict[str, Any],
+) -> list[str]:
+    """Return summary and interpretation lines for one report section."""
+    ranked = sorted(results, key=result_sort_key, reverse=True)
+    best = ranked[0] if ranked else None
+    tied = top_tied_results(results)
+    lines = [
+        f"SETTINGS TESTED: {len(results)}/{metadata.get('phase2_candidate_count', len(results))}",
+        f"RESULT COUNTS:   {result_count_summary(results)}",
+        f"FINDING:         {confidence_summary(best, len(tied))}",
+    ]
+    if best is not None:
+        lines.append(f"BEST SETTING:    {best.settings.label()}")
+        lines.append(
+            f"BEST SCORE:      {best.score:.2f} "
+            f"SENT/READ={best.bytes_sent}/{best.bytes_received}"
+        )
+    if len(tied) > 1:
+        lines.append(
+            f"AMBIGUOUS:       {len(tied)} SETTINGS TIED WITHIN "
+            f"{TIE_SCORE_TOLERANCE:.1f} POINTS."
+        )
+        lines.append("ACTION:          DO NOT TREAT ROW 1 AS UNIQUE.")
+    elif is_recommendable_result(best):
+        lines.append("ACTION:          RECORD THIS AS THE LIKELY SWITCH RESULT.")
+    elif has_any_signal(results):
+        lines.append("ACTION:          PARTIAL RESULT ONLY; REPEAT OR CHECK WIRING.")
+    else:
+        lines.append("ACTION:          NO WORKING SETTING FOUND FOR THIS SWITCH STATE.")
+    return lines
+
+
+def write_text_report(
     path: Path,
     metadata: dict[str, Any],
     results: Sequence[CandidateResult],
+    validation_results: Sequence[CandidateResult] | None = None,
 ) -> None:
-    """Write the full JSON scan report."""
+    """Append one compact old-school text report entry."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    top_results = ranked_top_results(results, metadata["top"])
-    payload = {
-        "metadata": dataclass_to_jsonable(metadata),
-        "top_results": [dataclass_to_jsonable(result) for result in top_results],
-        "candidates": [dataclass_to_jsonable(result) for result in results],
-    }
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-
-def write_csv_report(
-    path: Path,
-    results: Sequence[CandidateResult],
-    metadata: dict[str, Any] | None = None,
-) -> None:
-    """Write a sortable CSV summary for all candidate results."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    ranked = sorted(results, key=result_sort_key, reverse=True)
-    exploratory = (metadata or {}).get("exploratory_mode", {})
+    validation_results = [] if validation_results is None else list(validation_results)
+    options = metadata.get("options", {})
+    exploratory = metadata.get("exploratory_mode", {})
     phase0 = exploratory.get("phase0_baud_liveness", {})
     baud_focus = exploratory.get("baud_focus", {})
-    scan_mode = (metadata or {}).get("scan_mode", "")
-    fieldnames = [
-        "rank",
-        "score",
-        "repeatability",
-        "status",
-        "baud",
-        "data_bits",
-        "parity",
-        "stop_bits",
-        "flow_control",
-        "bytes_sent",
-        "bytes_received",
-        "old_bytes_cleared",
-        "exact_byte_match_ratio",
-        "line_integrity_ratio",
-        "missing_bytes",
-        "extra_bytes",
-        "printable_ascii_ratio",
-        "length_ratio",
-        "elapsed_sec",
-        "error",
-        "scan_mode",
-        "phase0_ran",
-        "phase0_alive_bauds",
-        "phase0_fallback",
-        "phase0_candidate_count_after",
-        "baud_focus_engaged",
-        "baud_focus_baud",
-        "baud_focus_deferred",
-        "baud_focus_deferred_count",
-        "baud_focus_engage_reason",
-        "baud_focus_release_reason",
+    created = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    switch_note = str(metadata.get("switch_note") or "").strip()
+    lines = [
+        "",
+        border_line(REPORT_WIDTH),
+        bordered_text("SERIAL PROBE RUN REPORT", REPORT_WIDTH),
+        border_line(REPORT_WIDTH),
+        f"APPENDED:        {created}",
+        f"STARTED UTC:     {metadata.get('started_at', '')}",
+        f"COM PATH:        {metadata.get('in_port')} -> BUFFER -> {metadata.get('out_port')}",
+        f"SWITCH NOTE:     {switch_note if switch_note else '(NOT ENTERED)'}",
+        f"SCAN MODE:       {str(metadata.get('scan_mode', '')).upper()}",
+        f"BAUD RANGE:      {options.get('min_baud')}..{options.get('max_baud')}",
+        f"TEST BYTES:      {options.get('payload_bytes')} X {options.get('bursts')}",
+        f"REPORT STATUS:   {metadata.get('recommendation_status')}",
+        "",
+        "ASSUMPTIONS:",
+        "  BUFFER IS PHYSICALLY BETWEEN THE TWO COM PORTS.",
+        "  BOTH BUFFER SWITCH BANKS ARE SET THE SAME WAY FOR THIS RUN.",
+        "  THE PROGRAM SETS BOTH PC COM PORTS; DEVICE MANAGER DEFAULTS ARE NOT USED.",
+        "",
     ]
-    with path.open("w", newline="", encoding="utf-8") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-        writer.writeheader()
-        for rank, result in enumerate(ranked, start=1):
-            writer.writerow(
-                {
-                    "rank": rank,
-                    "score": f"{result.score:.3f}",
-                    "repeatability": f"{result.repeatability:.3f}",
-                    "status": result.status,
-                    "baud": result.settings.baud,
-                    "data_bits": result.settings.data_bits,
-                    "parity": result.settings.parity,
-                    "stop_bits": result.settings.stop_bits,
-                    "flow_control": result.settings.flow_control,
-                    "bytes_sent": result.bytes_sent,
-                    "bytes_received": result.bytes_received,
-                    "old_bytes_cleared": result.bytes_drained_before,
-                    "exact_byte_match_ratio": f"{result.metrics.exact_byte_match_ratio:.6f}",
-                    "line_integrity_ratio": f"{result.metrics.line_integrity_ratio:.6f}",
-                    "missing_bytes": result.metrics.missing_bytes,
-                    "extra_bytes": result.metrics.extra_bytes,
-                    "printable_ascii_ratio": f"{result.metrics.printable_ascii_ratio:.6f}",
-                    "length_ratio": f"{result.metrics.length_ratio:.6f}",
-                    "elapsed_sec": f"{result.elapsed_sec:.3f}",
-                    "error": result.error or "",
-                    "scan_mode": str(scan_mode).upper(),
-                    "phase0_ran": "YES" if phase0.get("ran") else "NO",
-                    "phase0_alive_bauds": ",".join(
-                        str(baud) for baud in phase0.get("alive_bauds", [])
-                    ),
-                    "phase0_fallback": (
-                        "YES" if phase0.get("fallback_to_all_bauds") else "NO"
-                    ),
-                    "phase0_candidate_count_after": (
-                        phase0.get("candidate_count_after") or ""
-                    ),
-                    "baud_focus_engaged": (
-                        "YES" if baud_focus.get("engaged") else "NO"
-                    ),
-                    "baud_focus_baud": baud_focus.get("focused_baud") or "",
-                    "baud_focus_deferred": (
-                        "YES"
-                        if baud_focus.get("deferred_other_bauds")
-                        else "NO"
-                    ),
-                    "baud_focus_deferred_count": (
-                        baud_focus.get("deferred_candidate_count") or 0
-                    ),
-                    "baud_focus_engage_reason": baud_focus.get("engage_reason") or "",
-                    "baud_focus_release_reason": baud_focus.get("release_reason") or "",
-                }
+    if phase0:
+        alive = ",".join(str(baud) for baud in phase0.get("alive_bauds", []))
+        lines.extend(
+            [
+                f"PHASE 0 BAUDS:   {alive if alive else '(NONE)'}",
+                f"PHASE 0 FALLBACK:{' YES' if phase0.get('fallback_to_all_bauds') else ' NO'}",
+            ]
+        )
+    if baud_focus:
+        lines.append(
+            "BAUD FOCUS:      "
+            + (
+                f"ENGAGED {baud_focus.get('focused_baud')}"
+                if baud_focus.get("engaged")
+                else "NOT ENGAGED"
             )
+        )
+    lines.extend(
+        [
+            "",
+            "PHASE 1 SUMMARY:",
+            *text_report_summary_lines(results, metadata),
+            "",
+            *candidate_table_lines(results, int(metadata.get("top", 15)), "PHASE 1 TOP RESULTS"),
+        ]
+    )
+    if validation_results:
+        validation_metadata = dict(metadata)
+        validation_metadata["phase2_candidate_count"] = len(validation_results)
+        lines.extend(
+            [
+                "",
+                "VALIDATION SUMMARY:",
+                *text_report_summary_lines(validation_results, validation_metadata),
+                "",
+                *candidate_table_lines(
+                    validation_results,
+                    min(int(metadata.get("top", 15)), len(validation_results)),
+                    "VALIDATION TOP RESULTS",
+                ),
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "INTERPRETATION NOTES:",
+            "  BAUD RATE IS USUALLY THE MOST RELIABLE FIELD FROM THIS TEST.",
+            "  7/8 DATA BITS, PARITY, STOP BITS, AND FLOW CONTROL CAN TIE IF THE BUFFER",
+            "  OR TEST DATA DOES NOT FORCE THOSE FEATURES TO MATTER.",
+            "  FLOW CONTROL NEEDS A SEPARATE STRESS/MEMORY TEST BEFORE TRUSTING IT.",
+            border_line(REPORT_WIDTH),
+        ]
+    )
+    with path.open("a", encoding="utf-8") as report_file:
+        report_file.write("\n".join(lines) + "\n")
 
 
 def format_progress(result: CandidateResult) -> str:
@@ -2215,19 +2275,14 @@ def print_scan_summary(
     print(border_line(REPORT_WIDTH))
 
 
-def default_report_paths() -> tuple[Path, Path, Path]:
-    """Return timestamped default JSON, CSV, and log paths."""
-    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    return (
-        Path(f"serial_probe_report_{stamp}.json"),
-        Path(f"serial_probe_summary_{stamp}.csv"),
-        Path(f"serial_probe_{stamp}.log"),
-    )
+def default_report_paths() -> tuple[Path, Path]:
+    """Return append-only text report and debug log paths."""
+    return Path("serial_probe_report.txt"), Path("serial_probe_debug.log")
 
 
 def default_scan_options() -> ScanOptions:
     """Return practical defaults for the interactive scan."""
-    default_json, default_csv, default_log = default_report_paths()
+    default_text_report, default_log = default_report_paths()
     return ScanOptions(
         in_port="COM1",
         out_port="COM5",
@@ -2237,9 +2292,9 @@ def default_scan_options() -> ScanOptions:
         read_timeout=DEFAULT_READ_TIMEOUT,
         settle_ms=DEFAULT_SETTLE_MS,
         top=15,
-        json_report=default_json,
-        csv_report=default_csv,
+        text_report=default_text_report,
         log_file=default_log,
+        switch_note="",
         bursts=DEFAULT_BURSTS,
         progress_interval=DEFAULT_PROGRESS_INTERVAL,
         no_pre_drain=False,
@@ -3027,7 +3082,7 @@ def exploratory_metadata(
     options: ScanOptions,
     phase2_candidate_source: str = PHASE2_CANDIDATE_SOURCE_FULL,
 ) -> dict[str, Any]:
-    """Return JSON metadata for exploratory mode and candidate narrowing."""
+    """Return structured metadata for exploratory mode and candidate narrowing."""
     if narrowing_accepted:
         phase2_candidate_source = PHASE2_CANDIDATE_SOURCE_NARROWED
     phase0_fixed_settings = {
@@ -3527,19 +3582,19 @@ def prompt_yes_no_question(question: str, current: bool) -> bool:
 
 
 def prompt_scan_mode() -> str:
-    """Prompt for AUTO or MANUAL scan mode. Blank defaults to AUTO."""
+    """Prompt for scan mode. Blank defaults to conservative full scan."""
     while True:
         try:
-            value = input("SCAN MODE: AUTO OR MANUAL [AUTO]: ").strip().lower()
+            value = input("SCAN MODE: FULL OR AUTO [FULL]: ").strip().lower()
         except EOFError:
-            return "auto"
+            return "full"
         if value == "":
+            return "full"
+        if value in {"a", "auto", "quick"}:
             return "auto"
-        if value in {"a", "auto"}:
-            return "auto"
-        if value in {"m", "manual"}:
-            return "manual"
-        print("ENTER A OR M.")
+        if value in {"f", "full", "m", "manual"}:
+            return "full"
+        print("ENTER F OR A.")
 
 
 def print_menu_help() -> None:
@@ -3560,10 +3615,14 @@ def print_menu_help() -> None:
     print("  USE 11 MEMORY TEST AFTER A GOOD SETTING IS FOUND.")
     print()
     print("OPERATOR NOTES:")
-    print("  SCAN MODE:       AUTO OR MANUAL AT SCAN START; BLANK=AUTO.")
+    print("  SCAN MODE:       FULL OR AUTO AT SCAN START; BLANK=FULL.")
+    print("  FULL MODE:       MOST RELIABLE FOR SWITCH MAPPING; QUICK MODE ASKS.")
+    print("  AUTO MODE:       RUNS QUICK DISCOVERY AND MAY NARROW PHASE 2.")
+    print("  DEVICE PATH:     COM1 -> BUFFER INPUT -> BUFFER OUTPUT -> COM5.")
+    print("  PORT SETTINGS:   PROGRAM SETS COM PORTS; DEVICE MANAGER IS IGNORED.")
     print("  TEST SIZE:       BYTES SENT FOR EACH SETTING.")
     print("  TEST COUNT:      NUMBER OF TRIES PER SETTING.")
-    print("  QUICK MODE:      AUTO=YES; MANUAL ASKS; FIXED INTERNAL SETTINGS.")
+    print("  QUICK MODE:      AUTO=YES; FULL ASKS; FIXED INTERNAL SETTINGS.")
     print("  PHASE 0:         QUICK MODE FIRST TESTS EACH BAUD AT 8M1 FLOW=NONE.")
     print("  TURBO:           FASTER DISCOVERY TIMING; FULL EXHAUSTIVE STILL AVAILABLE.")
     print("  BAUD FOCUS:      QUICK MODE MAY DEFER OTHER BAUDS WHEN CONFIDENT.")
@@ -3603,7 +3662,7 @@ def print_configuration(options: ScanOptions) -> None:
     print()
     print_banner()
     print("CURRENT SETTINGS")
-    print_setting("SCAN MODE:", "ASK AT START; BLANK=AUTO")
+    print_setting("SCAN MODE:", "ASK AT START; BLANK=FULL")
     print_setting("PORTS:", f"{options.in_port} -> {options.out_port}")
     print_setting("BAUD RANGE:", f"{options.min_baud}..{options.max_baud}")
     print_setting("SETTINGS:", len(candidates))
@@ -3668,8 +3727,8 @@ def print_configuration(options: ScanOptions) -> None:
     )
     print_setting("TOP ROWS:", options.top)
     print_setting("MEMORY TEST:", "USE 11 AFTER SCAN")
-    print_setting("JSON FILE:", options.json_report)
-    print_setting("CSV FILE:", options.csv_report)
+    print_setting("REPORT FILE:", options.text_report)
+    print_setting("SWITCH NOTE:", options.switch_note or "(ASK AT SCAN START)")
     print_setting("LOG FILE:", options.log_file)
     print_setting("SEND TIME:", format_duration(wire).upper())
     print_setting("WAIT TIME:", f"{format_duration(overhead).upper()} IF QUIET")
@@ -3794,14 +3853,14 @@ def configure_pre_drain(options: ScanOptions) -> ScanOptions:
 def configure_reports(options: ScanOptions) -> ScanOptions:
     """Prompt for result and report settings."""
     top = prompt_int("NUMBER OF TOP ROWS TO SHOW", options.top, 1)
-    json_report = prompt_path("JSON REPORT FILE", options.json_report)
-    csv_report = prompt_path("CSV REPORT FILE", options.csv_report)
+    text_report = prompt_path("APPEND TEXT REPORT FILE", options.text_report)
+    switch_note = prompt_text("DEFAULT SWITCH/JUMPER NOTE", options.switch_note)
     log_file = prompt_path("LOG FILE", options.log_file)
     return dataclasses.replace(
         options,
         top=top,
-        json_report=json_report,
-        csv_report=csv_report,
+        text_report=text_report,
+        switch_note=switch_note,
         log_file=log_file,
     )
 
@@ -3974,16 +4033,6 @@ def prompt_memory_method() -> str:
         if choice == "2":
             return "live-transfer"
         print("ENTER 1 OR 2.")
-
-
-def memory_report_paths() -> tuple[Path, Path, Path]:
-    """Return timestamped memory-test JSON, CSV, and log paths."""
-    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    return (
-        Path(f"serial_probe_memory_report_{stamp}.json"),
-        Path(f"serial_probe_memory_summary_{stamp}.csv"),
-        Path(f"serial_probe_memory_{stamp}.log"),
-    )
 
 
 def wait_for_operator(message: str) -> None:
@@ -4404,8 +4453,7 @@ def memory_test_interpretation(results: Sequence[MemoryTestResult]) -> str:
 def print_memory_report(
     settings: SerialSettings,
     results: Sequence[MemoryTestResult],
-    json_report: Path,
-    csv_report: Path,
+    text_report: Path,
     log_file: Path,
 ) -> None:
     """Print the final memory test report."""
@@ -4446,75 +4494,48 @@ def print_memory_report(
         print("  NOTE: EARLY BYTES ARRIVED BEFORE RELEASE.")
     print()
     print_report_title("MEMORY TEST FILES")
-    print(f"  JSON FILE: {json_report}")
-    print(f"  CSV FILE:  {csv_report}")
-    print(f"  LOG FILE:  {log_file}")
+    print(f"  TEXT REPORT: {text_report} (APPENDED)")
+    print(f"  DEBUG LOG:   {log_file}")
     print(border_line(REPORT_WIDTH))
 
 
-def write_memory_reports(
-    json_report: Path,
-    csv_report: Path,
+def write_memory_text_report(
+    text_report: Path,
     settings: SerialSettings,
     results: Sequence[MemoryTestResult],
 ) -> None:
-    """Write JSON and CSV memory test reports."""
-    json_report.parent.mkdir(parents=True, exist_ok=True)
-    csv_report.parent.mkdir(parents=True, exist_ok=True)
-    json_report.write_text(
-        json.dumps(
-            {
-                "tool": "serial_probe",
-                "report": "memory_test",
-                "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                "serial_setting": dataclass_to_jsonable(settings),
-                "interpretation": memory_test_interpretation(results),
-                "results": [dataclass_to_jsonable(result) for result in results],
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    with csv_report.open("w", newline="", encoding="utf-8") as csv_file:
-        writer = csv.DictWriter(
-            csv_file,
-            fieldnames=[
-                "size_label",
-                "size_bytes",
-                "method",
-                "indicator",
-                "score",
-                "bytes_sent",
-                "bytes_received",
-                "bytes_cleared_before",
-                "bytes_seen_before_release",
-                "missing_bytes",
-                "extra_bytes",
-                "elapsed_sec",
-                "status",
-                "error",
-            ],
+    """Append a compact memory test section to the text report."""
+    text_report.parent.mkdir(parents=True, exist_ok=True)
+    created = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    lines = [
+        "",
+        border_line(REPORT_WIDTH),
+        bordered_text("SERIAL PROBE MEMORY TEST", REPORT_WIDTH),
+        border_line(REPORT_WIDTH),
+        f"APPENDED:        {created}",
+        f"SETTING:         {settings.label()}",
+        f"RESULT:          {memory_test_interpretation(results).upper()}",
+        "",
+        "SIZE  METHOD RESULT SCORE   SENT   READ EARLY CLEAR  MISS EXTRA  TIME",
+        border_line(REPORT_WIDTH),
+    ]
+    for result in results:
+        lines.append(
+            f"{result.size_label:<5} "
+            f"{result.method[:6].upper():<6} "
+            f"{result.indicator:<6} "
+            f"{result.score:>5.1f} "
+            f"{result.bytes_sent:>6} "
+            f"{result.bytes_received:>6} "
+            f"{result.bytes_seen_before_release:>5} "
+            f"{result.bytes_cleared_before:>5} "
+            f"{result.metrics.missing_bytes:>5} "
+            f"{result.metrics.extra_bytes:>5} "
+            f"{format_duration(result.elapsed_sec):>6}"
         )
-        writer.writeheader()
-        for result in results:
-            writer.writerow(
-                {
-                    "size_label": result.size_label,
-                    "size_bytes": result.size_bytes,
-                    "method": result.method,
-                    "indicator": result.indicator,
-                    "score": f"{result.score:.3f}",
-                    "bytes_sent": result.bytes_sent,
-                    "bytes_received": result.bytes_received,
-                    "bytes_cleared_before": result.bytes_cleared_before,
-                    "bytes_seen_before_release": result.bytes_seen_before_release,
-                    "missing_bytes": result.metrics.missing_bytes,
-                    "extra_bytes": result.metrics.extra_bytes,
-                    "elapsed_sec": f"{result.elapsed_sec:.3f}",
-                    "status": result.status,
-                    "error": result.error or "",
-                }
-            )
+    lines.append(border_line(REPORT_WIDTH))
+    with text_report.open("a", encoding="utf-8") as report_file:
+        report_file.write("\n".join(lines) + "\n")
 
 
 def run_memory_test(options: ScanOptions) -> None:
@@ -4527,7 +4548,8 @@ def run_memory_test(options: ScanOptions) -> None:
     settings = prompt_serial_setting(SerialSettings(9600, 8, "none", 1, "none"))
     sizes = prompt_memory_sizes()
     method = prompt_memory_method()
-    json_report, csv_report, log_file = memory_report_paths()
+    text_report = options.text_report
+    log_file = options.log_file
     logger = setup_logging(log_file)
     serial_module = import_or_install_pyserial()
     print()
@@ -4554,8 +4576,8 @@ def run_memory_test(options: ScanOptions) -> None:
         )
         for index, size in enumerate(sizes, start=1)
     ]
-    write_memory_reports(json_report, csv_report, settings, results)
-    print_memory_report(settings, results, json_report, csv_report, log_file)
+    write_memory_text_report(text_report, settings, results)
+    print_memory_report(settings, results, text_report, log_file)
 
 
 def print_commands() -> None:
@@ -4564,7 +4586,7 @@ def print_commands() -> None:
     print_banner()
     print("MAIN MENU")
     print("  1 START SCAN                 7 SET REPORT FILES")
-    print("  2 SET COM PORTS              8 MAKE REPORT NAMES")
+    print("  2 SET COM PORTS              8 RESET REPORT FILES")
     print("  3 SET BAUD RANGE             9 CURRENT SETTINGS")
     print("  4 SET TEST SIZE/COUNT       10 HELP")
     print("  5 SET TIMING/TURBO          11 MEMORY TEST")
@@ -4606,11 +4628,10 @@ def interactive_menu() -> ScanOptions | None:
         elif choice == "7":
             options = configure_reports(options)
         elif choice == "8":
-            default_json, default_csv, default_log = default_report_paths()
+            default_text_report, default_log = default_report_paths()
             options = dataclasses.replace(
                 options,
-                json_report=default_json,
-                csv_report=default_csv,
+                text_report=default_text_report,
                 log_file=default_log,
             )
         elif choice == "9":
@@ -4637,7 +4658,7 @@ def metadata_for_scan(
     completed_at: str | None = None,
     early_stopped: bool = False,
 ) -> dict[str, Any]:
-    """Build metadata for JSON reporting."""
+    """Build structured metadata for reporting."""
     return {
         "tool": "serial_probe",
         "started_at": started_at,
@@ -4676,9 +4697,14 @@ def run_scan(options: ScanOptions) -> int:
         "Turbo discovery mode?",
         options.turbo_discovery_enabled,
     )
+    switch_note = prompt_text(
+        "Switch/jumper note for report",
+        options.switch_note,
+    )
     options = dataclasses.replace(
         options,
         turbo_discovery_enabled=turbo_enabled,
+        switch_note=switch_note,
     )
     logger.info("scan-start turbo discovery=%s", turbo_enabled)
 
@@ -4699,13 +4725,13 @@ def run_scan(options: ScanOptions) -> int:
         print("AUTO MODE: EXPLORATORY=YES PHASE2=YES")
         logger.info("scan mode auto: exploratory=yes phase2=yes")
     else:
-        print("MANUAL MODE: OPERATOR PROMPTS ENABLED")
+        print("FULL MODE: CONSERVATIVE OPERATOR PROMPTS ENABLED")
         exploratory_requested = prompt_yes_no_question(
             "Run quick exploratory mode first?",
             False,
         )
         phase2_auto_accept = False
-        logger.info("scan mode manual: exploratory=%s", exploratory_requested)
+        logger.info("scan mode full: exploratory=%s", exploratory_requested)
 
     exploratory_selection: ExploratorySelection | None = None
     exploratory_narrowing_accepted = False
@@ -4794,6 +4820,13 @@ def run_scan(options: ScanOptions) -> int:
     print(f"SCAN MODE: {scan_mode.upper()}.")
     if auto_mode:
         print("AUTO MODE: EXPLORATORY=YES PHASE2=YES.")
+    else:
+        print("FULL MODE: QUICK DISCOVERY RUNS ONLY IF YOU ANSWER YES.")
+    print("DEVICE PATH: COM INPUT -> BUFFER -> COM OUTPUT.")
+    print("ASSUMPTION: BOTH BUFFER SWITCH BANKS ARE SET THE SAME WAY.")
+    print("NOTE: PROGRAM SETS COM PORTS; DEVICE MANAGER DEFAULTS ARE NOT USED.")
+    if options.switch_note:
+        print(f"SWITCH NOTE: {options.switch_note}")
     print(
         "TURBO DISCOVERY: "
         + ("ON; ADAPTIVE TIMING AND PRIORITY ORDER." if options.turbo_discovery_enabled else "OFF.")
@@ -4844,7 +4877,8 @@ def run_scan(options: ScanOptions) -> int:
     print(f"EFFECTIVE TIMING: {effective_timing_range_label(options, candidates)}.")
     print(f"SCREEN UPDATE: {options.progress_interval:.1f}S WHILE SETTING RUNS.")
     print_progress_legend()
-    print(f"REPORTS: {options.json_report}, {options.csv_report}, {options.log_file}")
+    print(f"REPORT: {options.text_report} (APPEND)")
+    print(f"DEBUG LOG: {options.log_file}")
     rough_total = 0.0
     for candidate in candidates:
         timing = effective_discovery_timing(options, candidate, options.payload_bytes)
@@ -4899,6 +4933,7 @@ def run_scan(options: ScanOptions) -> int:
     )
     metadata["completed_candidates"] = len(results)
     metadata["elapsed_sec"] = elapsed_sec
+    metadata["switch_note"] = options.switch_note
     metadata["early_stop_reason"] = (
         "operator-ended-after-top-match" if early_stopped else None
     )
@@ -4928,8 +4963,6 @@ def run_scan(options: ScanOptions) -> int:
         options=options,
         phase2_candidate_source=phase2_candidate_source,
     )
-    write_json_report(options.json_report, metadata, results)
-    write_csv_report(options.csv_report, results, metadata)
     logger.info(
         "serial_probe completed; candidates=%s/%s early_stopped=%s exploratory_narrowed=%s phase2_source=%s",
         len(results),
@@ -4938,8 +4971,7 @@ def run_scan(options: ScanOptions) -> int:
         exploratory_narrowing_accepted,
         phase2_candidate_source,
     )
-    logger.info("json_report=%s", options.json_report)
-    logger.info("csv_report=%s", options.csv_report)
+    logger.info("text_report=%s", options.text_report)
 
     print()
     print_report_title("PHASE 1 RESULTS")
@@ -4982,6 +5014,7 @@ def run_scan(options: ScanOptions) -> int:
         )
         if report.release_reason:
             print(f"  NOTE:                 BAUD FOCUS RELEASED: {report.release_reason}.")
+    validation_results: list[CandidateResult] = []
     if options.auto_validate_top_matches and results:
         ranked = ranked_top_results(results, options.top)
         top_score = ranked[0].score if ranked else 0.0
@@ -5059,11 +5092,17 @@ def run_scan(options: ScanOptions) -> int:
                 min(options.top, len(final_stage2_results)),
                 report_title="PHASE 2 FINAL REPORT",
             )
+            validation_results = list(final_stage2_results)
+    write_text_report(
+        options.text_report,
+        metadata,
+        results,
+        validation_results=validation_results,
+    )
     print()
     print_report_title("REPORT FILES")
-    print(f"  JSON FILE: {options.json_report}")
-    print(f"  CSV FILE:  {options.csv_report}")
-    print(f"  LOG FILE:  {options.log_file}")
+    print(f"  TEXT REPORT: {options.text_report} (APPENDED)")
+    print(f"  DEBUG LOG:   {options.log_file}")
     print(border_line(REPORT_WIDTH))
     return 0
 
