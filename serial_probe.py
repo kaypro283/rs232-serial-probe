@@ -24,7 +24,7 @@ import sys
 import threading
 import textwrap
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -91,27 +91,6 @@ PHASE0_BASELINE_STOP_BITS = 1
 PHASE0_BASELINE_FLOW_CONTROL = "none"
 DUAL_PHASE0_BAUD_PAIR_LIMIT = 6
 DUAL_PHASE0_FALLBACK_PAIR_LIMIT = 4
-EXPLORATORY_PAYLOAD_BYTES = 160
-EXPLORATORY_READ_TIMEOUT = 0.4
-EXPLORATORY_SETTLE_MS = 20
-EXPLORATORY_BURSTS = 1
-EXPLORATORY_PROGRESS_INTERVAL = 1.0
-EXPLORATORY_PRE_DRAIN_TIMEOUT = 0.5
-EXPLORATORY_PRE_DRAIN_QUIET = 0.1
-EXPLORATORY_MAX_DRAIN_BYTES = DEFAULT_MAX_DRAIN_BYTES
-EXPLORATORY_SHORTLIST_LIMIT = 12
-EXPLORATORY_MIN_NARROW_SCORE = 30.0
-EXPLORATORY_SCORE_TOLERANCE = 10.0
-EXPLORATORY_SUMMARY_ROWS = 8
-PHASE2_VIABLE_SIGNAL_STATUSES = {"weak", "partial", "strong", "exact"}
-PHASE2_CANDIDATE_SOURCE_NARROWED = "exploratory-narrowed"
-PHASE2_CANDIDATE_SOURCE_VIABLE = "exploratory-viable-signals"
-PHASE2_CANDIDATE_SOURCE_FULL = "all-selected-settings"
-BAUD_FOCUS_ENABLED_DEFAULT = True
-BAUD_FOCUS_STRONG_SCORE_THRESHOLD = 90.0
-BAUD_FOCUS_LEAD_GAP_THRESHOLD = 20.0
-BAUD_FOCUS_MIN_STRONG_RESULTS = 3
-BAUD_FOCUS_MIN_SAMPLES = 8
 FNV_OFFSET_32 = 0x811C9DC5
 FNV_PRIME_32 = 0x01000193
 ProgressCallback = Callable[[str], None]
@@ -414,11 +393,6 @@ class ScanOptions:
     validate_size_2_tie_bytes: int
     auto_validate_flow_control: bool
     flow_validate_size_bytes: int
-    baud_focus_enabled: bool
-    baud_focus_strong_score_threshold: float
-    baud_focus_lead_gap_threshold: float
-    baud_focus_min_strong_results: int
-    baud_focus_min_samples: int
     run_id: str = ""
 
 
@@ -434,79 +408,11 @@ class EffectiveTiming:
 
 
 @dataclass(frozen=True)
-class BaudFocusStats:
-    """Observed exploratory score pattern for one baud rate."""
-
-    baud: int
-    samples: int
-    strong_results: int
-    best_score: float
-
-
-@dataclass(frozen=True)
-class BaudFocusDecision:
-    """Current baud-focus confidence decision."""
-
-    baud: int | None
-    reason: str | None
-    disabled_reason: str | None
-
-
-@dataclass(frozen=True)
-class BaudFocusReport:
-    """Run summary for exploratory baud-focused narrowing."""
-
-    enabled: bool
-    engaged: bool
-    focused_baud: int | None
-    deferred_other_bauds: bool
-    deferred_candidate_count: int
-    deferred_bauds: list[int]
-    engage_reason: str | None
-    release_reason: str | None
-    disabled_reason: str | None
-    tested_before_engage: int | None
-
-
-@dataclass(frozen=True)
 class Phase0LivenessDecision:
     """Boolean liveness decision for one Phase 0 baud probe."""
 
     alive: bool
     reason: str
-
-
-@dataclass(frozen=True)
-class BaudLivenessResult:
-    """Phase 0 result for one baseline baud probe."""
-
-    baud: int
-    alive: bool
-    reason: str
-    settings: SerialSettings
-    score: float
-    status: str
-    error: str | None
-    bytes_sent: int
-    bytes_received: int
-    bytes_drained_before: int
-    elapsed_sec: float
-    metrics: ScoreMetrics
-
-
-@dataclass(frozen=True)
-class BaudLivenessReport:
-    """Run summary for the Phase 0 baud liveness sweep."""
-
-    ran: bool
-    tested_bauds: list[int]
-    alive_bauds: list[int]
-    fallback_to_all_bauds: bool
-    fallback_reason: str | None
-    candidate_count_before: int
-    candidate_count_after: int
-    elapsed_sec: float
-    results: list[BaudLivenessResult]
 
 
 @dataclass(frozen=True)
@@ -540,24 +446,6 @@ class DualBaudLivenessReport:
     fallback_reason: str | None
     elapsed_sec: float
     results: list[DualBaudLivenessResult]
-
-
-@dataclass(frozen=True)
-class ExploratorySelection:
-    """Ranked exploratory findings and the optional full-scan candidate subset."""
-
-    results: list[CandidateResult]
-    ranked_results: list[CandidateResult]
-    shortlist_results: list[CandidateResult]
-    narrowed_candidates: list[SerialSettings]
-    elapsed_sec: float
-    fallback_reason: str | None
-    notes: list[str]
-    cutoff_score: float | None
-    truncated: bool
-    baud_focus: BaudFocusReport
-    phase0_liveness: BaudLivenessReport
-    viable_candidates: list[SerialSettings] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -1247,27 +1135,6 @@ def scan_bauds(min_baud: int, max_baud: int) -> list[int]:
     return list(reversed(available_bauds(min_baud, max_baud)))
 
 
-def exhaustive_candidates(bauds: Sequence[int]) -> list[SerialSettings]:
-    """Return the full Cartesian candidate list in the documented order."""
-    return [
-        SerialSettings(baud, data_bits, parity, stop_bits, flow)
-        for baud in bauds
-        for data_bits in DATA_BITS
-        for parity in PARITIES
-        for stop_bits in STOP_BITS
-        for flow in FLOW_CONTROLS
-    ]
-
-
-def generate_candidates(
-    min_baud: int,
-    max_baud: int,
-) -> list[SerialSettings]:
-    """Generate the full Cartesian candidate list for a scan."""
-    bauds = scan_bauds(min_baud, max_baud)
-    return exhaustive_candidates(bauds)
-
-
 def normalize_port_name(port: str) -> str:
     """Normalize a Windows COM port name for same-port checks."""
     normalized = port.strip().upper()
@@ -1699,52 +1566,6 @@ def receive_completion_detected(received: bytes, expected: bytes) -> bool:
         score.score >= TOP_MATCH_MIN_SCORE
         and score.metrics.end_marker_present
         and score.metrics.line_integrity_ratio >= 1.0
-    )
-
-
-def discovery_frame_priority(settings: SerialSettings) -> tuple[int, int, int, int]:
-    """Return a priority key that puts common printer-buffer frames first."""
-    parity_rank = {
-        "none": 0,
-        "even": 1,
-        "odd": 2,
-        "mark": 4,
-        "space": 5,
-    }.get(settings.parity, 9)
-    flow_rank = {
-        "none": 0,
-        "xon/xoff": 1,
-        "rts/cts": 2,
-        "dsr/dtr": 3,
-    }.get(settings.flow_control, 9)
-    data_rank = 0 if settings.data_bits == 8 else 1
-    stop_rank = 0 if settings.stop_bits == 1 else 1
-    if settings.data_bits == 8 and settings.parity == "none" and settings.stop_bits == 1:
-        frame_rank = 0
-    elif settings.data_bits == 8 and settings.parity in {"even", "odd"} and settings.stop_bits == 1:
-        frame_rank = 1
-    elif settings.data_bits == 7 and settings.parity in {"even", "odd"} and settings.stop_bits == 1:
-        frame_rank = 2
-    else:
-        frame_rank = 3 + data_rank + stop_rank + parity_rank
-    return frame_rank, flow_rank, parity_rank, stop_rank
-
-
-def prioritize_discovery_candidates(
-    candidates: Sequence[SerialSettings],
-    options: ScanOptions,
-) -> list[SerialSettings]:
-    """Return candidates in turbo discovery priority order when enabled."""
-    if not options.turbo_discovery_enabled:
-        return list(candidates)
-    baud_order = scan_bauds(options.min_baud, options.max_baud)
-    baud_rank = {baud: index for index, baud in enumerate(baud_order)}
-    return sorted(
-        candidates,
-        key=lambda candidate: (
-            baud_rank.get(candidate.baud, len(baud_rank)),
-            discovery_frame_priority(candidate),
-        ),
     )
 
 
@@ -2620,21 +2441,6 @@ def result_sort_key(result: CandidateResult) -> tuple[float, float, float, int]:
     )
 
 
-def ranked_top_results(
-    results: Sequence[CandidateResult],
-    top: int,
-) -> list[CandidateResult]:
-    """Return top non-zero results, including all perfect scores when tied."""
-    ranked = [
-        result
-        for result in sorted(results, key=result_sort_key, reverse=True)
-        if result.score > 0.0
-    ]
-    perfect_count = sum(1 for result in ranked if result.score >= PERFECT_SCORE)
-    display_count = max(top, perfect_count)
-    return ranked[:display_count]
-
-
 def setup_logging(log_file: Path) -> logging.Logger:
     """Configure file logging and return the scan logger."""
     log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -2686,45 +2492,6 @@ def dataclass_to_jsonable(value: Any) -> Any:
     return value
 
 
-def candidate_table_lines(
-    results: Sequence[CandidateResult],
-    top: int,
-    title: str,
-) -> list[str]:
-    """Return compact ranked result table lines for text reports."""
-    ranked = ranked_top_results(results, top)
-    lines = [
-        title,
-        border_line(REPORT_WIDTH),
-        "RK SCORE   BAUD MODE FLOW       SENT   READ  CLR  EXCT LINE RESULT",
-        border_line(REPORT_WIDTH),
-    ]
-    for rank, result in enumerate(ranked, start=1):
-        mode = (
-            f"{result.settings.data_bits}"
-            f"{result.settings.parity_code()}"
-            f"{result.settings.stop_bits}"
-        )
-        indicator = result_indicator(result.score, result.status, result.error)
-        lines.append(
-            f"{rank:>2} "
-            f"{result.score:>5.1f} "
-            f"{result.settings.baud:>6} "
-            f"{mode:<4} "
-            f"{result.settings.flow_control.upper():<8} "
-            f"{result.bytes_sent:>6} "
-            f"{result.bytes_received:>6} "
-            f"{result.bytes_drained_before:>4} "
-            f"{result.metrics.exact_byte_match_ratio:>4.2f} "
-            f"{result.metrics.line_integrity_ratio:>4.2f} "
-            f"{indicator}"
-        )
-    lines.append(border_line(REPORT_WIDTH))
-    if not ranked:
-        lines.append("NO NON-ZERO RESULTS.")
-    return lines
-
-
 def result_count_summary(results: Sequence[CandidateResult]) -> str:
     """Return PASS/GOOD/PARTIAL/FAIL/STALE/ERROR counts."""
     counts: dict[str, int] = {}
@@ -2735,11 +2502,6 @@ def result_count_summary(results: Sequence[CandidateResult]) -> str:
         f"{name}={counts.get(name, 0)}"
         for name in ("PASS", "GOOD", "PARTIAL", "FAIL", "STALE", "ERROR")
     )
-
-
-def scan_type_label(scan_mode: str) -> str:
-    """Return the operator-facing scan type label."""
-    return "QUICK" if scan_mode == "quick" else "FULL"
 
 
 def frame_label(settings: SerialSettings | DualSerialSettings) -> str:
@@ -2794,172 +2556,6 @@ def stale_nonce_seen(results: Sequence[CandidateResult]) -> bool:
     )
 
 
-def best_drain_estimate_lines(result: CandidateResult | None) -> list[str]:
-    """Return full-buffer drain estimate lines for the best setting."""
-    if result is None:
-        return []
-    base = estimated_buffer_drain_seconds(result.settings, safety_factor=1.0)
-    safe = estimated_buffer_drain_seconds(result.settings)
-    return [
-        f"16K DRAIN EST.:  {format_duration(base)} RAW, {format_duration(safe)} WITH SAFETY.",
-        "PURGE NOTE:      SHORT QUIET DRAINS DO NOT PROVE A 16K BUFFER IS EMPTY.",
-    ]
-
-
-def text_report_summary_lines(
-    results: Sequence[CandidateResult],
-    metadata: dict[str, Any],
-) -> list[str]:
-    """Return summary and interpretation lines for one report section."""
-    ranked = sorted(results, key=result_sort_key, reverse=True)
-    best = ranked[0] if ranked else None
-    tied = top_tied_results(results)
-    lines = [
-        f"SETTINGS TESTED: {len(results)}/{metadata.get('phase2_candidate_count', len(results))}",
-        f"RESULT COUNTS:   {result_count_summary(results)}",
-        f"FINDING:         {confidence_summary(best, len(tied))}",
-    ]
-    if best is not None:
-        lines.append(f"BEST SETTING:    {best.settings.label()}")
-        lines.append(
-            f"BEST SCORE:      {best.score:.2f} "
-            f"SENT/READ={best.bytes_sent}/{best.bytes_received}"
-        )
-        lines.extend(best_drain_estimate_lines(best))
-    lines.extend(frame_ambiguity_lines(results))
-    if stale_nonce_seen(results):
-        lines.append("STALE DATA:      WRONG-NONCE OR OLD PROBE DATA WAS DETECTED.")
-    if len(tied) > 1:
-        lines.append(
-            f"AMBIGUOUS:       {len(tied)} SETTINGS TIED WITHIN "
-            f"{TIE_SCORE_TOLERANCE:.1f} POINTS."
-        )
-        lines.append("ACTION:          DO NOT TREAT ROW 1 AS UNIQUE.")
-    elif is_recommendable_result(best):
-        lines.append("ACTION:          BAUD/ASCII TRANSFER LOOKS GOOD; REVIEW AMBIGUITIES.")
-    elif has_any_signal(results):
-        lines.append("ACTION:          PARTIAL RESULT ONLY; REPEAT OR CHECK WIRING.")
-    else:
-        lines.append("ACTION:          NO WORKING SETTING FOUND FOR THIS SWITCH STATE.")
-    return lines
-
-
-def write_text_report(
-    path: Path,
-    metadata: dict[str, Any],
-    results: Sequence[CandidateResult],
-    validation_results: Sequence[CandidateResult] | None = None,
-    flow_validation_results: Sequence[FlowControlValidationResult] | None = None,
-) -> None:
-    """Append one compact old-school text report entry."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    validation_results = [] if validation_results is None else list(validation_results)
-    flow_validation_results = (
-        []
-        if flow_validation_results is None
-        else list(flow_validation_results)
-    )
-    options = metadata.get("options", {})
-    exploratory = metadata.get("exploratory_mode", {})
-    phase0 = exploratory.get("phase0_baud_liveness", {})
-    baud_focus = exploratory.get("baud_focus", {})
-    created = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-    switch_note = str(metadata.get("switch_note") or "").strip()
-    lines = [
-        "",
-        border_line(REPORT_WIDTH),
-        bordered_text("SERIAL PROBE RUN REPORT", REPORT_WIDTH),
-        border_line(REPORT_WIDTH),
-        f"APPENDED:        {created}",
-        f"STARTED UTC:     {metadata.get('started_at', '')}",
-        f"RUN ID:          {metadata.get('run_id', '')}",
-        f"COM PATH:        {metadata.get('in_port')} -> BUFFER -> {metadata.get('out_port')}",
-        f"DIP NOTE:        {switch_note if switch_note else '(NOT ENTERED)'}",
-        f"SCAN TYPE:       {scan_type_label(str(metadata.get('scan_mode', '')))}",
-        f"BAUD RANGE:      {options.get('min_baud')}..{options.get('max_baud')}",
-        f"TEST BYTES:      {options.get('payload_bytes')} X {options.get('bursts')}",
-        f"REPORT STATUS:   {metadata.get('recommendation_status')}",
-        "",
-        "ASSUMPTIONS:",
-        "  BUFFER IS PHYSICALLY BETWEEN THE TWO COM PORTS.",
-        "  SWITCH BANKS ARE NOT ASSUMED TO BE TWO COMPLETE PORT PROFILES.",
-        "  THE PROGRAM SETS BOTH PC COM PORTS; DEVICE MANAGER DEFAULTS ARE NOT USED.",
-        "",
-    ]
-    if metadata.get("operator_break_action"):
-        lines.extend(
-            [
-                f"OPERATOR BREAK:  {metadata.get('operator_break_stage', 'SCAN')}",
-                f"BREAK ACTION:    {str(metadata.get('operator_break_action')).upper()}",
-                "",
-            ]
-        )
-    if phase0:
-        alive = ",".join(str(baud) for baud in phase0.get("alive_bauds", []))
-        lines.extend(
-            [
-                f"PHASE 0 BAUDS:   {alive if alive else '(NONE)'}",
-                f"PHASE 0 FALLBACK:{' YES' if phase0.get('fallback_to_all_bauds') else ' NO'}",
-            ]
-        )
-    if baud_focus:
-        lines.append(
-            "QUICK BAUD FOCUS: "
-            + (
-                f"ENGAGED {baud_focus.get('focused_baud')}"
-                if baud_focus.get("engaged")
-                else "NOT ENGAGED"
-            )
-        )
-    lines.extend(
-        [
-            "",
-            "PHASE 1 SUMMARY:",
-            *text_report_summary_lines(results, metadata),
-            "",
-            *candidate_table_lines(results, int(metadata.get("top", 15)), "PHASE 1 TOP RESULTS"),
-        ]
-    )
-    if validation_results:
-        validation_metadata = dict(metadata)
-        validation_metadata["phase2_candidate_count"] = len(validation_results)
-        lines.extend(
-            [
-                "",
-                "VALIDATION SUMMARY:",
-                *text_report_summary_lines(validation_results, validation_metadata),
-                "",
-                *candidate_table_lines(
-                    validation_results,
-                    min(int(metadata.get("top", 15)), len(validation_results)),
-                    "VALIDATION TOP RESULTS",
-                ),
-            ]
-        )
-    if flow_validation_results:
-        lines.extend(
-            [
-                "",
-                *flow_validation_report_lines(flow_validation_results),
-            ]
-        )
-    lines.extend(
-        [
-            "",
-            "INTERPRETATION NOTES:",
-            "  BAUD RESULT IS THE STRONGEST EVIDENCE IN THIS DISCOVERY TEST.",
-            "  ASCII-ONLY TRANSFER DOES NOT PROVE 8-BIT CLEANLINESS.",
-            "  STOP-BIT COUNT CAN BE BYTE-INVISIBLE AND MAY REMAIN AMBIGUOUS.",
-            "  PARITY IS NOT PROVEN UNLESS IT CREATES AN OBSERVABLE BYTE DIFFERENCE.",
-            "  FLOW CONTROL REQUIRES HOLD/RELEASE OR BACKPRESSURE VALIDATION.",
-            "  WRONG-NONCE DATA MEANS STALE BUFFER OUTPUT OR A WRONG CANDIDATE/TRIAL.",
-            border_line(REPORT_WIDTH),
-        ]
-    )
-    with path.open("a", encoding="utf-8") as report_file:
-        report_file.write("\n".join(lines) + "\n")
-
-
 def format_progress(result: CandidateResult) -> str:
     """Return one console progress line for a candidate result."""
     status = result.status.upper() if not result.error else f"{result.status.upper()}: {result.error[:60]}"
@@ -3001,44 +2597,6 @@ def format_scan_eta(
         f"LEFT={format_duration(remaining_seconds)} "
         f"FINISH={finish}"
     )
-
-
-def print_ranked_table(
-    results: Sequence[CandidateResult],
-    top: int,
-    report_title: str = "SERIAL PROBE FINAL REPORT",
-) -> None:
-    """Print a ranked non-zero table to stdout."""
-    ranked = ranked_top_results(results, top)
-    print()
-    print_report_title(report_title)
-    print("TOP OBSERVED RESULTS (NON-ZERO SCORES)")
-    print(border_line(REPORT_WIDTH))
-    print(
-        "RK SCORE   BAUD MODE FLOW       SENT   READ  CLR  EXCT LINE RESULT"
-    )
-    print(border_line(REPORT_WIDTH))
-    for rank, result in enumerate(ranked, start=1):
-        mode = (
-            f"{result.settings.data_bits}"
-            f"{result.settings.parity_code()}"
-            f"{result.settings.stop_bits}"
-        )
-        indicator = result_indicator(result.score, result.status, result.error)
-        print(
-            f"{rank:>2} "
-            f"{result.score:>5.1f} "
-            f"{result.settings.baud:>6} "
-            f"{mode:<4} "
-            f"{result.settings.flow_control.upper():<8} "
-            f"{result.bytes_sent:>6} "
-            f"{result.bytes_received:>6} "
-            f"{result.bytes_drained_before:>4} "
-            f"{result.metrics.exact_byte_match_ratio:>4.2f} "
-            f"{result.metrics.line_integrity_ratio:>4.2f} "
-            f"{indicator}"
-        )
-    print(border_line(REPORT_WIDTH))
 
 
 def is_recommendable_result(result: CandidateResult | None) -> bool:
@@ -3134,72 +2692,6 @@ def confidence_summary(result: CandidateResult | None, tied_count: int = 0) -> s
     return "NO CONFIDENT MATCH. CHECK CABLES, PORTS, FLOW CONTROL."
 
 
-def print_result_details(result: CandidateResult) -> None:
-    """Print switch-setting and score details for one scan result."""
-    print(f"    BAUD RATE:          {result.settings.baud}")
-    print(f"    DATA BITS:          {result.settings.data_bits}")
-    print(
-        f"    PARITY:             "
-        f"{parity_name(result.settings.parity)} ({result.settings.parity_code()})"
-    )
-    print(f"    STOP BITS:          {result.settings.stop_bits}")
-    print(f"    FLOW CONTROL:       {flow_control_name(result.settings.flow_control)}")
-    print("    FRAME NOTE:         DATA/PARITY/STOP MAY BE BYTE-AMBIGUOUS.")
-    if result.settings.flow_control != "none":
-        print("    FLOW NOTE:          CLEAN TRANSFER IS NOT HANDSHAKE PROOF.")
-    print_wrapped_value("    SETTING:            ", result.settings.label())
-    print(
-        f"    RESULT:             "
-        f"{result_indicator(result.score, result.status, result.error)}"
-    )
-    print(f"    SCORE:              {result.score:.2f}/100")
-    print(f"    REPEAT:             {result.repeatability:.3f}")
-    print(f"    SENT/READ:          {result.bytes_sent}/{result.bytes_received}")
-    print(f"    OLD BYTES CLEAR:    {result.bytes_drained_before}")
-    print(f"    EXACT RATIO:        {result.metrics.exact_byte_match_ratio:.3f}")
-    print(f"    LINE RATIO:         {result.metrics.line_integrity_ratio:.3f}")
-    print(f"    ASCII RATIO:        {result.metrics.printable_ascii_ratio:.3f}")
-    print(f"    MISSING/EXTRA:      {result.metrics.missing_bytes}/{result.metrics.extra_bytes}")
-    if result.status == "stale-output":
-        print("    NOTE:               OUTPUT NEVER WENT QUIET.")
-        if result.error:
-            print_wrapped_value("    DETAIL:             ", result.error)
-    elif result.status in {"wrong-nonce", "mixed-nonce"}:
-        print("    NOTE:               STALE OR WRONG-NONCE PROBE DATA WAS SEEN.")
-        print(
-            "    NONCE LINES:        "
-            f"CURRENT={result.metrics.current_nonce_line_count} "
-            f"WRONG={result.metrics.wrong_nonce_line_count}"
-        )
-    elif result.status == "eight-bit-not-clean":
-        print("    NOTE:               ASCII MAY PASS, BUT 8-BIT PATH IS NOT CLEAN.")
-    elif result.error:
-        print_wrapped_value("    ERROR:              ", result.error)
-    elif result.metrics.extra_bytes > result.bytes_sent:
-        print("    NOTE:               EXTRA OUTPUT/BACKLOG PRESENT.")
-
-
-def print_tied_results(results: Sequence[CandidateResult]) -> None:
-    """Print a compact table of tied top candidate settings."""
-    print("    RK   SCORE   SETTING")
-    for rank, result in enumerate(results, start=1):
-        print(f"    {rank:>4}  {result.score:>5.1f}   {result.settings.label()}")
-
-
-def ask_continue_after_top_match(result: CandidateResult) -> bool:
-    """Ask the operator whether to continue after a top match."""
-    print()
-    print(border_line(REPORT_WIDTH))
-    print(bordered_text("TOP MATCH FOUND", REPORT_WIDTH))
-    print(border_line(REPORT_WIDTH))
-    print_wrapped_value("    SETTING:            ", result.settings.label())
-    print(f"    SCORE:              {result.score:.2f}/100")
-    print("    CONTINUE TO LOOK FOR POSSIBLE TIES.")
-    print("    ENTER N TO END NOW AND WRITE REPORT.")
-    print(border_line(REPORT_WIDTH))
-    return prompt_yes_no("CONTINUE SCAN", True)
-
-
 def prompt_operator_break_action(target: str = "SCAN") -> str:
     """Ask what to do after Ctrl+C/BREAK during a running test."""
     target = target.upper()
@@ -3252,134 +2744,6 @@ def flow_control_name(flow_control: str) -> str:
     }[flow_control]
 
 
-def aggregate_result_timing(results: Sequence[CandidateResult]) -> TimingBreakdown:
-    """Return total timing across candidate results."""
-    return combine_timing_breakdowns([result.timing for result in results])
-
-
-def slowest_stage_labels(timing: TimingBreakdown, count: int = 3) -> list[str]:
-    """Return labels for the slowest timing stages."""
-    stages = [
-        ("OPEN/SETUP", timing.open_setup_sec),
-        ("DRAIN", timing.drain_sec),
-        ("WRITE", timing.write_sec),
-        ("READ WAIT", timing.read_wait_sec),
-        ("OTHER", timing.other_sec),
-    ]
-    stages.sort(key=lambda item: item[1], reverse=True)
-    return [
-        f"{name}={format_duration(seconds).upper()}"
-        for name, seconds in stages[:count]
-        if seconds > 0.0
-    ]
-
-
-def print_scan_summary(
-    results: Sequence[CandidateResult],
-    total_candidates: int,
-    elapsed_sec: float,
-    early_stopped: bool,
-    top: int,
-    early_stop_reason: str | None = None,
-) -> None:
-    """Print a concise human-readable scan summary."""
-    ranked = sorted(results, key=result_sort_key, reverse=True)
-    best = ranked[0] if ranked else None
-    tied = top_tied_results(results)
-    counts: dict[str, int] = {}
-    for result in results:
-        indicator = result_indicator(result.score, result.status, result.error)
-        counts[indicator] = counts.get(indicator, 0) + 1
-
-    print()
-    print_report_title("SCAN SUMMARY")
-    print(f"  RUN TIME:             {format_duration(elapsed_sec)}")
-    print(f"  SETTINGS TESTED:      {len(results)}/{total_candidates}")
-    if results:
-        print(
-            "  AVG SETTING TIME:     "
-            f"{format_duration(elapsed_sec / max(len(results), 1))}"
-        )
-        slow_labels = slowest_stage_labels(aggregate_result_timing(results))
-        if slow_labels:
-            print("  SLOWEST STAGES:       " + ", ".join(slow_labels))
-    print(f"  ENDED EARLY:          {'YES' if early_stopped else 'NO'}")
-    print(
-        "  RESULT COUNTS:        "
-        + ", ".join(
-            f"{name}={counts.get(name, 0)}"
-            for name in ("PASS", "GOOD", "PARTIAL", "FAIL", "STALE", "ERROR")
-        )
-    )
-    print(f"  TOP ROWS:             {len(ranked_top_results(results, top))}")
-    print(f"  FINDING:              {confidence_summary(best, len(tied))}")
-    if early_stopped:
-        if early_stop_reason == "operator-ended-after-top-match":
-            print("  NOTE:                 OPERATOR ENDED AFTER TOP MATCH.")
-            print("                        LATER SETTINGS WERE NOT TESTED FOR TIES.")
-        else:
-            print("  NOTE:                 OPERATOR BREAK ENDED SCAN EARLY.")
-            print("                        UNTESTED SETTINGS MAY STILL MATCH.")
-
-    if best is None:
-        return
-
-    print()
-    print(border_line(REPORT_WIDTH))
-    if len(tied) > 1:
-        print(bordered_text("MULTIPLE TOP SETTINGS FOUND", REPORT_WIDTH))
-        print(border_line(REPORT_WIDTH))
-        print(
-            "    MORE THAN ONE SETTING MATCHED WITHIN "
-            f"{TIE_SCORE_TOLERANCE:.1f} SCORE POINTS."
-        )
-        print("    DO NOT TREAT ROW 1 AS THE ONLY POSSIBLE SWITCH SETTING.")
-        print("    BYTE TRANSFER DOES NOT DISTINGUISH THESE FRAME SETTINGS.")
-        print()
-        print_tied_results(ranked_top_results(tied, top))
-        print(border_line(REPORT_WIDTH))
-        return
-
-    if is_recommendable_result(best):
-        print(bordered_text("BEST OBSERVED TRANSFER", REPORT_WIDTH))
-        print(border_line(REPORT_WIDTH))
-        print_result_details(best)
-        for line in frame_ambiguity_lines(results):
-            print_wrapped_value("    NOTE:               ", line)
-        for line in best_drain_estimate_lines(best):
-            print_wrapped_value("    NOTE:               ", line)
-        if early_stopped:
-            if early_stop_reason == "operator-ended-after-top-match":
-                print("    NOTE:               OPERATOR ENDED AFTER THIS TOP MATCH.")
-                print("                        POSSIBLE LATER TIES WERE NOT TESTED.")
-            else:
-                print("    NOTE:               OPERATOR BREAK ENDED SCAN EARLY.")
-                print("                        UNTESTED SETTINGS MAY STILL MATCH.")
-        print(border_line(REPORT_WIDTH))
-        return
-
-    if has_any_signal(results):
-        print(bordered_text("NO RELIABLE SETTING FOUND", REPORT_WIDTH))
-        print(border_line(REPORT_WIDTH))
-        print("    BEST ROW WAS ONLY A PARTIAL RESULT.")
-        print("    DO NOT USE IT AS THE BUFFER SWITCH SETTING YET.")
-        print("    RESET/CLEAR BUFFER, CHECK CABLES AND FLOW CONTROL, RUN AGAIN.")
-    else:
-        print(bordered_text("NO WORKING SETTING FOUND", REPORT_WIDTH))
-        print(border_line(REPORT_WIDTH))
-        print("    CURRENT BUFFER SWITCH SETUP DID NOT PASS ANY TEST.")
-        print("    DO NOT USE TOP ROW AS A SWITCH RECOMMENDATION.")
-        print("    POSSIBLE CAUSES: UNUSED SWITCH POSITION, DISABLED PORT,")
-        print("    HELD OUTPUT, WRONG CABLE, WRONG COM PORT, FLOW-CONTROL HOLD.")
-
-    print()
-    print(border_line(REPORT_WIDTH))
-    print(bordered_text("BEST OBSERVED RESULT ONLY", REPORT_WIDTH))
-    print(border_line(REPORT_WIDTH))
-    print_result_details(best)
-    print(border_line(REPORT_WIDTH))
-
-
 def default_report_paths() -> tuple[Path, Path]:
     """Return append-only text report and debug log paths."""
     return Path("serial_probe_report.txt"), Path("serial_probe_debug.log")
@@ -3413,11 +2777,6 @@ def default_scan_options() -> ScanOptions:
         validate_size_2_tie_bytes=16 * 1024,
         auto_validate_flow_control=True,
         flow_validate_size_bytes=FLOW_VALIDATE_PAYLOAD_BYTES,
-        baud_focus_enabled=BAUD_FOCUS_ENABLED_DEFAULT,
-        baud_focus_strong_score_threshold=BAUD_FOCUS_STRONG_SCORE_THRESHOLD,
-        baud_focus_lead_gap_threshold=BAUD_FOCUS_LEAD_GAP_THRESHOLD,
-        baud_focus_min_strong_results=BAUD_FOCUS_MIN_STRONG_RESULTS,
-        baud_focus_min_samples=BAUD_FOCUS_MIN_SAMPLES,
     )
 
 
@@ -3460,37 +2819,7 @@ def validate_options(options: ScanOptions) -> None:
         raise ValueError(f"VALIDATE SIZE 2 MUST BE 0 OR AT LEAST {minimum_payload_size()} BYTES")
     if options.flow_validate_size_bytes < minimum_payload_size():
         raise ValueError(f"FLOW VALIDATE SIZE MUST BE AT LEAST {minimum_payload_size()} BYTES")
-    if not 0.0 <= options.baud_focus_strong_score_threshold <= 100.0:
-        raise ValueError("QUICK BAUD FOCUS SCORE MUST BE 0..100")
-    if options.baud_focus_lead_gap_threshold < 0.0:
-        raise ValueError("QUICK BAUD FOCUS GAP CANNOT BE NEGATIVE")
-    if options.baud_focus_min_strong_results <= 0:
-        raise ValueError("QUICK BAUD FOCUS GOOD COUNT MUST BE POSITIVE")
-    if options.baud_focus_min_samples <= 0:
-        raise ValueError("QUICK BAUD FOCUS SAMPLE COUNT MUST BE POSITIVE")
     available_bauds(options.min_baud, options.max_baud)
-
-
-def estimate_scan_wire_seconds(options: ScanOptions) -> float:
-    """Estimate total data-sending time for the selected scan."""
-    candidates = generate_candidates(options.min_baud, options.max_baud)
-    return sum(
-        estimated_transmit_seconds(candidate, options.payload_bytes) * options.bursts
-        for candidate in candidates
-    )
-
-
-def estimate_scan_overhead_seconds(options: ScanOptions) -> float:
-    """Estimate non-wire wait time assuming quiet output."""
-    candidates = generate_candidates(options.min_baud, options.max_baud)
-    total = 0.0
-    for candidate in candidates:
-        timing = effective_discovery_timing(options, candidate, options.payload_bytes)
-        per_burst = timing.read_timeout + (timing.settle_ms / 1000.0)
-        if not options.no_pre_drain:
-            per_burst += timing.pre_drain_quiet
-        total += per_burst * options.bursts
-    return total
 
 
 def phase0_baseline_settings(baud: int) -> SerialSettings:
@@ -3746,37 +3075,6 @@ def run_known_baud_purge(
     return result
 
 
-def run_deep_purge_menu(options: ScanOptions) -> None:
-    """Prompt for and run an explicit known-baud deep purge."""
-    settings = prompt_serial_setting(
-        SerialSettings(1200, 8, "none", 1, "none"),
-        title="KNOWN-BAUD PURGE SETTING",
-        intro="ENTER OUTPUT-SIDE SETTING TO DRAIN THE BUFFER.",
-    )
-    safe_estimate = estimated_buffer_drain_seconds(settings)
-    print()
-    print_report_title("DEEP PURGE ESTIMATE")
-    print(f"  SETTING:              {settings.label()}")
-    print(f"  FULL 16K ESTIMATE:    {format_duration(safe_estimate)} WITH SAFETY")
-    print("  ENTER A SHORTER LIMIT TO SAMPLE, OR THE FULL ESTIMATE TO WAIT IT OUT.")
-    print(border_line(REPORT_WIDTH))
-    max_seconds = prompt_float(
-        "PURGE TIME LIMIT, SECONDS",
-        min(safe_estimate, 30.0),
-        0.1,
-    )
-    logger = setup_logging(options.log_file)
-    serial_module = import_or_install_pyserial()
-    run_known_baud_purge(
-        serial_module=serial_module,
-        options=options,
-        logger=logger,
-        settings=settings,
-        max_seconds=max_seconds,
-        reason="OPERATOR REQUESTED EXPLICIT KNOWN-BAUD PURGE.",
-    )
-
-
 def phase0_extra_byte_limit(expected_byte_count: int) -> int:
     """Return the tolerated extra-byte limit for Phase 0 liveness."""
     ratio_limit = int(expected_byte_count * PHASE0_MAX_EXTRA_BYTES_RATIO)
@@ -3814,857 +3112,40 @@ def classify_phase0_liveness(
     return Phase0LivenessDecision(True, "VALID PROBE STRUCTURE")
 
 
-def baud_liveness_result_from_candidate(
-    result: CandidateResult,
-    decision: Phase0LivenessDecision,
-) -> BaudLivenessResult:
-    """Return the compact Phase 0 report row for one candidate result."""
-    return BaudLivenessResult(
-        baud=result.settings.baud,
-        alive=decision.alive,
-        reason=decision.reason,
-        settings=result.settings,
-        score=result.score,
-        status=result.status,
-        error=result.error,
-        bytes_sent=result.bytes_sent,
-        bytes_received=result.bytes_received,
-        bytes_drained_before=result.bytes_drained_before,
-        elapsed_sec=result.elapsed_sec,
-        metrics=result.metrics,
-    )
-
-
-def empty_baud_liveness_report(
-    candidate_count: int,
-    fallback_reason: str | None = None,
-) -> BaudLivenessReport:
-    """Return a not-run Phase 0 liveness report for metadata."""
-    return BaudLivenessReport(
-        ran=False,
-        tested_bauds=[],
-        alive_bauds=[],
-        fallback_to_all_bauds=True,
-        fallback_reason=fallback_reason,
-        candidate_count_before=candidate_count,
-        candidate_count_after=candidate_count,
-        elapsed_sec=0.0,
-        results=[],
-    )
-
-
-def candidates_after_phase0_liveness(
-    candidates: Sequence[SerialSettings],
-    report: BaudLivenessReport,
-) -> list[SerialSettings]:
-    """Return quick exploratory candidates after the Phase 0 baud gate."""
-    if report.fallback_to_all_bauds:
-        return list(candidates)
-    alive = set(report.alive_bauds)
-    return [candidate for candidate in candidates if candidate.baud in alive]
-
-
-def exploratory_payload_bytes() -> int:
-    """Return the fixed internal exploratory payload size."""
-    return max(EXPLORATORY_PAYLOAD_BYTES, minimum_payload_size())
-
-
-def exploratory_fixed_settings_label() -> str:
-    """Return a compact description of fixed exploratory scan settings."""
-    return (
-        f"{exploratory_payload_bytes()} BYTES X {EXPLORATORY_BURSTS}, "
-        f"READ={EXPLORATORY_READ_TIMEOUT:.1f}S, "
-        f"PAUSE={EXPLORATORY_SETTLE_MS}MS, "
-        f"CLEAR={EXPLORATORY_PRE_DRAIN_TIMEOUT:.1f}S/"
-        f"{EXPLORATORY_PRE_DRAIN_QUIET:.1f}S"
-    )
-
-
-def baud_focus_settings_label(options: ScanOptions) -> str:
-    """Return a compact operator label for baud focus settings."""
-    if not options.baud_focus_enabled:
-        return "OFF"
-    return (
-        "ON, "
-        f"SCORE>={options.baud_focus_strong_score_threshold:.1f}, "
-        f"GAP>={options.baud_focus_lead_gap_threshold:.1f}, "
-        f"GOOD>={options.baud_focus_min_strong_results}, "
-        f"SAMPLES>={options.baud_focus_min_samples}"
-    )
-
-
-def exploratory_scan_options(options: ScanOptions) -> ScanOptions:
-    """Return fixed internal options for quick exploratory mode."""
-    return dataclasses.replace(
-        options,
-        payload_bytes=exploratory_payload_bytes(),
-        read_timeout=EXPLORATORY_READ_TIMEOUT,
-        settle_ms=EXPLORATORY_SETTLE_MS,
-        bursts=EXPLORATORY_BURSTS,
-        progress_interval=EXPLORATORY_PROGRESS_INTERVAL,
-        no_pre_drain=False,
-        pre_drain_timeout=EXPLORATORY_PRE_DRAIN_TIMEOUT,
-        pre_drain_quiet=EXPLORATORY_PRE_DRAIN_QUIET,
-        max_drain_bytes=EXPLORATORY_MAX_DRAIN_BYTES,
-        turbo_discovery_enabled=False,
-        ask_on_top_match=False,
-    )
-
-
-def empty_baud_focus_report(
-    enabled: bool,
-    disabled_reason: str | None = None,
-) -> BaudFocusReport:
-    """Return a no-focus report with optional disabled reason."""
-    return BaudFocusReport(
-        enabled=enabled,
-        engaged=False,
-        focused_baud=None,
-        deferred_other_bauds=False,
-        deferred_candidate_count=0,
-        deferred_bauds=[],
-        engage_reason=None,
-        release_reason=None,
-        disabled_reason=disabled_reason,
-        tested_before_engage=None,
-    )
-
-
-def group_candidates_by_baud(
-    candidates: Sequence[SerialSettings],
-) -> tuple[list[int], dict[int, list[SerialSettings]]]:
-    """Group candidate settings by baud while preserving scan baud order."""
-    baud_order: list[int] = []
-    grouped: dict[int, list[SerialSettings]] = {}
-    for candidate in candidates:
-        if candidate.baud not in grouped:
-            grouped[candidate.baud] = []
-            baud_order.append(candidate.baud)
-        grouped[candidate.baud].append(candidate)
-    return baud_order, grouped
-
-
-def next_unseen_candidate(
-    candidates: Sequence[SerialSettings],
-    tested: set[SerialSettings],
-) -> SerialSettings | None:
-    """Return the next candidate not already tested."""
-    for candidate in candidates:
-        if candidate not in tested:
-            return candidate
-    return None
-
-
-def result_blocks_baud_focus(result: CandidateResult) -> str | None:
-    """Return a reason when a result disables baud focus narrowing."""
-    if result.status in STALE_STATUSES:
-        return "STALE OR WRONG-NONCE OUTPUT SEEN"
-    if result.error or result.status in {"error", "partial-write"}:
-        return "ERROR SEEN"
-    return None
-
-
-def baud_focus_stats(
-    results: Sequence[CandidateResult],
-    baud_order: Sequence[int],
-    strong_score_threshold: float,
-) -> list[BaudFocusStats]:
-    """Return per-baud sample counts and strong-hit totals."""
-    samples = {baud: 0 for baud in baud_order}
-    strong = {baud: 0 for baud in baud_order}
-    best = {baud: 0.0 for baud in baud_order}
-    for result in results:
-        baud = result.settings.baud
-        if baud not in samples:
-            continue
-        samples[baud] += 1
-        best[baud] = max(best[baud], result.score)
-        if (
-            not result.error
-            and result.status
-            not in {"error", "no-data", "stale-output", "wrong-nonce", "mixed-nonce", "partial-write"}
-            and result.score >= strong_score_threshold
-        ):
-            strong[baud] += 1
-    return [
-        BaudFocusStats(
-            baud=baud,
-            samples=samples[baud],
-            strong_results=strong[baud],
-            best_score=best[baud],
-        )
-        for baud in baud_order
-    ]
-
-
-def select_baud_focus(
-    results: Sequence[CandidateResult],
-    baud_order: Sequence[int],
-    grouped_candidates: dict[int, list[SerialSettings]],
-    options: ScanOptions,
-) -> BaudFocusDecision:
-    """Return a focused baud only after all confidence gates pass."""
-    if not options.baud_focus_enabled:
-        return BaudFocusDecision(None, None, "QUICK BAUD FOCUS OFF")
-    if len(baud_order) < 2:
-        return BaudFocusDecision(None, None, "ONLY ONE BAUD SELECTED")
-
-    stats = baud_focus_stats(
-        results,
-        baud_order,
-        options.baud_focus_strong_score_threshold,
-    )
-    eligible = [
-        stat
-        for stat in stats
-        if stat.samples >= min(
-            options.baud_focus_min_samples,
-            len(grouped_candidates.get(stat.baud, [])),
-        )
-        and stat.strong_results >= options.baud_focus_min_strong_results
-        and stat.best_score >= options.baud_focus_strong_score_threshold
-    ]
-    if not eligible:
-        return BaudFocusDecision(None, None, None)
-
-    eligible.sort(
-        key=lambda stat: (stat.best_score, stat.strong_results, stat.samples),
-        reverse=True,
-    )
-    best = eligible[0]
-    next_best_score = max(
-        (stat.best_score for stat in stats if stat.baud != best.baud),
-        default=0.0,
-    )
-    lead_gap = best.best_score - next_best_score
-    if lead_gap < options.baud_focus_lead_gap_threshold:
-        return BaudFocusDecision(None, None, None)
-
-    reason = (
-        f"SCORE={best.best_score:.1f} GAP={lead_gap:.1f} "
-        f"GOOD={best.strong_results} SAMPLES={best.samples}"
-    )
-    return BaudFocusDecision(best.baud, reason, None)
-
-
-def is_exploratory_signal(result: CandidateResult) -> bool:
-    """Return True when an exploratory result is useful enough for narrowing."""
-    if result.error:
-        return False
-    if result.status in {"error", "no-data", "stale-output", "wrong-nonce", "mixed-nonce", "partial-write"}:
-        return False
-    return result.score >= EXPLORATORY_MIN_NARROW_SCORE
-
-
-def is_phase2_viable_signal(result: CandidateResult) -> bool:
-    """Return True when an exploratory row has any usable life signal."""
-    if result.error:
-        return False
-    return result.status in PHASE2_VIABLE_SIGNAL_STATUSES
-
-
-def select_exploratory_candidates(
-    results: Sequence[CandidateResult],
-    all_candidates: Sequence[SerialSettings],
-    elapsed_sec: float,
-    baud_focus: BaudFocusReport,
-    phase0_liveness: BaudLivenessReport,
-) -> ExploratorySelection:
-    """Select a conservative full-scan shortlist from exploratory results."""
-    ranked_results = sorted(results, key=result_sort_key, reverse=True)
-    ranked_nonzero = [result for result in ranked_results if result.score > 0.0]
-    notes: list[str] = []
-    fallback_reason: str | None = None
-    cutoff_score: float | None = None
-    shortlist_results: list[CandidateResult] = []
-    narrowed_candidates: list[SerialSettings] = []
-    truncated = False
-    viable_candidates = [
-        result.settings for result in ranked_results if is_phase2_viable_signal(result)
-    ]
-
-    stale_count = sum(1 for result in results if result.status in STALE_STATUSES)
-    no_data_count = sum(1 for result in results if result.status == "no-data")
-    error_count = sum(1 for result in results if result.error or result.status == "error")
-    if stale_count:
-        notes.append(f"STALE={stale_count}; WRONG-RUN OR NOT-QUIET OUTPUT WAS SEEN.")
-    if no_data_count:
-        notes.append(f"NO DATA={no_data_count}; NOTHING USEFUL WAS READ.")
-    if error_count:
-        notes.append(f"ERROR={error_count}; CHECK LOG FOR DRIVER DETAILS.")
-
-    if not results:
-        fallback_reason = "NO EXPLORATORY SETTINGS WERE TESTED."
-    elif not ranked_nonzero:
-        fallback_reason = "NO EXPLORATORY SIGNAL WAS OBSERVED."
-    else:
-        eligible = [result for result in ranked_results if is_exploratory_signal(result)]
-        best = ranked_nonzero[0]
-        if not eligible:
-            fallback_reason = (
-                f"BEST EXPLORATORY SCORE {best.score:.1f} "
-                f"IS BELOW {EXPLORATORY_MIN_NARROW_SCORE:.1f}."
-            )
-        else:
-            best_eligible = eligible[0]
-            cutoff_score = max(
-                EXPLORATORY_MIN_NARROW_SCORE,
-                best_eligible.score - EXPLORATORY_SCORE_TOLERANCE,
-            )
-            within_cutoff = [
-                result for result in eligible if result.score >= cutoff_score
-            ]
-            shortlist_results = within_cutoff[:EXPLORATORY_SHORTLIST_LIMIT]
-            truncated = len(within_cutoff) > len(shortlist_results)
-            seed_frames = {
-                (
-                    result.settings.baud,
-                    result.settings.data_bits,
-                    result.settings.parity,
-                    result.settings.stop_bits,
-                )
-                for result in shortlist_results
-            }
-            expanded_settings = {
-                SerialSettings(baud, data_bits, parity, stop_bits, flow)
-                for baud, data_bits, parity, stop_bits in seed_frames
-                for flow in FLOW_CONTROLS
-            }
-            narrowed_candidates = [
-                candidate for candidate in all_candidates if candidate in expanded_settings
-            ]
-            tied_count = sum(
-                1
-                for result in within_cutoff
-                if abs(result.score - best_eligible.score) <= TIE_SCORE_TOLERANCE
-            )
-            if tied_count > 1:
-                notes.append(
-                    f"AMBIGUOUS={tied_count}; TOP SCORES ARE CLOSE TOGETHER."
-                )
-            if best_eligible.score < RECOMMENDATION_MIN_SCORE:
-                notes.append("CONFIDENCE IS LOW; USE ONLY AS A FULL-SCAN HINT.")
-            if best_eligible.metrics.extra_bytes > best_eligible.bytes_sent:
-                notes.append("BEST ROW HAD EXTRA OUTPUT; BACKLOG OR NOISE MAY EXIST.")
-            if truncated:
-                notes.append(
-                    f"SHORTLIST LIMITED TO TOP {EXPLORATORY_SHORTLIST_LIMIT} "
-                    "EXPLORATORY ROWS."
-                )
-            notes.append(
-                "FLOW CONTROL WAS EXPANDED FOR EACH PROMISING FRAME SETTING."
-            )
-
-    if fallback_reason:
-        if viable_candidates:
-            notes.append(
-                f"SIGNAL-ONLY PHASE 2 AVAILABLE: {len(viable_candidates)} SETTINGS."
-            )
-        else:
-            notes.append("FULL SCAN WILL USE ALL SELECTED SETTINGS.")
-
-    return ExploratorySelection(
-        results=list(results),
-        ranked_results=ranked_results,
-        shortlist_results=shortlist_results,
-        narrowed_candidates=narrowed_candidates,
-        elapsed_sec=elapsed_sec,
-        fallback_reason=fallback_reason,
-        notes=notes,
-        cutoff_score=cutoff_score,
-        truncated=truncated,
-        baud_focus=baud_focus,
-        phase0_liveness=phase0_liveness,
-        viable_candidates=viable_candidates,
-    )
-
-
-def phase2_candidates_after_exploratory(
-    all_candidates: Sequence[SerialSettings],
-    selection: ExploratorySelection | None,
-    narrowing_accepted: bool,
-) -> tuple[list[SerialSettings], str]:
-    """Return phase-2 candidates and a metadata source label."""
-    if selection is None:
-        return list(all_candidates), PHASE2_CANDIDATE_SOURCE_FULL
-    if narrowing_accepted and selection.narrowed_candidates:
-        return (
-            list(selection.narrowed_candidates),
-            PHASE2_CANDIDATE_SOURCE_NARROWED,
-        )
-    if selection.viable_candidates:
-        return (
-            list(selection.viable_candidates),
-            PHASE2_CANDIDATE_SOURCE_VIABLE,
-        )
-    return list(all_candidates), PHASE2_CANDIDATE_SOURCE_FULL
-
-
-def print_phase0_start(
-    options: ScanOptions,
-    phase0_options: ScanOptions,
-    bauds: Sequence[int],
-    candidate_count: int,
-    payload: ProbePayload,
-) -> None:
-    """Print the Phase 0 liveness sweep start banner."""
-    print()
-    print_report_title("PHASE 0 BAUD LIVENESS SWEEP")
-    print("MODE: FIXED 8E1 FLOW=NONE; SAME-BAUD LIVENESS GATE.")
-    print(
-        f"PORTS: {options.in_port} -> {options.out_port}; "
-        f"TEST={payload.byte_count} BYTES X {phase0_options.bursts}"
-    )
-    print(
-        f"TIMING: READ={phase0_options.read_timeout:.2f}S, "
-        f"PAUSE={phase0_options.settle_ms}MS."
-    )
-    print(
-        f"CLEAR OUTPUT: ON; QUIET={phase0_options.pre_drain_quiet:.2f}S "
-        f"LIMIT={phase0_options.pre_drain_timeout:.2f}S "
-        f"MAX={phase0_options.max_drain_bytes} BYTES."
-    )
-    print(f"BAUDS: {len(bauds)}; SETTINGS BEFORE GATE: {candidate_count}.")
-    print("ALIVE REQUIRES VALID PROBE LINE AND MARKER; NOISE IS NOT ENOUGH.")
-    print(border_line(REPORT_WIDTH))
-
-
-def format_phase0_progress(
-    result: BaudLivenessResult,
-    index: int,
-    total: int,
-) -> str:
-    """Return one Phase 0 console progress line."""
-    state = "ALIVE" if result.alive else "NOT ALIVE"
-    return (
-        f"PHASE0 [{index:04d}/{total:04d}] {state:<9} "
-        f"{result.settings.label():32s} "
-        f"READ={result.bytes_received:6d} CLR={result.bytes_drained_before:6d} "
-        f"SCORE={result.score:6.2f} {result.reason}"
-    )
-
-
-def print_phase0_summary(report: BaudLivenessReport) -> None:
-    """Print a concise Phase 0 liveness summary."""
-    print()
-    print_report_title("PHASE 0 RESULTS")
-    print(f"  RUN TIME:             {format_duration(report.elapsed_sec)}")
-    print(f"  BAUDS TESTED:         {len(report.tested_bauds)}")
-    print(f"  ALIVE BAUDS:          {len(report.alive_bauds)}")
-    print(f"  FIXED SETTINGS:       {phase0_fixed_settings_label()}")
-    if report.alive_bauds:
-        print_wrapped_value(
-            "  ALIVE LIST:           ",
-            ", ".join(str(baud) for baud in report.alive_bauds),
-        )
-        print(
-            "  QUICK CANDIDATES:     "
-            f"{report.candidate_count_after}/{report.candidate_count_before}"
-        )
-    if report.fallback_to_all_bauds:
-        print("  QUICK CANDIDATES:     ALL SELECTED SETTINGS")
-        if report.fallback_reason:
-            print_wrapped_value("  FALLBACK:             ", report.fallback_reason)
-    print(border_line(REPORT_WIDTH))
-
-
-def print_exploratory_start(
-    options: ScanOptions,
-    exploratory_options: ScanOptions,
-    candidate_count: int,
-    payload: ProbePayload,
-) -> None:
-    """Print the exploratory-mode start banner."""
-    print()
-    print_report_title("QUICK EXPLORATORY START")
-    print("MODE: FIXED INTERNAL PRE-SCAN; FULL SCAN SETTINGS ARE NOT CHANGED.")
-    print(
-        f"PORTS: {options.in_port} -> {options.out_port}; "
-        f"TEST={payload.byte_count} BYTES X {exploratory_options.bursts}"
-    )
-    print(
-        f"TIMING: READ={exploratory_options.read_timeout:.1f}S, "
-        f"PAUSE={exploratory_options.settle_ms}MS."
-    )
-    print(
-        f"CLEAR OUTPUT: ON; QUIET={exploratory_options.pre_drain_quiet:.1f}S "
-        f"LIMIT={exploratory_options.pre_drain_timeout:.1f}S "
-        f"MAX={exploratory_options.max_drain_bytes} BYTES."
-    )
-    print(f"QUICK BAUD FOCUS: {baud_focus_settings_label(options)}.")
-    print(f"SETTINGS: {candidate_count}; BROAD LIGHT PASS.")
-    print(border_line(REPORT_WIDTH))
-
-
-def print_baud_focus_report(report: BaudFocusReport) -> None:
-    """Print baud focus summary lines in the report style."""
-    if not report.enabled:
-        print("  QUICK BAUD FOCUS:    OFF")
-        return
-    if report.engaged:
-        print(f"  QUICK BAUD FOCUS:    ENGAGED {report.focused_baud}")
-        print(
-            "  OTHER BAUDS:         "
-            + (
-                f"DEFERRED {report.deferred_candidate_count} SETTINGS"
-                if report.deferred_other_bauds
-                else "NOT DEFERRED"
-            )
-        )
-        if report.engage_reason:
-            print_wrapped_value("  FOCUS REASON:        ", report.engage_reason)
-        if report.release_reason:
-            print_wrapped_value("  FOCUS RELEASE:       ", report.release_reason)
-        return
-    print("  QUICK BAUD FOCUS:    NOT ENGAGED")
-    if report.disabled_reason:
-        print_wrapped_value("  FOCUS DISABLED:      ", report.disabled_reason)
-
-
-def print_exploratory_summary(selection: ExploratorySelection) -> None:
-    """Print a concise exploratory finding summary."""
-    print()
-    print_report_title("QUICK EXPLORATORY RESULTS")
-    print(f"  RUN TIME:             {format_duration(selection.elapsed_sec)}")
-    print(f"  SETTINGS TESTED:      {len(selection.results)}")
-    print(f"  FIXED SETTINGS:       {exploratory_fixed_settings_label()}")
-    phase0 = selection.phase0_liveness
-    print(
-        "  PHASE 0 ALIVE:        "
-        f"{len(phase0.alive_bauds)}/{len(phase0.tested_bauds)} BAUDS"
-    )
-    if phase0.fallback_to_all_bauds:
-        print("  PHASE 0 GATE:         FALLBACK TO ALL BAUDS")
-    else:
-        print(
-            "  PHASE 0 GATE:         "
-            f"{phase0.candidate_count_after}/{phase0.candidate_count_before} SETTINGS"
-        )
-    print_baud_focus_report(selection.baud_focus)
-    if selection.fallback_reason:
-        print_wrapped_value("  FINDING:              ", selection.fallback_reason)
-    elif selection.shortlist_results:
-        print(
-            "  FINDING:              "
-            f"{len(selection.shortlist_results)} ROWS AT SCORE >= "
-            f"{selection.cutoff_score:.1f}"
-        )
-        print(
-            "  FULL-SCAN CANDIDATES: "
-            f"{len(selection.narrowed_candidates)} AFTER FLOW EXPANSION"
-        )
-    print(
-        "  SIGNAL CANDIDATES:    "
-        f"{len(selection.viable_candidates)} FOR PHASE 2 FALLBACK"
-    )
-
-    top_rows = [
-        result for result in selection.ranked_results if result.score > 0.0
-    ][:EXPLORATORY_SUMMARY_ROWS]
-    if top_rows:
-        print()
-        print(border_line(REPORT_WIDTH))
-        print("RK SCORE   BAUD MODE FLOW       READ  CLR  EXCT LINE RESULT")
-        print(border_line(REPORT_WIDTH))
-        for rank, result in enumerate(top_rows, start=1):
-            mode = (
-                f"{result.settings.data_bits}"
-                f"{result.settings.parity_code()}"
-                f"{result.settings.stop_bits}"
-            )
-            indicator = result_indicator(result.score, result.status, result.error)
-            print(
-                f"{rank:>2} "
-                f"{result.score:>5.1f} "
-                f"{result.settings.baud:>6} "
-                f"{mode:<4} "
-                f"{result.settings.flow_control.upper():<8} "
-                f"{result.bytes_received:>6} "
-                f"{result.bytes_drained_before:>4} "
-                f"{result.metrics.exact_byte_match_ratio:>4.2f} "
-                f"{result.metrics.line_integrity_ratio:>4.2f} "
-                f"{indicator}"
-            )
-        print(border_line(REPORT_WIDTH))
-    else:
-        print("  TOP ROWS:             NONE")
-
-    if selection.notes:
-        print()
-        print("  NOTES:")
-        for note in selection.notes:
-            print_wrapped_value("    ", note)
-    print(border_line(REPORT_WIDTH))
-
-
-def exploratory_metadata(
-    requested: bool,
-    narrowing_accepted: bool,
-    selection: ExploratorySelection | None,
-    original_candidate_count: int,
-    final_candidate_count: int,
-    options: ScanOptions,
-    phase2_candidate_source: str = PHASE2_CANDIDATE_SOURCE_FULL,
-) -> dict[str, Any]:
-    """Return structured metadata for exploratory mode and candidate narrowing."""
-    if narrowing_accepted:
-        phase2_candidate_source = PHASE2_CANDIDATE_SOURCE_NARROWED
-    phase0_fixed_settings = {
-        "payload_bytes": phase0_payload_bytes(),
-        "read_timeout": PHASE0_READ_TIMEOUT,
-        "settle_ms": PHASE0_SETTLE_MS,
-        "bursts": PHASE0_BURSTS,
-        "progress_interval": PHASE0_PROGRESS_INTERVAL,
-        "pre_drain_enabled": True,
-        "pre_drain_timeout": PHASE0_PRE_DRAIN_TIMEOUT,
-        "pre_drain_quiet": PHASE0_PRE_DRAIN_QUIET,
-        "max_drain_bytes": PHASE0_MAX_DRAIN_BYTES,
-        "baseline_data_bits": PHASE0_BASELINE_DATA_BITS,
-        "baseline_parity": PHASE0_BASELINE_PARITY,
-        "baseline_stop_bits": PHASE0_BASELINE_STOP_BITS,
-        "baseline_flow_control": PHASE0_BASELINE_FLOW_CONTROL,
-        "min_alive_score": PHASE0_MIN_ALIVE_SCORE,
-        "min_line_integrity": PHASE0_MIN_LINE_INTEGRITY,
-        "max_extra_bytes": PHASE0_MAX_EXTRA_BYTES,
-        "max_extra_bytes_ratio": PHASE0_MAX_EXTRA_BYTES_RATIO,
-    }
-    fixed_settings = {
-        "payload_bytes": exploratory_payload_bytes(),
-        "read_timeout": EXPLORATORY_READ_TIMEOUT,
-        "settle_ms": EXPLORATORY_SETTLE_MS,
-        "bursts": EXPLORATORY_BURSTS,
-        "progress_interval": EXPLORATORY_PROGRESS_INTERVAL,
-        "pre_drain_enabled": True,
-        "pre_drain_timeout": EXPLORATORY_PRE_DRAIN_TIMEOUT,
-        "pre_drain_quiet": EXPLORATORY_PRE_DRAIN_QUIET,
-        "max_drain_bytes": EXPLORATORY_MAX_DRAIN_BYTES,
-        "shortlist_limit": EXPLORATORY_SHORTLIST_LIMIT,
-        "min_narrow_score": EXPLORATORY_MIN_NARROW_SCORE,
-        "score_tolerance": EXPLORATORY_SCORE_TOLERANCE,
-        "baud_focus_enabled": options.baud_focus_enabled,
-        "baud_focus_strong_score_threshold": (
-            options.baud_focus_strong_score_threshold
-        ),
-        "baud_focus_lead_gap_threshold": options.baud_focus_lead_gap_threshold,
-        "baud_focus_min_strong_results": options.baud_focus_min_strong_results,
-        "baud_focus_min_samples": options.baud_focus_min_samples,
-    }
-    metadata: dict[str, Any] = {
-        "requested": requested,
-        "phase0_fixed_internal_settings": phase0_fixed_settings,
-        "fixed_internal_settings": fixed_settings,
-        "narrowing_accepted": narrowing_accepted,
-        "original_candidate_count": original_candidate_count,
-        "final_candidate_count": final_candidate_count,
-        "candidate_source": phase2_candidate_source,
-        "phase2_candidate_source": phase2_candidate_source,
-    }
-    if selection is None:
-        metadata["ran"] = False
-        metadata["shortlist_count"] = 0
-        metadata["narrowed_candidate_count"] = 0
-        metadata["viable_signal_candidate_count"] = 0
-        metadata["baud_focus"] = dataclass_to_jsonable(
-            empty_baud_focus_report(
-                options.baud_focus_enabled,
-                "EXPLORATORY NOT RUN",
-            )
-        )
-        metadata["phase0_baud_liveness"] = dataclass_to_jsonable(
-            empty_baud_liveness_report(
-                original_candidate_count,
-                "EXPLORATORY NOT RUN",
-            )
-        )
-        return metadata
-
-    metadata.update(
-        {
-            "ran": True,
-            "elapsed_sec": selection.elapsed_sec,
-            "tested_candidates": len(selection.results),
-            "fallback_reason": selection.fallback_reason,
-            "cutoff_score": selection.cutoff_score,
-            "truncated": selection.truncated,
-            "notes": selection.notes,
-            "phase0_baud_liveness": dataclass_to_jsonable(
-                selection.phase0_liveness
-            ),
-            "baud_focus": dataclass_to_jsonable(selection.baud_focus),
-            "shortlist_count": len(selection.shortlist_results),
-            "narrowed_candidate_count": len(selection.narrowed_candidates),
-            "viable_signal_candidate_count": len(selection.viable_candidates),
-            "shortlist_settings": [
-                dataclass_to_jsonable(result.settings)
-                for result in selection.shortlist_results
-            ],
-            "narrowed_candidate_settings": [
-                dataclass_to_jsonable(settings)
-                for settings in selection.narrowed_candidates
-            ],
-            "viable_signal_candidate_settings": [
-                dataclass_to_jsonable(settings)
-                for settings in selection.viable_candidates
-            ],
-            "top_results": [
-                dataclass_to_jsonable(result)
-                for result in selection.ranked_results[:EXPLORATORY_SUMMARY_ROWS]
-            ],
-        }
-    )
-    return metadata
-
-
-def run_phase0_baud_liveness(
-    serial_module: Any,
-    options: ScanOptions,
-    candidates: Sequence[SerialSettings],
-    logger: logging.Logger,
-) -> BaudLivenessReport:
-    """Run the fixed 8E1 baud liveness sweep used before quick mode."""
-    purge_buffer_output(
-        serial_module=serial_module,
-        options=options,
-        logger=logger,
-        reason="START PHASE 0 WITH AN EMPTY BUFFER FIFO.",
-    )
-    phase0_options = phase0_scan_options(options)
-    phase0_payload = generate_phase0_payload(phase0_options.payload_bytes)
-    baud_order, _ = group_candidates_by_baud(candidates)
-    if not baud_order:
-        return empty_baud_liveness_report(
-            len(candidates),
-            "NO BAUDS SELECTED",
-        )
-
-    print_phase0_start(
-        options=options,
-        phase0_options=phase0_options,
-        bauds=baud_order,
-        candidate_count=len(candidates),
-        payload=phase0_payload,
-    )
-    logger.info("phase 0 baud liveness sweep started")
-    logger.info("phase 0 options: %s", phase0_options)
-    logger.info(
-        "phase 0 payload: %s bytes, %s lines",
-        phase0_payload.byte_count,
-        phase0_payload.line_count,
-    )
-
-    started = time.monotonic()
-    results: list[BaudLivenessResult] = []
-    expected_byte_count = phase0_payload.byte_count * phase0_options.bursts
-    for index, baud in enumerate(baud_order, start=1):
-        candidate_result = run_candidate(
-            serial_module=serial_module,
-            index=index,
-            total=len(baud_order),
-            settings=phase0_baseline_settings(baud),
-            options=phase0_options,
-            payload=phase0_payload,
-            logger=logger,
-            progress=None,
-        )
-        decision = classify_phase0_liveness(candidate_result, expected_byte_count)
-        liveness_result = baud_liveness_result_from_candidate(
-            candidate_result,
-            decision,
-        )
-        results.append(liveness_result)
-        print(
-            format_phase0_progress(liveness_result, index, len(baud_order)),
-            flush=True,
-        )
-        print(format_scan_eta(len(results), len(baud_order), started), flush=True)
-        logger.info(
-            "phase 0 baud %s: %s score=%.2f status=%s reason=%s read=%s cleared=%s error=%s",
-            baud,
-            "alive" if decision.alive else "not-alive",
-            candidate_result.score,
-            candidate_result.status,
-            decision.reason,
-            candidate_result.bytes_received,
-            candidate_result.bytes_drained_before,
-            candidate_result.error,
-        )
-        if decision.alive:
-            if not prompt_yes_no_question(
-                "Live Phase 0 baud found. Continue Phase 0 sweep?",
-                False,
-            ):
-                logger.info("phase 0 stopped after live baud %s", baud)
-                break
-
-    elapsed_sec = time.monotonic() - started
-    alive_bauds = [result.baud for result in results if result.alive]
-    fallback_reason = None
-    fallback_to_all = False
-    if not alive_bauds:
-        fallback_to_all = True
-        fallback_reason = "NO ALIVE BAUDS; QUICK MODE WILL USE ALL SELECTED BAUDS."
-    alive = set(alive_bauds)
-    candidate_count_after = (
-        len(candidates)
-        if fallback_to_all
-        else sum(1 for candidate in candidates if candidate.baud in alive)
-    )
-    report = BaudLivenessReport(
-        ran=True,
-        tested_bauds=list(baud_order),
-        alive_bauds=alive_bauds,
-        fallback_to_all_bauds=fallback_to_all,
-        fallback_reason=fallback_reason,
-        candidate_count_before=len(candidates),
-        candidate_count_after=candidate_count_after,
-        elapsed_sec=elapsed_sec,
-        results=results,
-    )
-    print_phase0_summary(report)
-    logger.info(
-        "phase 0 completed; alive=%s/%s fallback=%s quick_candidates=%s/%s",
-        len(alive_bauds),
-        len(baud_order),
-        fallback_to_all,
-        candidate_count_after,
-        len(candidates),
-    )
-    return report
-
-
-def run_phase0_only_sweep(
-    serial_module: Any,
-    options: ScanOptions,
-    logger: logging.Logger,
-) -> int:
-    """Run only the Phase 0 baud liveness sweep and stop before full scan."""
-    candidates = prioritize_discovery_candidates(
-        generate_candidates(options.min_baud, options.max_baud),
-        options,
-    )
-    logger.info("phase 0 only sweep requested")
-    logger.info("options: %s", options)
-    logger.info("phase 0 only candidates before baud grouping: %s", len(candidates))
-    run_phase0_baud_liveness(
-        serial_module=serial_module,
-        options=options,
-        candidates=candidates,
-        logger=logger,
-    )
-    print()
-    print_report_title("PHASE 0 SWEEP COMPLETE")
-    print("FULL SCAN WAS NOT RUN.")
-    print_wrapped_value("  DEBUG LOG:   ", options.log_file)
-    print(border_line(REPORT_WIDTH))
-    return 0
-
-
 def dual_phase0_settings(input_baud: int, output_baud: int) -> DualSerialSettings:
     """Return fixed baseline dual-bank settings for one baud pair."""
     return DualSerialSettings(
         input_settings=phase0_baseline_settings(input_baud),
         output_settings=phase0_baseline_settings(output_baud),
     )
+
+
+def discovery_frame_priority(settings: SerialSettings) -> tuple[int, int, int, int]:
+    """Return a conservative frame-test priority for one baud."""
+    parity_rank = {
+        "none": 0,
+        "even": 1,
+        "odd": 2,
+        "mark": 3,
+        "space": 4,
+    }.get(settings.parity, 9)
+    flow_rank = {
+        "none": 0,
+        "xon/xoff": 1,
+        "rts/cts": 2,
+        "dsr/dtr": 3,
+    }.get(settings.flow_control, 9)
+    data_rank = 0 if settings.data_bits == 8 else 1
+    stop_rank = 0 if settings.stop_bits == 1 else 1
+    if settings.data_bits == 8 and settings.parity == "none" and settings.stop_bits == 1:
+        frame_rank = 0
+    elif settings.data_bits == 8 and settings.parity in {"even", "odd"} and settings.stop_bits == 1:
+        frame_rank = 1
+    elif settings.data_bits == 7 and settings.parity in {"even", "odd"} and settings.stop_bits == 1:
+        frame_rank = 2
+    else:
+        frame_rank = 3 + data_rank + stop_rank + parity_rank
+    return frame_rank, flow_rank, parity_rank, stop_rank
 
 
 def frame_candidates_for_baud(baud: int) -> list[SerialSettings]:
@@ -5317,214 +3798,6 @@ def dual_scan_candidate_count(pairs: Sequence[tuple[int, int]]) -> int:
     return len(pairs) * frame_count * frame_count
 
 
-def run_exploratory_scan(
-    serial_module: Any,
-    options: ScanOptions,
-    candidates: Sequence[SerialSettings],
-    logger: logging.Logger,
-) -> ExploratorySelection:
-    """Run quick exploratory mode and return candidate narrowing findings."""
-    phase0_liveness = run_phase0_baud_liveness(
-        serial_module=serial_module,
-        options=options,
-        candidates=candidates,
-        logger=logger,
-    )
-    quick_candidates = candidates_after_phase0_liveness(candidates, phase0_liveness)
-    quick_options = exploratory_scan_options(options)
-    quick_payload = generate_payload(quick_options.payload_bytes)
-    print_exploratory_start(
-        options,
-        quick_options,
-        len(quick_candidates),
-        quick_payload,
-    )
-    logger.info("quick exploratory mode started")
-    logger.info("quick options: %s", quick_options)
-    logger.info(
-        "quick candidates after phase 0: %s/%s",
-        len(quick_candidates),
-        len(candidates),
-    )
-    logger.info(
-        "quick payload: %s bytes, %s lines",
-        quick_payload.byte_count,
-        quick_payload.line_count,
-    )
-
-    started = time.monotonic()
-    results: list[CandidateResult] = []
-    tested: set[SerialSettings] = set()
-    baud_order, grouped = group_candidates_by_baud(quick_candidates)
-    focus_enabled = options.baud_focus_enabled and len(baud_order) > 1
-    focus_active = False
-    focus_engaged = False
-    focused_baud: int | None = None
-    focus_engage_reason: str | None = None
-    focus_release_reason: str | None = None
-    focus_disabled_reason: str | None = (
-        "ONLY ONE BAUD SELECTED"
-        if options.baud_focus_enabled and len(baud_order) < 2
-        else None
-    )
-    tested_before_engage: int | None = None
-    deferred_candidate_count = 0
-    deferred_bauds: list[int] = []
-
-    while True:
-        if focus_active and focused_baud is not None:
-            settings = next_unseen_candidate(grouped[focused_baud], tested)
-            if settings is None:
-                deferred = [
-                    candidate
-                    for candidate in quick_candidates
-                    if candidate not in tested and candidate.baud != focused_baud
-                ]
-                deferred_candidate_count = len(deferred)
-                deferred_bauds = [
-                    baud
-                    for baud in baud_order
-                    if baud != focused_baud
-                    and any(candidate.baud == baud for candidate in deferred)
-                ]
-                if deferred_candidate_count:
-                    print("OTHER BAUDS DEFERRED BY CONFIDENCE RULE")
-                    logger.info(
-                        "baud focus deferred %s settings at bauds %s",
-                        deferred_candidate_count,
-                        deferred_bauds,
-                    )
-                break
-        else:
-            settings = next_unseen_candidate(quick_candidates, tested)
-            if settings is None:
-                break
-
-        index = len(results) + 1
-        result = run_candidate(
-            serial_module=serial_module,
-            index=index,
-            total=len(quick_candidates),
-            settings=settings,
-            options=quick_options,
-            payload=quick_payload,
-            logger=logger,
-            progress=None,
-        )
-        results.append(result)
-        tested.add(settings)
-        print("QUICK " + format_progress(result), flush=True)
-        print(format_scan_eta(len(results), len(quick_candidates), started), flush=True)
-
-        if focus_enabled:
-            block_reason = result_blocks_baud_focus(result)
-            if focus_active:
-                if block_reason:
-                    focus_active = False
-                    focus_release_reason = block_reason
-                    print_wrapped_value(
-                        "",
-                        f"QUICK BAUD FOCUS CANCELED: {block_reason}",
-                    )
-                    print("RETURNING TO FULL BAUD SWEEP")
-                    logger.info(
-                        "baud focus canceled for %s: %s",
-                        focused_baud,
-                        block_reason,
-                    )
-                else:
-                    decision = select_baud_focus(results, baud_order, grouped, options)
-                    if decision.disabled_reason:
-                        focus_active = False
-                        focus_release_reason = decision.disabled_reason
-                        print_wrapped_value(
-                            "",
-                            "QUICK BAUD FOCUS CANCELED: "
-                            f"{decision.disabled_reason}",
-                        )
-                        print("RETURNING TO FULL BAUD SWEEP")
-                        logger.info(
-                            "baud focus canceled for %s: %s",
-                            focused_baud,
-                            decision.disabled_reason,
-                        )
-                    elif decision.baud != focused_baud:
-                        focus_active = False
-                        focus_release_reason = "CONFIDENCE DROPPED"
-                        print("QUICK BAUD FOCUS CANCELED: CONFIDENCE DROPPED")
-                        print("RETURNING TO FULL BAUD SWEEP")
-                        logger.info(
-                            "baud focus canceled for %s: confidence dropped",
-                            focused_baud,
-                        )
-            elif block_reason:
-                logger.info(
-                    "baud focus waiting; %s before focus on %s",
-                    block_reason,
-                    result.settings.label(),
-                )
-            else:
-                decision = select_baud_focus(results, baud_order, grouped, options)
-                if decision.disabled_reason:
-                    focus_disabled_reason = decision.disabled_reason
-                    print_wrapped_value(
-                        "",
-                        "QUICK BAUD FOCUS DISABLED: "
-                        f"{decision.disabled_reason}",
-                    )
-                    logger.info("baud focus disabled: %s", decision.disabled_reason)
-                elif decision.baud is not None:
-                    focus_active = True
-                    focus_engaged = True
-                    focused_baud = decision.baud
-                    focus_engage_reason = decision.reason
-                    tested_before_engage = len(results)
-                    print_wrapped_value(
-                        "",
-                        (
-                            f"QUICK BAUD FOCUS ENGAGED: {focused_baud} "
-                            f"{focus_engage_reason or ''}"
-                        ).rstrip(),
-                    )
-                    logger.info(
-                        "baud focus engaged for %s: %s",
-                        focused_baud,
-                        focus_engage_reason,
-                    )
-
-    elapsed_sec = time.monotonic() - started
-    baud_focus_report = BaudFocusReport(
-        enabled=options.baud_focus_enabled,
-        engaged=focus_engaged,
-        focused_baud=focused_baud,
-        deferred_other_bauds=deferred_candidate_count > 0,
-        deferred_candidate_count=deferred_candidate_count,
-        deferred_bauds=deferred_bauds,
-        engage_reason=focus_engage_reason,
-        release_reason=focus_release_reason,
-        disabled_reason=focus_disabled_reason,
-        tested_before_engage=tested_before_engage,
-    )
-    selection = select_exploratory_candidates(
-        results,
-        candidates,
-        elapsed_sec,
-        baud_focus_report,
-        phase0_liveness,
-    )
-    print_exploratory_summary(selection)
-    logger.info(
-        "quick exploratory completed; candidates=%s fallback=%s shortlist=%s narrowed=%s viable=%s baud_focus=%s",
-        len(results),
-        selection.fallback_reason,
-        len(selection.shortlist_results),
-        len(selection.narrowed_candidates),
-        len(selection.viable_candidates),
-        dataclass_to_jsonable(baud_focus_report),
-    )
-    return selection
-
-
 def prompt_text(label: str, current: str) -> str:
     """Prompt for a string value, preserving current on blank input."""
     try:
@@ -5617,35 +3890,6 @@ def prompt_yes_no_question(question: str, current: bool) -> bool:
         print("ENTER Y OR N.")
 
 
-def prompt_scan_mode() -> str:
-    """Prompt for scan type. Blank defaults to conservative full scan."""
-    while True:
-        try:
-            value = (
-                input("SCAN TYPE: FULL OR QUICK [FULL]: ")
-                .lstrip("\ufeff")
-                .strip()
-                .lower()
-            )
-        except EOFError:
-            return "full"
-        if value == "":
-            return "full"
-        if value in {"q", "quick", "a", "auto"}:
-            return "quick"
-        if value in {"f", "full", "m", "manual"}:
-            return "full"
-        print("ENTER F OR Q.")
-
-
-def prompt_phase0_only_sweep() -> bool:
-    """Ask whether start scan should run only the Phase 0 baud sweep."""
-    return prompt_yes_no_question(
-        "Run only Phase 0 baud liveness sweep?",
-        False,
-    )
-
-
 def prompt_start_scan_workflow() -> str:
     """Ask which automated workflow option 1 should run."""
     print()
@@ -5687,7 +3931,7 @@ def print_menu_help() -> None:
             "  READ OUTPUT PORT.",
             "  TEST EACH SELECTED SERIAL SETTING.",
             "  RANK BY MATCH QUALITY.",
-            "  USE 11 MEMORY TEST AFTER A GOOD SETTING IS FOUND.",
+            "  USE MENU 2 FOR MEMORY TEST AFTER A GOOD SETTING IS FOUND.",
             "",
             "OPERATOR NOTES:",
             "  START SCAN:      CHOOSE AUTOMATED DISCOVERY, BANK 2 TEST, OR PHASE 0.",
@@ -5698,19 +3942,18 @@ def print_menu_help() -> None:
             "  FRAME TEST:      AFTER PHASE 0, TESTS FRAME AND FLOW AROUND LIVE PAIRS.",
             "  DEVICE PATH:     COM1 -> BUFFER INPUT -> BUFFER OUTPUT -> COM5.",
             "  PORT SETTINGS:   PROGRAM SETS COM PORTS; DEVICE MANAGER IS IGNORED.",
-            "  TEST SIZE:       BYTES SENT FOR EACH SETTING.",
-            "  TEST COUNT:      NUMBER OF TRIES PER SETTING.",
+            "  SCAN SIZE:       BYTES SENT FOR EACH DISCOVERY SETTING.",
+            "  SCAN COUNT:      NUMBER OF DISCOVERY TRIES PER SETTING.",
             "  DISCOVERY:       STAGED DUAL-PORT TEST BEFORE FULL MATRIX FALLBACK.",
             "  TURBO:           FASTER DISCOVERY TIMING.",
             "  ASK ON MATCH:    PAUSE AFTER PASS; ASK CONTINUE.",
             "  FLOW VALIDATE:   AFTER BEST FRAME, TEST NONE/XON/RTS/DSR BEHAVIOR.",
-            "  CLEAR OUTPUT:    DISCARD OLD BUFFER DATA FIRST.",
-            "  DEEP PURGE:      OPTIONAL PROMPT INSIDE BANK 2 KNOWN-BAUD TEST.",
+            "  STALE DATA:      DISCARD OLD BUFFER DATA BEFORE EACH TEST.",
             "  NONCES:          EACH TRIAL PAYLOAD HAS RUN/CANDIDATE/TRIAL IDS.",
             "  8-BIT TEST:      SEPARATE HIGH-BIT CHALLENGE; ASCII PASS IS NOT ENOUGH.",
             "  MAX CLEAR:       DEFAULT 32768 BYTES.",
             "  TOP ROWS:        BEST RESULTS SHOWN AT END.",
-            "  MEMORY TEST:     COMMAND 11 AFTER SCAN.",
+            "  MEMORY TEST:     MENU 2 AFTER SCAN.",
             "  BREAK:           CTRL+C ASKS RESUME, REPORT, MENU, OR QUIT.",
             "  AFTER SCAN:      RUN AGAIN, MAIN MENU, OR QUIT.",
         ]
@@ -5734,16 +3977,20 @@ def print_configuration(options: ScanOptions) -> None:
     try:
         bauds = available_bauds(options.min_baud, options.max_baud)
         baud_order = scan_bauds(options.min_baud, options.max_baud)
-        candidates = generate_candidates(options.min_baud, options.max_baud)
-        wire = estimate_scan_wire_seconds(options)
-        overhead = estimate_scan_overhead_seconds(options)
+        timing_candidates = [phase0_baseline_settings(baud) for baud in baud_order]
+        phase0_pair_count = len(bauds) * len(bauds)
+        selected_pair_limit = min(DUAL_PHASE0_BAUD_PAIR_LIMIT, phase0_pair_count)
+        fallback_pair_limit = min(DUAL_PHASE0_FALLBACK_PAIR_LIMIT, phase0_pair_count)
+        frame_pairs_per_live_pair = dual_scan_candidate_count([(0, 0)])
         range_error: str | None = None
     except ValueError as exc:
         bauds = []
         baud_order = []
-        candidates = []
-        wire = 0.0
-        overhead = 0.0
+        timing_candidates = []
+        phase0_pair_count = 0
+        selected_pair_limit = 0
+        fallback_pair_limit = 0
+        frame_pairs_per_live_pair = 0
         range_error = str(exc)
     lines: list[str] = ["", *banner_lines(), "CURRENT SETTINGS"]
     lines.extend(setting_lines("START SCAN:", "DISCOVERY / BANK 2 KNOWN-BAUD / PHASE 0"))
@@ -5751,7 +3998,7 @@ def print_configuration(options: ScanOptions) -> None:
     lines.extend(
         setting_lines("BAUD RANGE:", f"{options.min_baud}..{options.max_baud}")
     )
-    lines.extend(setting_lines("SETTINGS:", len(candidates)))
+    lines.extend(setting_lines("BAUDS:", len(bauds)))
     if baud_order:
         lines.extend(
             setting_lines("BAUD ORDER:", f"{baud_order[0]} DOWN TO {baud_order[-1]}")
@@ -5760,24 +4007,25 @@ def print_configuration(options: ScanOptions) -> None:
         lines.extend(setting_lines("RANGE ERROR:", range_error))
     lines.extend(
         setting_lines(
-            "COUNT FORMULA:",
-            f"{len(bauds)} BAUD X "
-            f"{len(DATA_BITS)} DATA X {len(PARITIES)} PARITY X "
-            f"{len(STOP_BITS)} STOP X {len(FLOW_CONTROLS)} FLOW",
+            "PHASE 0 PAIRS:",
+            f"{phase0_pair_count} INPUT/OUTPUT BAUD PAIRS AT 8E1 FLOW=NONE",
         )
     )
-    lines.extend(setting_lines("TEST BYTES:", f"{options.payload_bytes} BYTES"))
-    lines.extend(setting_lines("TEST COUNT:", options.bursts))
     lines.extend(
         setting_lines(
-            "QUICK MODE:",
-            f"ASK AT START; FIXED INTERNAL {exploratory_fixed_settings_label()}",
+            "PHASE 0 SELECT:",
+            f"UP TO {selected_pair_limit} LIVE PAIRS; FALLBACK UP TO {fallback_pair_limit}",
         )
     )
-    lines.extend(setting_lines("PHASE 0:", phase0_fixed_settings_label()))
     lines.extend(
-        setting_lines("QUICK BAUD FOCUS:", baud_focus_settings_label(options))
+        setting_lines(
+            "FRAME TESTS:",
+            f"{frame_pairs_per_live_pair} INPUT/OUTPUT FRAME PAIRS PER LIVE BAUD PAIR",
+        )
     )
+    lines.extend(setting_lines("SCAN BYTES:", f"{options.payload_bytes} BYTES"))
+    lines.extend(setting_lines("SCAN COUNT:", options.bursts))
+    lines.extend(setting_lines("PHASE 0:", phase0_fixed_settings_label()))
     lines.extend(
         setting_lines(
             "TURBO DISCOVERY:",
@@ -5786,18 +4034,14 @@ def print_configuration(options: ScanOptions) -> None:
     )
     lines.extend(
         setting_lines(
-            "EFFECTIVE TIMING:",
-            effective_timing_range_label(options, candidates),
+            "FRAME TIMING:",
+            effective_timing_range_label(options, timing_candidates),
         )
     )
     lines.extend(
         setting_lines(
-            "CANDIDATE ORDER:",
-            (
-                "TURBO PRIORITY; LOW-VALUE FRAMES DEFERRED"
-                if options.turbo_discovery_enabled
-                else "EXHAUSTIVE PROGRAM ORDER"
-            ),
+            "SCAN ORDER:",
+            "PHASE 0 BAUD PAIRS; STAGED FRAME SWEEPS; FULL MATRIX IF NEEDED",
         )
     )
     lines.extend(
@@ -5832,7 +4076,7 @@ def print_configuration(options: ScanOptions) -> None:
     lines.extend(setting_lines("OPEN PAUSE:", f"{options.settle_ms} MS"))
     lines.extend(
         setting_lines(
-            "CLEAR OUTPUT:",
+            "STALE DATA:",
             (
                 "NO"
                 if options.no_pre_drain
@@ -5845,18 +4089,14 @@ def print_configuration(options: ScanOptions) -> None:
         )
     )
     lines.extend(setting_lines("TOP ROWS:", options.top))
-    lines.extend(setting_lines("MEMORY TEST:", "USE 11 AFTER SCAN"))
+    lines.extend(setting_lines("MEMORY TEST:", "USE MENU 2 AFTER SCAN"))
     lines.extend(setting_lines("BANK 2 TEST:", "AVAILABLE INSIDE START SCAN"))
     lines.extend(setting_lines("REPORT FILE:", options.text_report))
     lines.extend(
         setting_lines("DIP SETTING NOTE:", options.switch_note or "(ASK AT SCAN START)")
     )
     lines.extend(setting_lines("LOG FILE:", options.log_file))
-    lines.extend(setting_lines("SEND TIME:", format_duration(wire).upper()))
-    lines.extend(
-        setting_lines("WAIT TIME:", f"{format_duration(overhead).upper()} IF QUIET")
-    )
-    lines.extend(setting_lines("TOTAL EST.:", format_duration(wire + overhead).upper()))
+    lines.extend(setting_lines("ESTIMATE:", "SHOWN AFTER PHASE 0 SELECTS LIVE BAUD PAIRS"))
     print_paged_lines(lines)
 
 
@@ -5872,13 +4112,14 @@ def configure_baud_range(options: ScanOptions) -> ScanOptions:
 
 def configure_payload(options: ScanOptions) -> ScanOptions:
     """Prompt for payload and burst settings."""
+    print("SCAN SIZE AND VALIDATION")
     print(f"MINIMUM TEST MESSAGE IS {minimum_payload_size()} BYTES.")
     payload_bytes = prompt_int(
-        "TEST MESSAGE SIZE IN BYTES",
+        "SCAN MESSAGE SIZE IN BYTES",
         options.payload_bytes,
         minimum=minimum_payload_size(),
     )
-    bursts = prompt_int("NUMBER OF TESTS PER SETTING", options.bursts, minimum=1)
+    bursts = prompt_int("SCAN COUNT PER SETTING", options.bursts, minimum=1)
     ask_on_top_match = prompt_yes_no(
         "ASK WHETHER TO CONTINUE AFTER TOP MATCH",
         options.ask_on_top_match,
@@ -5929,7 +4170,7 @@ def configure_payload(options: ScanOptions) -> ScanOptions:
 
 def configure_timing(options: ScanOptions) -> ScanOptions:
     """Prompt for timing settings."""
-    print("DISCOVERY TIMING")
+    print("TIMING AND STALE DATA")
     print("TURBO APPLIES ONLY TO SCAN DISCOVERY.")
     print("VALIDATION AND MEMORY TESTS STAY CONSERVATIVE.")
     turbo_enabled = prompt_yes_no(
@@ -5937,7 +4178,7 @@ def configure_timing(options: ScanOptions) -> ScanOptions:
         options.turbo_discovery_enabled,
     )
     pre_drain_enabled = prompt_yes_no(
-        "CLEAR OLD OUTPUT BEFORE EACH TEST",
+        "REJECT STALE OUTPUT BEFORE EACH TEST",
         not options.no_pre_drain,
     )
     read_timeout = prompt_float(
@@ -5991,46 +4232,6 @@ def configure_reports(options: ScanOptions) -> ScanOptions:
         text_report=text_report,
         switch_note=switch_note,
         log_file=log_file,
-    )
-
-
-def configure_baud_focus(options: ScanOptions) -> ScanOptions:
-    """Prompt for exploratory baud focus settings."""
-    print("QUICK BAUD FOCUS")
-    print("USED ONLY BY QUICK SCAN.")
-    print("IF ONE BAUD IS CLEARLY BEST, QUICK SCAN MAY DEFER OTHER BAUDS.")
-    print("FULL SCAN DOES NOT USE THIS.")
-    enabled = prompt_yes_no("QUICK BAUD FOCUS ENABLED", options.baud_focus_enabled)
-    score_threshold = prompt_float(
-        "FOCUS SCORE",
-        options.baud_focus_strong_score_threshold,
-        0.0,
-    )
-    lead_gap = prompt_float(
-        "FOCUS LEAD GAP",
-        options.baud_focus_lead_gap_threshold,
-        0.0,
-    )
-    min_strong = prompt_int(
-        "FOCUS GOOD COUNT",
-        options.baud_focus_min_strong_results,
-        1,
-    )
-    min_samples = prompt_int(
-        "FOCUS SAMPLE COUNT",
-        options.baud_focus_min_samples,
-        1,
-    )
-    if score_threshold > 100.0:
-        print("VALUE TOO HIGH. USING 100.0.")
-        score_threshold = 100.0
-    return dataclasses.replace(
-        options,
-        baud_focus_enabled=enabled,
-        baud_focus_strong_score_threshold=score_threshold,
-        baud_focus_lead_gap_threshold=lead_gap,
-        baud_focus_min_strong_results=min_strong,
-        baud_focus_min_samples=min_samples,
     )
 
 
@@ -7804,13 +6005,12 @@ def print_commands() -> None:
     menu_line("OPERATION", "SETUP")
     menu_line("  1  START SCAN", "  3  SET COM PORTS")
     menu_line("  2  MEMORY TEST", "  4  SET BAUD RANGE")
-    menu_line("", "  5  TEST SIZE / COUNT")
-    menu_line("", "  6  TIMING / TURBO / CLEAR")
-    menu_line("", "  7  QUICK BAUD FOCUS")
+    menu_line("", "  5  SCAN SIZE / VALIDATE")
+    menu_line("", "  6  TIMING / STALE DATA")
     menu_line()
     menu_line("REPORTS", "REFERENCE")
-    menu_line("  8  SET REPORT FILES", " 10  CURRENT SETTINGS")
-    menu_line("  9  RESET REPORT FILES", " 11  HELP")
+    menu_line("  7  SET REPORT FILES", "  S  CURRENT SETTINGS")
+    menu_line("  8  RESET REPORT FILES", "  ?  HELP")
     menu_line("", "  0  QUIT")
     print(border_line(SCREEN_WIDTH))
 
@@ -7822,7 +6022,7 @@ def interactive_menu(options: ScanOptions | None = None) -> ScanOptions | None:
     while True:
         print_commands()
         try:
-            choice = read_operator_input("COMMAND (?=HELP): ").lstrip("\ufeff").strip().lower()
+            choice = read_operator_input("COMMAND (1-8,S,?,0): ").lstrip("\ufeff").strip().lower()
         except EOFError:
             return None
 
@@ -7848,24 +6048,22 @@ def interactive_menu(options: ScanOptions | None = None) -> ScanOptions | None:
         elif choice == "6":
             options = configure_timing(options)
         elif choice == "7":
-            options = configure_baud_focus(options)
-        elif choice == "8":
             options = configure_reports(options)
-        elif choice == "9":
+        elif choice == "8":
             default_text_report, default_log = default_report_paths()
             options = dataclasses.replace(
                 options,
                 text_report=default_text_report,
                 log_file=default_log,
             )
-        elif choice == "10":
+        elif choice in {"s", "c", "settings", "current"}:
             print_configuration(options)
-        elif choice in {"11", "h", "help", "?"}:
+        elif choice in {"h", "help", "?"}:
             print_menu_help()
         elif choice in {"0", "q", "quit", "exit"}:
             return None
         else:
-            print("ENTER 0-11, OR ? FOR HELP.")
+            print("ENTER 1-8, S, ?, OR 0.")
 
 
 def prompt_after_scan_action(title: str = "RUN COMPLETE") -> str:
@@ -8386,644 +6584,6 @@ def run_dual_bank_scan(
         phase0_report,
         results,
         validation_results=validation_results,
-    )
-    print()
-    print_report_title("REPORT FILES")
-    print_wrapped_value("  TEXT REPORT: ", f"{options.text_report} (APPENDED)")
-    print_wrapped_value("  DEBUG LOG:   ", options.log_file)
-    print(border_line(REPORT_WIDTH))
-    if operator_break_action == "menu":
-        raise ReturnToMainMenuAfterReport()
-    if operator_break_action == "quit":
-        raise QuitProgramAfterReport()
-    if operator_break_action is not None:
-        return OPERATOR_BREAK_EXIT_CODE
-    return 0
-
-
-def metadata_for_scan(
-    options: ScanOptions,
-    pyserial_version: str,
-    payload: ProbePayload,
-    candidate_count: int,
-    scan_mode: str,
-    started_at: str,
-    completed_at: str | None = None,
-    early_stopped: bool = False,
-) -> dict[str, Any]:
-    """Build structured metadata for reporting."""
-    return {
-        "tool": "serial_probe",
-        "started_at": started_at,
-        "completed_at": completed_at,
-        "python": sys.version,
-        "platform": platform.platform(),
-        "pyserial_version": pyserial_version,
-        "in_port": options.in_port,
-        "out_port": options.out_port,
-        "mode": "scan",
-        "scan_mode": scan_mode,
-        "run_id": options.run_id,
-        "candidate_count": candidate_count,
-        "completed_candidates": None,
-        "early_stopped": early_stopped,
-        "top": options.top,
-        "payload": dataclass_to_jsonable(payload),
-        "options": dataclass_to_jsonable(options),
-        "baud_list": BAUD_RATES,
-        "baud_order": scan_bauds(options.min_baud, options.max_baud),
-        "data_bits": DATA_BITS,
-        "parities": PARITIES,
-        "stop_bits": STOP_BITS,
-        "flow_controls": FLOW_CONTROLS,
-    }
-
-
-def run_scan(options: ScanOptions) -> int:
-    """Run the serial probe scan and write reports."""
-    workflow = prompt_start_scan_workflow()
-    if workflow == "bank2":
-        run_second_bank_characterization(options)
-        return 0
-    phase0_only = workflow == "phase0"
-    serial_module = import_or_install_pyserial()
-    logger = setup_logging(options.log_file)
-    logger.info("serial_probe started")
-    logger.info("using dual input/output baud discovery model workflow=%s", workflow)
-
-    return run_dual_bank_scan(
-        serial_module=serial_module,
-        options=options,
-        logger=logger,
-        phase0_only=phase0_only,
-    )
-
-
-def run_same_settings_scan(
-    serial_module: Any,
-    options: ScanOptions,
-    logger: logging.Logger,
-) -> int:
-    """Run the legacy same-settings scan path."""
-    pyserial_version = str(getattr(serial_module, "VERSION", "unknown"))
-    scan_mode = prompt_scan_mode()
-    turbo_enabled = prompt_yes_no_question(
-        "Turbo discovery mode?",
-        options.turbo_discovery_enabled,
-    )
-    switch_note = prompt_text(
-        "DIP setting note for report",
-        options.switch_note,
-    )
-    options = dataclasses.replace(
-        options,
-        turbo_discovery_enabled=turbo_enabled,
-        switch_note=switch_note,
-        run_id=make_run_id("S"),
-    )
-    logger.info("legacy same-settings scan-start turbo discovery=%s", turbo_enabled)
-
-    all_candidates = prioritize_discovery_candidates(
-        generate_candidates(options.min_baud, options.max_baud),
-        options,
-    )
-    candidates = list(all_candidates)
-    payload = generate_payload(options.payload_bytes)
-    logger.info("options: %s", options)
-    logger.info("payload: %s bytes, %s lines", payload.byte_count, payload.line_count)
-    logger.info("candidates: %s", len(all_candidates))
-
-    quick_mode = scan_mode == "quick"
-    if quick_mode:
-        exploratory_requested = True
-        phase2_quick_accept = True
-        print("QUICK SCAN: EXPLORATORY=YES PHASE2=YES")
-        logger.info("scan type quick: exploratory=yes phase2=yes")
-    else:
-        print("FULL MODE: CONSERVATIVE OPERATOR PROMPTS ENABLED")
-        exploratory_requested = prompt_yes_no_question(
-            "Run quick exploratory mode first?",
-            False,
-        )
-        phase2_quick_accept = False
-        logger.info("scan type full: exploratory=%s", exploratory_requested)
-
-    exploratory_selection: ExploratorySelection | None = None
-    exploratory_narrowing_accepted = False
-    phase2_candidate_source = PHASE2_CANDIDATE_SOURCE_FULL
-    if exploratory_requested:
-        exploratory_selection = run_exploratory_scan(
-            serial_module=serial_module,
-            options=options,
-            candidates=all_candidates,
-            logger=logger,
-        )
-        if exploratory_selection.narrowed_candidates:
-            if phase2_quick_accept:
-                exploratory_narrowing_accepted = True
-                print("QUICK SCAN: PHASE2 QUICK LIST ACCEPTED")
-            else:
-                exploratory_narrowing_accepted = prompt_yes_no_question(
-                    "Use these findings to narrow full analysis?",
-                    False,
-                )
-            if exploratory_narrowing_accepted:
-                candidates, phase2_candidate_source = phase2_candidates_after_exploratory(
-                    all_candidates,
-                    exploratory_selection,
-                    exploratory_narrowing_accepted,
-                )
-                logger.info(
-                    "exploratory narrowing accepted; full candidates=%s/%s",
-                    len(candidates),
-                    len(all_candidates),
-                )
-            else:
-                logger.info("operator declined exploratory narrowing")
-                candidates, phase2_candidate_source = phase2_candidates_after_exploratory(
-                    all_candidates,
-                    exploratory_selection,
-                    exploratory_narrowing_accepted,
-                )
-                if phase2_candidate_source == PHASE2_CANDIDATE_SOURCE_VIABLE:
-                    print(
-                        "PHASE 2 SIGNAL-ONLY MODE: "
-                        f"TESTING {len(candidates)}/{len(all_candidates)} "
-                        "SETTINGS WITH QUICK LIFE SIGNAL."
-                    )
-                else:
-                    print("FULL ANALYSIS WILL TEST ALL SELECTED SETTINGS.")
-        else:
-            logger.info(
-                "exploratory narrowing unavailable: %s",
-                exploratory_selection.fallback_reason,
-            )
-            candidates, phase2_candidate_source = phase2_candidates_after_exploratory(
-                all_candidates,
-                exploratory_selection,
-                exploratory_narrowing_accepted,
-            )
-            if phase2_candidate_source == PHASE2_CANDIDATE_SOURCE_VIABLE:
-                print(
-                    "PHASE 2 SIGNAL-ONLY MODE: "
-                    f"TESTING {len(candidates)}/{len(all_candidates)} "
-                    "SETTINGS WITH QUICK LIFE SIGNAL."
-                )
-            else:
-                print("FULL ANALYSIS WILL TEST ALL SELECTED SETTINGS.")
-        logger.info(
-            "phase 2 candidate source=%s candidates=%s/%s narrowed=%s viable=%s",
-            phase2_candidate_source,
-            len(candidates),
-            len(all_candidates),
-            len(exploratory_selection.narrowed_candidates),
-            len(exploratory_selection.viable_candidates),
-        )
-    else:
-        logger.info("operator skipped quick exploratory mode")
-        logger.info(
-            "phase 2 candidate source=%s candidates=%s/%s",
-            phase2_candidate_source,
-            len(candidates),
-            len(all_candidates),
-        )
-
-    purge_buffer_output(
-        serial_module=serial_module,
-        options=options,
-        logger=logger,
-        reason="CLEAR DISCOVERY DATA BEFORE PHASE 1 SCAN.",
-    )
-    scan_started = time.monotonic()
-    started_at = dt.datetime.now(dt.timezone.utc).isoformat()
-
-    print_report_title("SCAN START")
-    print(f"SCAN TYPE: {scan_type_label(scan_mode)}.")
-    if quick_mode:
-        print("QUICK SCAN: EXPLORATORY=YES PHASE2=YES.")
-    else:
-        print("FULL MODE: QUICK DISCOVERY RUNS ONLY IF YOU ANSWER YES.")
-    print("DEVICE PATH: COM INPUT -> BUFFER -> COM OUTPUT.")
-    print("SWITCH MODEL: BAUD FIRST; SW1/SW2 ARE NOT TWO COMPLETE PORT PROFILES.")
-    print("NOTE: PROGRAM SETS COM PORTS; DEVICE MANAGER DEFAULTS ARE NOT USED.")
-    if options.switch_note:
-        print(f"DIP SETTING NOTE: {options.switch_note}")
-    print(
-        "TURBO DISCOVERY: "
-        + ("ON; ADAPTIVE TIMING AND PRIORITY ORDER." if options.turbo_discovery_enabled else "OFF.")
-    )
-    if exploratory_narrowing_accepted:
-        print("MODE: FULL ANALYSIS OF QUICK EXPLORATORY SHORTLIST.")
-        print(f"SETTINGS: {len(candidates)}/{len(all_candidates)} SELECTED BY QUICK MODE.")
-    elif phase2_candidate_source == PHASE2_CANDIDATE_SOURCE_VIABLE:
-        print("MODE: FULL ANALYSIS OF QUICK EXPLORATORY SIGNAL SETTINGS.")
-        print(
-            f"SETTINGS: {len(candidates)}/{len(all_candidates)} "
-            "SELECTED BY QUICK LIFE SIGNAL."
-        )
-    else:
-        print("MODE: TEST ALL SELECTED SERIAL SETTINGS.")
-        if exploratory_requested:
-            print("QUICK MODE: RAN; FULL ANALYSIS NOT NARROWED.")
-    print(
-        f"PORTS: {options.in_port} -> {options.out_port}; "
-        f"TEST={payload.byte_count} BYTES X {options.bursts}"
-    )
-    if options.no_pre_drain:
-        print(
-            f"CLEAR OUTPUT: OFF; OLD {options.out_port} DATA WILL BE SCORED."
-        )
-    else:
-        print(
-            f"CLEAR OUTPUT: ON; QUIET={options.pre_drain_quiet:.1f}S "
-            f"LIMIT={options.pre_drain_timeout:.1f}S "
-            f"MAX={options.max_drain_bytes} BYTES."
-        )
-    if options.ask_on_top_match:
-        print("TOP MATCH PROMPT: ON; PASS ASKS WHETHER TO CONTINUE.")
-    else:
-        print("TOP MATCH PROMPT: OFF.")
-    if options.auto_validate_top_matches:
-        size2 = (
-            f"{options.validate_size_2_tie_bytes} BYTES"
-            if options.validate_size_2_tie_bytes > 0
-            else "OFF"
-        )
-        print(
-            "STAGE 2 VALIDATION: ON; "
-            f"SIZE1={options.validate_size_1_bytes} BYTES SIZE2={size2}."
-        )
-    else:
-        print("STAGE 2 VALIDATION: OFF.")
-    if options.auto_validate_flow_control:
-        print(
-            "FLOW VALIDATION: ON; "
-            f"SIZE={options.flow_validate_size_bytes} BYTES AFTER BEST FRAME."
-        )
-    else:
-        print("FLOW VALIDATION: OFF.")
-    print(f"EFFECTIVE TIMING: {effective_timing_range_label(options, candidates)}.")
-    print(f"SCREEN UPDATE: {options.progress_interval:.1f}S WHILE SETTING RUNS.")
-    print_progress_legend()
-    print(f"REPORT: {options.text_report} (APPEND)")
-    print(f"DEBUG LOG: {options.log_file}")
-    rough_total = 0.0
-    for candidate in candidates:
-        timing = effective_discovery_timing(options, candidate, options.payload_bytes)
-        rough_total += estimated_transmit_seconds(
-            candidate,
-            options.payload_bytes,
-        ) * options.bursts
-        per_burst_wait = timing.read_timeout + (timing.settle_ms / 1000.0)
-        if not options.no_pre_drain:
-            per_burst_wait += timing.pre_drain_quiet
-        rough_total += per_burst_wait * options.bursts
-    print(
-        f"START EST.: {format_duration(rough_total)}; "
-        f"FINISH ABOUT {format_finish_clock(rough_total)}"
-    )
-
-    results: list[CandidateResult] = []
-    early_stopped = False
-    early_stop_reason: str | None = None
-    operator_break_action: str | None = None
-    operator_break_stage: str | None = None
-    candidate_index = 0
-    while candidate_index < len(candidates):
-        settings = candidates[candidate_index]
-        display_index = candidate_index + 1
-        try:
-            result = run_candidate(
-                serial_module=serial_module,
-                index=display_index,
-                total=len(candidates),
-                settings=settings,
-                options=options,
-                payload=payload,
-                logger=logger,
-                progress=console_progress,
-            )
-        except KeyboardInterrupt:
-            action = prompt_operator_break_action("SCAN")
-            if action == "resume":
-                logger.info(
-                    "operator resumed scan at candidate %s/%s %s",
-                    display_index,
-                    len(candidates),
-                    settings.label(),
-                )
-                continue
-            operator_break_action = action
-            operator_break_stage = "SCAN"
-            early_stopped = True
-            early_stop_reason = f"operator-break-{action}"
-            logger.info(
-                "operator break during scan; action=%s completed=%s/%s",
-                action,
-                len(results),
-                len(candidates),
-            )
-            break
-        results.append(result)
-        print(format_progress(result), flush=True)
-        print(format_scan_eta(len(results), len(candidates), scan_started), flush=True)
-        if options.ask_on_top_match and is_top_match_result(result):
-            if ask_continue_after_top_match(result):
-                logger.info("operator chose to continue after top match: %s", result.settings.label())
-            else:
-                early_stopped = True
-                early_stop_reason = "operator-ended-after-top-match"
-                logger.info("operator ended scan after top match: %s", result.settings.label())
-                break
-        candidate_index += 1
-
-    completed_at = dt.datetime.now(dt.timezone.utc).isoformat()
-    elapsed_sec = time.monotonic() - scan_started
-    metadata = metadata_for_scan(
-        options=options,
-        pyserial_version=pyserial_version,
-        payload=payload,
-        candidate_count=len(candidates),
-        scan_mode=scan_mode,
-        started_at=started_at,
-        completed_at=completed_at,
-        early_stopped=early_stopped,
-    )
-    metadata["completed_candidates"] = len(results)
-    metadata["elapsed_sec"] = elapsed_sec
-    metadata["switch_note"] = options.switch_note
-    metadata["early_stop_reason"] = early_stop_reason
-    metadata["operator_break_action"] = operator_break_action
-    metadata["operator_break_stage"] = operator_break_stage
-    metadata["recommendation_status"] = scan_recommendation_status(results)
-    ranked_results = sorted(results, key=result_sort_key, reverse=True)
-    best_result = ranked_results[0] if ranked_results else None
-    tied_results = top_tied_results(results)
-    metadata["recommended_setting"] = (
-        dataclass_to_jsonable(best_result.settings)
-        if is_recommendable_result(best_result) and len(tied_results) <= 1
-        else None
-    )
-    metadata["tied_top_settings"] = [
-        dataclass_to_jsonable(result.settings) for result in tied_results
-    ]
-    metadata["tie_score_tolerance"] = TIE_SCORE_TOLERANCE
-    metadata["full_candidate_count_before_exploratory"] = len(all_candidates)
-    metadata["full_candidate_count_after_exploratory"] = len(candidates)
-    metadata["phase2_candidate_source"] = phase2_candidate_source
-    metadata["phase2_candidate_count"] = len(candidates)
-    metadata["exploratory_mode"] = exploratory_metadata(
-        requested=exploratory_requested,
-        narrowing_accepted=exploratory_narrowing_accepted,
-        selection=exploratory_selection,
-        original_candidate_count=len(all_candidates),
-        final_candidate_count=len(candidates),
-        options=options,
-        phase2_candidate_source=phase2_candidate_source,
-    )
-    logger.info(
-        "serial_probe completed; candidates=%s/%s early_stopped=%s exploratory_narrowed=%s phase2_source=%s",
-        len(results),
-        len(all_candidates),
-        early_stopped,
-        exploratory_narrowing_accepted,
-        phase2_candidate_source,
-    )
-    logger.info("text_report=%s", options.text_report)
-
-    print()
-    print_report_title("PHASE 1 RESULTS")
-    print("BASE SCAN RANKING AND SUMMARY.")
-    print_ranked_table(results, options.top, report_title="PHASE 1 FINAL REPORT")
-    print_scan_summary(
-        results=results,
-        total_candidates=len(candidates),
-        elapsed_sec=elapsed_sec,
-        early_stopped=early_stopped,
-        top=options.top,
-        early_stop_reason=early_stop_reason,
-    )
-    print_wrapped_value("  NOTE:                 ", f"SCAN TYPE {scan_type_label(scan_mode)}.")
-    if exploratory_narrowing_accepted:
-        print_wrapped_value(
-            "  NOTE:                 ",
-            "FULL ANALYSIS USED QUICK EXPLORATORY "
-            f"CANDIDATES ({len(candidates)}/{len(all_candidates)}).",
-        )
-    elif phase2_candidate_source == PHASE2_CANDIDATE_SOURCE_VIABLE:
-        print_wrapped_value(
-            "  NOTE:                 ",
-            "FULL ANALYSIS USED QUICK EXPLORATORY "
-            f"SIGNAL CANDIDATES ({len(candidates)}/{len(all_candidates)}).",
-        )
-    elif exploratory_requested:
-        print("  NOTE:                 QUICK EXPLORATORY DID NOT NARROW FULL ANALYSIS.")
-    if exploratory_selection is not None:
-        phase0 = exploratory_selection.phase0_liveness
-        print_wrapped_value(
-            "  NOTE:                 ",
-            "PHASE 0 BAUD LIVENESS "
-            f"{len(phase0.alive_bauds)}/{len(phase0.tested_bauds)}.",
-        )
-        if phase0.fallback_to_all_bauds and phase0.fallback_reason:
-            print_wrapped_value(
-                "  NOTE:                 ",
-                f"PHASE 0 FALLBACK: {phase0.fallback_reason}",
-            )
-    if exploratory_selection is not None and exploratory_selection.baud_focus.engaged:
-        report = exploratory_selection.baud_focus
-        print_wrapped_value(
-            "  NOTE:                 ",
-            "QUICK BAUD FOCUS "
-            f"{report.focused_baud}; "
-            f"DEFERRED={report.deferred_candidate_count}.",
-        )
-        if report.release_reason:
-            print_wrapped_value(
-                "  NOTE:                 ",
-                f"QUICK BAUD FOCUS RELEASED: {report.release_reason}.",
-            )
-    validation_results: list[CandidateResult] = []
-    if options.auto_validate_top_matches and results and operator_break_action is None:
-        ranked = ranked_top_results(results, options.top)
-        top_score = ranked[0].score if ranked else 0.0
-        shortlist = [result for result in ranked if abs(result.score - top_score) <= 0.0001]
-        if shortlist:
-            purge_buffer_output(
-                serial_module=serial_module,
-                options=options,
-                logger=logger,
-                reason="CLEAR PHASE 1 DATA BEFORE VALIDATION.",
-            )
-            print()
-            print_report_title("PHASE 2 VALIDATION")
-            print(
-                f"SHORTLIST: {len(shortlist)} TOP-SCORE SETTING(S) "
-                f"FROM SCORE={top_score:.2f}."
-            )
-            stage2_options = dataclasses.replace(
-                options,
-                turbo_discovery_enabled=False,
-                payload_bytes=options.validate_size_1_bytes,
-                bursts=1,
-                ask_on_top_match=False,
-            )
-            stage2_payload = generate_payload(options.validate_size_1_bytes)
-            stage2_results: list[CandidateResult] = []
-            validation_index = 0
-            while validation_index < len(shortlist):
-                candidate = shortlist[validation_index]
-                display_index = validation_index + 1
-                print(
-                    f"VALIDATION PASS 1: {stage2_payload.byte_count} BYTES "
-                    f"{display_index}/{len(shortlist)} {candidate.settings.label()}"
-                )
-                try:
-                    stage2_result = run_candidate(
-                        serial_module=serial_module,
-                        index=display_index,
-                        total=len(shortlist),
-                        settings=candidate.settings,
-                        options=stage2_options,
-                        payload=stage2_payload,
-                        logger=logger,
-                        progress=console_progress,
-                    )
-                except KeyboardInterrupt:
-                    action = prompt_operator_break_action("VALIDATION")
-                    if action == "resume":
-                        logger.info(
-                            "operator resumed validation at %s/%s %s",
-                            display_index,
-                            len(shortlist),
-                            candidate.settings.label(),
-                        )
-                        continue
-                    operator_break_action = action
-                    operator_break_stage = "VALIDATION"
-                    logger.info(
-                        "operator break during validation; action=%s completed=%s/%s",
-                        action,
-                        len(stage2_results),
-                        len(shortlist),
-                    )
-                    break
-                stage2_results.append(stage2_result)
-                print(format_progress(stage2_result), flush=True)
-                validation_index += 1
-            tied_after_1 = top_tied_results(stage2_results)
-            final_stage2_results = stage2_results
-            if (
-                operator_break_action is None
-                and len(tied_after_1) > 1
-                and options.validate_size_2_tie_bytes > 0
-            ):
-                print(
-                    f"TIE REMAINS ({len(tied_after_1)}). "
-                    f"RUNNING PASS 2 AT {options.validate_size_2_tie_bytes} BYTES."
-                )
-                purge_buffer_output(
-                    serial_module=serial_module,
-                    options=options,
-                    logger=logger,
-                    reason="CLEAR VALIDATION PASS 1 DATA BEFORE PASS 2.",
-                )
-                stage2_options = dataclasses.replace(
-                    stage2_options,
-                    payload_bytes=options.validate_size_2_tie_bytes,
-                )
-                stage2_payload = generate_payload(options.validate_size_2_tie_bytes)
-                tie_results: list[CandidateResult] = []
-                tie_index = 0
-                while tie_index < len(tied_after_1):
-                    candidate = tied_after_1[tie_index]
-                    display_index = tie_index + 1
-                    print(
-                        f"VALIDATION PASS 2: {stage2_payload.byte_count} BYTES "
-                        f"{display_index}/{len(tied_after_1)} "
-                        f"{candidate.settings.label()}"
-                    )
-                    try:
-                        tie_result = run_candidate(
-                            serial_module=serial_module,
-                            index=display_index,
-                            total=len(tied_after_1),
-                            settings=candidate.settings,
-                            options=stage2_options,
-                            payload=stage2_payload,
-                            logger=logger,
-                            progress=console_progress,
-                        )
-                    except KeyboardInterrupt:
-                        action = prompt_operator_break_action("VALIDATION")
-                        if action == "resume":
-                            logger.info(
-                                "operator resumed validation pass 2 at %s/%s %s",
-                                display_index,
-                                len(tied_after_1),
-                                candidate.settings.label(),
-                            )
-                            continue
-                        operator_break_action = action
-                        operator_break_stage = "VALIDATION"
-                        logger.info(
-                            "operator break during validation pass 2; "
-                            "action=%s completed=%s/%s",
-                            action,
-                            len(tie_results),
-                            len(tied_after_1),
-                        )
-                        break
-                    tie_results.append(tie_result)
-                    print(format_progress(tie_result), flush=True)
-                    tie_index += 1
-                final_stage2_results = tie_results
-            elif operator_break_action is None and len(tied_after_1) > 1:
-                print("TIE REMAINS AFTER PASS 1. PASS 2 IS OFF.")
-
-            print("STAGE 2 FINAL RANKING:")
-            print_ranked_table(
-                final_stage2_results,
-                min(options.top, len(final_stage2_results)),
-                report_title="PHASE 2 FINAL REPORT",
-            )
-            validation_results = list(final_stage2_results)
-    flow_validation_results: list[FlowControlValidationResult] = []
-    if (
-        options.auto_validate_flow_control
-        and results
-        and operator_break_action is None
-    ):
-        flow_validation_results, flow_break_action = run_flow_control_validation(
-            serial_module=serial_module,
-            options=options,
-            results=results,
-            validation_results=validation_results,
-            logger=logger,
-        )
-        if flow_break_action is not None:
-            operator_break_action = flow_break_action
-            operator_break_stage = "FLOW VALIDATION"
-    metadata["flow_control_validation"] = {
-        "enabled": options.auto_validate_flow_control,
-        "ran": bool(flow_validation_results),
-        "payload_bytes": options.flow_validate_size_bytes,
-        "recommendation": flow_control_validation_recommendation(
-            flow_validation_results
-        ),
-        "results": dataclass_to_jsonable(flow_validation_results),
-    }
-    if operator_break_action is not None:
-        metadata["operator_break_action"] = operator_break_action
-        metadata["operator_break_stage"] = operator_break_stage
-        if operator_break_stage in {"VALIDATION", "FLOW VALIDATION"}:
-            metadata["early_stop_reason"] = f"operator-break-{operator_break_action}"
-    write_text_report(
-        options.text_report,
-        metadata,
-        results,
-        validation_results=validation_results,
-        flow_validation_results=flow_validation_results,
     )
     print()
     print_report_title("REPORT FILES")
