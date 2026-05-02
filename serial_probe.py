@@ -462,6 +462,7 @@ class DualBaudLivenessReport:
 
     ran: bool
     tested_pairs: list[tuple[int, int]]
+    total_pairs: int
     alive_pairs: list[tuple[int, int]]
     selected_pairs: list[tuple[int, int]]
     fallback_reason: str | None
@@ -3877,25 +3878,90 @@ def dual_phase0_settings(input_baud: int, output_baud: int) -> DualSerialSetting
     )
 
 
+def frame_candidates_for_baud(baud: int) -> list[SerialSettings]:
+    """Return frame candidates for one baud in discovery order."""
+    frames = [
+        SerialSettings(baud, data_bits, parity, stop_bits, "none")
+        for data_bits in DATA_BITS
+        for parity in PARITIES
+        for stop_bits in STOP_BITS
+    ]
+    frames.sort(key=discovery_frame_priority)
+    return frames
+
+
+def unique_dual_candidates(
+    candidates: Sequence[DualSerialSettings],
+) -> list[DualSerialSettings]:
+    """Return dual settings with duplicates removed while preserving order."""
+    unique: list[DualSerialSettings] = []
+    seen: set[DualSerialSettings] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        unique.append(candidate)
+        seen.add(candidate)
+    return unique
+
+
+def dual_output_frame_sweep_for_pair(
+    input_baud: int,
+    output_baud: int,
+) -> list[DualSerialSettings]:
+    """Hold Phase 0 input framing and sweep output frames."""
+    seed = dual_phase0_settings(input_baud, output_baud)
+    return unique_dual_candidates(
+        [
+            DualSerialSettings(seed.input_settings, output_frame)
+            for output_frame in frame_candidates_for_baud(output_baud)
+        ]
+    )
+
+
+def dual_input_frame_sweep_for_pair(
+    input_baud: int,
+    output_settings: SerialSettings,
+) -> list[DualSerialSettings]:
+    """Hold the best observed output framing and sweep input frames."""
+    return unique_dual_candidates(
+        [
+            DualSerialSettings(input_frame, output_settings)
+            for input_frame in frame_candidates_for_baud(input_baud)
+        ]
+    )
+
+
+def best_dual_output_settings(
+    results: Sequence[CandidateResult],
+    seed: DualSerialSettings,
+) -> SerialSettings:
+    """Return the best output frame seen while the input frame was fixed."""
+    eligible = [
+        result
+        for result in results
+        if isinstance(result.settings, DualSerialSettings)
+        and result.settings.input_settings == seed.input_settings
+        and result.settings.output_settings.baud == seed.output_settings.baud
+        and result.score > 0.0
+    ]
+    if not eligible:
+        return seed.output_settings
+    best_result = sorted(eligible, key=result_sort_key, reverse=True)[0]
+    return dual_result_settings(best_result).output_settings
+
+
+def has_recommendable_dual_result(results: Sequence[CandidateResult]) -> bool:
+    """Return True when staged dual discovery found a usable pair."""
+    return any(is_recommendable_result(result) for result in results)
+
+
 def dual_frame_candidates_for_pair(
     input_baud: int,
     output_baud: int,
 ) -> list[DualSerialSettings]:
     """Return independent input/output frame candidates for one baud pair."""
-    input_frames = [
-        SerialSettings(input_baud, data_bits, parity, stop_bits, "none")
-        for data_bits in DATA_BITS
-        for parity in PARITIES
-        for stop_bits in STOP_BITS
-    ]
-    output_frames = [
-        SerialSettings(output_baud, data_bits, parity, stop_bits, "none")
-        for data_bits in DATA_BITS
-        for parity in PARITIES
-        for stop_bits in STOP_BITS
-    ]
-    input_frames.sort(key=discovery_frame_priority)
-    output_frames.sort(key=discovery_frame_priority)
+    input_frames = frame_candidates_for_baud(input_baud)
+    output_frames = frame_candidates_for_baud(output_baud)
     return [
         DualSerialSettings(input_settings=input_frame, output_settings=output_frame)
         for input_frame in input_frames
@@ -3999,7 +4065,7 @@ def print_dual_phase0_summary(report: DualBaudLivenessReport) -> None:
     print()
     print_report_title("DUAL PHASE 0 RESULTS")
     print(f"  RUN TIME:             {format_duration(report.elapsed_sec)}")
-    print(f"  BAUD PAIRS TESTED:    {len(report.tested_pairs)}")
+    print(f"  BAUD PAIRS TESTED:    {len(report.tested_pairs)}/{report.total_pairs}")
     print(f"  ALIVE PAIRS:          {len(report.alive_pairs)}")
     if input_bauds:
         print_wrapped_value(
@@ -4102,16 +4168,21 @@ def run_dual_phase0_baud_matrix(
                 )
                 break
 
-    elapsed_sec = time.monotonic() - started
+    elapsed_sec = sum(result.elapsed_sec for result in results)
     alive_pairs = [
         (result.input_baud, result.output_baud)
         for result in results
         if result.alive
     ]
+    tested_pairs = [
+        (result.input_baud, result.output_baud)
+        for result in results
+    ]
     selected_pairs, fallback_reason = select_dual_phase0_pairs(results)
     report = DualBaudLivenessReport(
         ran=True,
-        tested_pairs=list(pairs),
+        tested_pairs=tested_pairs,
+        total_pairs=len(pairs),
         alive_pairs=alive_pairs,
         selected_pairs=selected_pairs,
         fallback_reason=fallback_reason,
@@ -4122,7 +4193,7 @@ def run_dual_phase0_baud_matrix(
     logger.info(
         "dual phase 0 completed alive=%s/%s selected=%s reason=%s",
         len(alive_pairs),
-        len(pairs),
+        len(results),
         selected_pairs,
         fallback_reason,
     )
@@ -4364,8 +4435,23 @@ def write_dual_bank_text_report(
         f"COM PATH:        {metadata.get('in_port')} -> BUFFER -> {metadata.get('out_port')}",
         f"SWITCH NOTE:     {switch_note if switch_note else '(NOT ENTERED)'}",
         "SCAN MODEL:      DUAL BANK INPUT/OUTPUT SETTINGS",
-        f"PHASE 0 PAIRS:   {len(phase0.alive_pairs)}/{len(phase0.tested_pairs)} ALIVE",
+        (
+            "PHASE 0 PAIRS:   "
+            f"{len(phase0.alive_pairs)} ALIVE / "
+            f"{len(phase0.tested_pairs)} TESTED / {phase0.total_pairs} POSSIBLE"
+        ),
         f"PHASE 1 PAIRS:   {selected_pairs if selected_pairs else '(NONE)'}",
+        f"STAGED TESTS:    {metadata.get('staged_candidate_count', 0)} PLANNED",
+        (
+            "FULL MATRIX:     "
+            + (
+                "RUN"
+                if metadata.get("full_matrix_ran")
+                else "SKIPPED"
+                if metadata.get("full_matrix_skipped")
+                else "NOT REACHED"
+            )
+        ),
         "",
         "DUAL-BANK SUMMARY:",
         *dual_text_summary_lines(results),
@@ -6662,9 +6748,17 @@ def run_dual_bank_scan(
         print(border_line(REPORT_WIDTH))
         return 1
 
-    candidates: list[DualSerialSettings] = []
+    full_candidates: list[DualSerialSettings] = []
+    staged_preview_candidates: list[DualSerialSettings] = []
     for input_baud, output_baud in selected_pairs:
-        candidates.extend(dual_frame_candidates_for_pair(input_baud, output_baud))
+        full_candidates.extend(dual_frame_candidates_for_pair(input_baud, output_baud))
+        seed = dual_phase0_settings(input_baud, output_baud)
+        staged_preview_candidates.extend(dual_output_frame_sweep_for_pair(input_baud, output_baud))
+        staged_preview_candidates.extend(
+            dual_input_frame_sweep_for_pair(input_baud, seed.output_settings)
+        )
+    full_candidates = unique_dual_candidates(full_candidates)
+    staged_preview_candidates = unique_dual_candidates(staged_preview_candidates)
     payload = generate_payload(options.payload_bytes)
     purge_buffer_output(
         serial_module=serial_module,
@@ -6687,11 +6781,17 @@ def run_dual_bank_scan(
             for input_baud, output_baud in selected_pairs
         ),
     )
-    print(f"SETTINGS: {len(candidates)} INPUT/OUTPUT FRAME PAIRS.")
+    print(
+        f"STAGED SETTINGS: {len(staged_preview_candidates)} "
+        f"BEFORE FULL MATRIX FALLBACK."
+    )
+    print(f"FULL MATRIX: {len(full_candidates)} INPUT/OUTPUT FRAME PAIRS IF NEEDED.")
     print(
         f"PORTS: {options.in_port} -> BUFFER -> {options.out_port}; "
         f"TEST={payload.byte_count} BYTES X {options.bursts}"
     )
+    print("DISCOVERY ORDER: PHASE 0 FRAME, OUTPUT SWEEP, INPUT SWEEP.")
+    print("FULL MATRIX RUNS ONLY IF STAGED DISCOVERY DOES NOT FIND A GOOD PAIR.")
     print("FLOW CONTROL: NONE DURING DUAL FRAME DISCOVERY.")
     if options.auto_validate_top_matches:
         print(f"VALIDATION: ON; SIZE1={options.validate_size_1_bytes} BYTES.")
@@ -6702,84 +6802,184 @@ def run_dual_bank_scan(
     print_progress_legend()
     print(f"REPORT: {options.text_report} (APPEND)")
     print(f"DEBUG LOG: {options.log_file}")
-    rough_total = 0.0
-    for candidate in candidates:
+    staged_rough_total = 0.0
+    for candidate in staged_preview_candidates:
         timing = effective_discovery_timing(
             options,
             candidate.input_settings,
             options.payload_bytes,
         )
-        rough_total += estimated_transmit_seconds(
+        staged_rough_total += estimated_transmit_seconds(
             candidate.input_settings,
             options.payload_bytes,
         ) * options.bursts
         per_burst_wait = timing.read_timeout + (timing.settle_ms / 1000.0)
         if not options.no_pre_drain:
             per_burst_wait += timing.pre_drain_quiet
-        rough_total += per_burst_wait * options.bursts
+        staged_rough_total += per_burst_wait * options.bursts
+    full_rough_total = 0.0
+    for candidate in full_candidates:
+        timing = effective_discovery_timing(
+            options,
+            candidate.input_settings,
+            options.payload_bytes,
+        )
+        full_rough_total += estimated_transmit_seconds(
+            candidate.input_settings,
+            options.payload_bytes,
+        ) * options.bursts
+        per_burst_wait = timing.read_timeout + (timing.settle_ms / 1000.0)
+        if not options.no_pre_drain:
+            per_burst_wait += timing.pre_drain_quiet
+        full_rough_total += per_burst_wait * options.bursts
     print(
-        f"START EST.: {format_duration(rough_total)}; "
-        f"FINISH ABOUT {format_finish_clock(rough_total)}"
+        f"STAGE EST.: {format_duration(staged_rough_total)}; "
+        f"FINISH ABOUT {format_finish_clock(staged_rough_total)}"
+    )
+    print(
+        f"FULL EST. IF NEEDED: {format_duration(full_rough_total)}; "
+        f"FINISH ABOUT {format_finish_clock(full_rough_total)}"
     )
 
     results: list[CandidateResult] = []
+    tested_settings: set[DualSerialSettings] = set()
     early_stopped = False
     operator_break_action: str | None = None
     operator_break_stage: str | None = None
-    index = 0
-    while index < len(candidates):
-        settings = candidates[index]
-        display_index = index + 1
-        try:
-            result = run_dual_candidate(
-                serial_module=serial_module,
-                index=display_index,
-                total=len(candidates),
-                settings=settings,
-                options=options,
-                payload=payload,
-                logger=logger,
-                progress=console_progress,
-            )
-        except KeyboardInterrupt:
-            action = prompt_operator_break_action("DUAL SCAN")
-            if action == "resume":
-                logger.info(
-                    "operator resumed dual scan at %s/%s %s",
-                    display_index,
-                    len(candidates),
-                    settings.label(),
+    full_matrix_ran = False
+    full_matrix_skipped = False
+
+    def run_dual_sequence(
+        stage_title: str,
+        stage_name: str,
+        sequence: Sequence[DualSerialSettings],
+    ) -> list[CandidateResult]:
+        nonlocal early_stopped, operator_break_action, operator_break_stage
+        unique_sequence = [
+            settings for settings in unique_dual_candidates(sequence)
+            if settings not in tested_settings
+        ]
+        if (
+            not unique_sequence
+            or early_stopped
+            or operator_break_action is not None
+        ):
+            return []
+
+        print()
+        print_report_title(stage_title)
+        print(f"SETTINGS: {len(unique_sequence)}")
+        print(border_line(REPORT_WIDTH))
+        stage_results: list[CandidateResult] = []
+        index = 0
+        while index < len(unique_sequence):
+            settings = unique_sequence[index]
+            display_index = len(results) + 1
+            try:
+                result = run_dual_candidate(
+                    serial_module=serial_module,
+                    index=display_index,
+                    total=len(full_candidates),
+                    settings=settings,
+                    options=options,
+                    payload=payload,
+                    logger=logger,
+                    progress=console_progress,
                 )
-                continue
-            operator_break_action = action
-            operator_break_stage = "DUAL SCAN"
-            early_stopped = True
-            logger.info(
-                "operator break during dual scan; action=%s completed=%s/%s",
-                action,
-                len(results),
-                len(candidates),
-            )
-            break
-        results.append(result)
-        print(format_dual_progress(result), flush=True)
-        print(format_scan_eta(len(results), len(candidates), scan_started), flush=True)
-        if options.ask_on_top_match and is_top_match_result(result):
-            print()
-            print_report_title("DUAL TOP MATCH FOUND")
-            print_dual_result_details(result)
-            print("    CONTINUE TO LOOK FOR POSSIBLE TIES.")
-            print("    ENTER N TO END NOW AND WRITE REPORT.")
-            print(border_line(REPORT_WIDTH))
-            if not prompt_yes_no("CONTINUE DUAL SCAN", True):
+            except KeyboardInterrupt:
+                action = prompt_operator_break_action(stage_name)
+                if action == "resume":
+                    logger.info(
+                        "operator resumed %s at %s/%s %s",
+                        stage_name.lower(),
+                        display_index,
+                        len(full_candidates),
+                        settings.label(),
+                    )
+                    continue
+                operator_break_action = action
+                operator_break_stage = stage_name
                 early_stopped = True
-                operator_break_stage = "DUAL SCAN"
                 logger.info(
-                    "operator ended dual scan after top match: %s",
-                    settings.label(),
+                    "operator break during %s; action=%s completed=%s/%s",
+                    stage_name.lower(),
+                    action,
+                    len(results),
+                    len(full_candidates),
                 )
                 break
-        index += 1
+            results.append(result)
+            stage_results.append(result)
+            tested_settings.add(settings)
+            print(format_dual_progress(result), flush=True)
+            print(
+                format_scan_eta(len(results), len(full_candidates), scan_started),
+                flush=True,
+            )
+            if options.ask_on_top_match and is_top_match_result(result):
+                print()
+                print_report_title("DUAL TOP MATCH FOUND")
+                print_dual_result_details(result)
+                print("    CONTINUE TO LOOK FOR POSSIBLE TIES.")
+                print("    ENTER N TO END NOW AND WRITE REPORT.")
+                print(border_line(REPORT_WIDTH))
+                if not prompt_yes_no("CONTINUE DUAL SCAN", True):
+                    early_stopped = True
+                    operator_break_stage = stage_name
+                    logger.info(
+                        "operator ended %s after top match: %s",
+                        stage_name.lower(),
+                        settings.label(),
+                    )
+                    break
+            index += 1
+        return stage_results
+
+    for input_baud, output_baud in selected_pairs:
+        if early_stopped or operator_break_action is not None:
+            break
+        seed = dual_phase0_settings(input_baud, output_baud)
+        seed_results = run_dual_sequence(
+            "DUAL SEED CONFIRM",
+            "DUAL SEED CONFIRM",
+            [seed],
+        )
+        output_results = run_dual_sequence(
+            "DUAL OUTPUT FRAME SWEEP",
+            "DUAL OUTPUT FRAME SWEEP",
+            dual_output_frame_sweep_for_pair(input_baud, output_baud),
+        )
+        best_output = best_dual_output_settings(
+            [*seed_results, *output_results],
+            seed,
+        )
+        run_dual_sequence(
+            "DUAL INPUT FRAME SWEEP",
+            "DUAL INPUT FRAME SWEEP",
+            dual_input_frame_sweep_for_pair(input_baud, best_output),
+        )
+
+    if not early_stopped and operator_break_action is None:
+        if has_recommendable_dual_result(results):
+            full_matrix_skipped = True
+            print()
+            print_report_title("DUAL FULL MATRIX SKIPPED")
+            print("STAGED DISCOVERY FOUND A GOOD INPUT/OUTPUT FRAME PAIR.")
+            print(f"FULL {len(full_candidates)}-PAIR MATRIX WAS NOT NEEDED.")
+            print(border_line(REPORT_WIDTH))
+        else:
+            fallback_candidates = [
+                candidate
+                for candidate in full_candidates
+                if candidate not in tested_settings
+            ]
+            if fallback_candidates:
+                full_matrix_ran = True
+                run_dual_sequence(
+                    "DUAL FULL MATRIX FALLBACK",
+                    "DUAL FULL MATRIX FALLBACK",
+                    fallback_candidates,
+                )
 
     elapsed_sec = time.monotonic() - scan_started
     completed_at = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -6798,7 +6998,10 @@ def run_dual_bank_scan(
         "options": dataclass_to_jsonable(options),
         "phase0_dual_baud_liveness": dataclass_to_jsonable(phase0_report),
         "completed_candidates": len(results),
-        "candidate_count": len(candidates),
+        "candidate_count": len(full_candidates),
+        "staged_candidate_count": len(staged_preview_candidates),
+        "full_matrix_ran": full_matrix_ran,
+        "full_matrix_skipped": full_matrix_skipped,
         "early_stopped": early_stopped,
         "operator_break_action": operator_break_action,
         "operator_break_stage": operator_break_stage,
@@ -6822,7 +7025,7 @@ def run_dual_bank_scan(
     print_dual_ranked_table(results, options.top)
     print_dual_scan_summary(
         results=results,
-        total_candidates=len(candidates),
+        total_candidates=len(full_candidates),
         elapsed_sec=elapsed_sec,
         early_stopped=early_stopped,
         top=options.top,
