@@ -114,6 +114,15 @@ RECOMMENDATION_MIN_SCORE = 90.0
 TOP_MATCH_MIN_SCORE = 99.0
 TIE_SCORE_TOLERANCE = 0.5
 PERFECT_SCORE = 100.0
+OPERATOR_BREAK_EXIT_CODE = 130
+
+
+class ReturnToMainMenuAfterReport(Exception):
+    """Signal that the operator asked for the main menu after report writing."""
+
+
+class QuitProgramAfterReport(Exception):
+    """Signal that the operator asked to quit after report writing."""
 
 
 @dataclass(frozen=True)
@@ -1140,6 +1149,7 @@ def print_progress_legend() -> None:
     print("  PASS GOOD PART FAIL STALE ERROR  QUICK RESULT.")
     print("  SCORE                 0-100 MATCH CONFIDENCE.")
     print("  SCAN TIME             ELAPSED, LEFT, FINISH TIME.")
+    print("  CTRL+C                OPERATOR BREAK MENU.")
 
 
 def received_length(received: bytearray, lock: threading.Lock) -> int:
@@ -1929,6 +1939,14 @@ def write_text_report(
         "  THE PROGRAM SETS BOTH PC COM PORTS; DEVICE MANAGER DEFAULTS ARE NOT USED.",
         "",
     ]
+    if metadata.get("operator_break_action"):
+        lines.extend(
+            [
+                f"OPERATOR BREAK:  {metadata.get('operator_break_stage', 'SCAN')}",
+                f"BREAK ACTION:    {str(metadata.get('operator_break_action')).upper()}",
+                "",
+            ]
+        )
     if phase0:
         alive = ",".join(str(baud) for baud in phase0.get("alive_bauds", []))
         lines.extend(
@@ -2202,6 +2220,37 @@ def ask_continue_after_top_match(result: CandidateResult) -> bool:
     return prompt_yes_no("CONTINUE SCAN", True)
 
 
+def prompt_operator_break_action(target: str = "SCAN") -> str:
+    """Ask what to do after Ctrl+C/BREAK during a running test."""
+    target = target.upper()
+    print()
+    print(border_line(REPORT_WIDTH))
+    print(bordered_text("OPERATOR BREAK", REPORT_WIDTH))
+    print(border_line(REPORT_WIDTH))
+    print(f"  {target} PAUSED.")
+    print(f"  1 RESUME {target}")
+    print(f"  2 END {target}, WRITE REPORT")
+    print("  3 RETURN TO MAIN MENU AFTER REPORT")
+    print("  0 QUIT AFTER REPORT")
+    print(border_line(REPORT_WIDTH))
+    while True:
+        try:
+            choice = input("ENTER SELECTION [1]: ").lstrip("\ufeff").strip().lower()
+        except EOFError:
+            return "resume"
+        if choice == "":
+            return "resume"
+        if choice in {"1", "c", "continue", "r", "resume"}:
+            return "resume"
+        if choice in {"2", "e", "end", "report", "write"}:
+            return "report"
+        if choice in {"3", "m", "menu", "main"}:
+            return "menu"
+        if choice in {"0", "q", "quit", "exit"}:
+            return "quit"
+        print("ENTER 1, 2, 3, OR 0.")
+
+
 def parity_name(parity: str) -> str:
     """Return a clear parity label for reports."""
     return {
@@ -2251,6 +2300,7 @@ def print_scan_summary(
     elapsed_sec: float,
     early_stopped: bool,
     top: int,
+    early_stop_reason: str | None = None,
 ) -> None:
     """Print a concise human-readable scan summary."""
     ranked = sorted(results, key=result_sort_key, reverse=True)
@@ -2284,8 +2334,12 @@ def print_scan_summary(
     print(f"  TOP ROWS:             {len(ranked_top_results(results, top))}")
     print(f"  FINDING:              {confidence_summary(best, len(tied))}")
     if early_stopped:
-        print("  NOTE:                 OPERATOR ENDED AFTER TOP MATCH.")
-        print("                        LATER SETTINGS WERE NOT TESTED FOR TIES.")
+        if early_stop_reason == "operator-ended-after-top-match":
+            print("  NOTE:                 OPERATOR ENDED AFTER TOP MATCH.")
+            print("                        LATER SETTINGS WERE NOT TESTED FOR TIES.")
+        else:
+            print("  NOTE:                 OPERATOR BREAK ENDED SCAN EARLY.")
+            print("                        UNTESTED SETTINGS MAY STILL MATCH.")
 
     if best is None:
         return
@@ -2311,8 +2365,12 @@ def print_scan_summary(
         print(border_line(REPORT_WIDTH))
         print_result_details(best)
         if early_stopped:
-            print("    NOTE:               OPERATOR ENDED AFTER THIS TOP MATCH.")
-            print("                        POSSIBLE LATER TIES WERE NOT TESTED.")
+            if early_stop_reason == "operator-ended-after-top-match":
+                print("    NOTE:               OPERATOR ENDED AFTER THIS TOP MATCH.")
+                print("                        POSSIBLE LATER TIES WERE NOT TESTED.")
+            else:
+                print("    NOTE:               OPERATOR BREAK ENDED SCAN EARLY.")
+                print("                        UNTESTED SETTINGS MAY STILL MATCH.")
         print(border_line(REPORT_WIDTH))
         return
 
@@ -3715,6 +3773,7 @@ def print_menu_help() -> None:
             "  MAX CLEAR:       DEFAULT 32768 BYTES.",
             "  TOP ROWS:        BEST RESULTS SHOWN AT END.",
             "  MEMORY TEST:     COMMAND 11 AFTER SCAN.",
+            "  BREAK:           CTRL+C ASKS RESUME, REPORT, MENU, OR QUIT.",
             "  AFTER SCAN:      RUN AGAIN, MAIN MENU, OR QUIT.",
         ]
     )
@@ -4683,21 +4742,47 @@ def run_memory_test(options: ScanOptions) -> None:
     print(f"  SIZES:      {', '.join(byte_size_label(size) for size in sizes)}")
     print(f"  METHOD:     {method.upper()}")
     print(border_line(REPORT_WIDTH))
-    results = [
-        run_memory_size_test(
-            serial_module=serial_module,
-            index=index,
-            total=len(sizes),
-            size_bytes=size,
-            settings=settings,
-            options=options,
-            logger=logger,
-            method=method,
-        )
-        for index, size in enumerate(sizes, start=1)
-    ]
+    results: list[MemoryTestResult] = []
+    operator_break_action: str | None = None
+    size_index = 0
+    while size_index < len(sizes):
+        size = sizes[size_index]
+        display_index = size_index + 1
+        try:
+            result = run_memory_size_test(
+                serial_module=serial_module,
+                index=display_index,
+                total=len(sizes),
+                size_bytes=size,
+                settings=settings,
+                options=options,
+                logger=logger,
+                method=method,
+            )
+        except KeyboardInterrupt:
+            action = prompt_operator_break_action("MEMORY TEST")
+            if action == "resume":
+                logger.info(
+                    "operator resumed memory test at %s/%s %s",
+                    display_index,
+                    len(sizes),
+                    byte_size_label(size),
+                )
+                continue
+            operator_break_action = action
+            logger.info(
+                "operator break during memory test; action=%s completed=%s/%s",
+                action,
+                len(results),
+                len(sizes),
+            )
+            break
+        results.append(result)
+        size_index += 1
     write_memory_text_report(text_report, settings, results)
     print_memory_report(settings, results, text_report, log_file)
+    if operator_break_action == "quit":
+        raise QuitProgramAfterReport()
 
 
 def print_commands() -> None:
@@ -5044,17 +5129,45 @@ def run_scan(options: ScanOptions) -> int:
 
     results: list[CandidateResult] = []
     early_stopped = False
-    for index, settings in enumerate(candidates, start=1):
-        result = run_candidate(
-            serial_module=serial_module,
-            index=index,
-            total=len(candidates),
-            settings=settings,
-            options=options,
-            payload=payload,
-            logger=logger,
-            progress=console_progress,
-        )
+    early_stop_reason: str | None = None
+    operator_break_action: str | None = None
+    operator_break_stage: str | None = None
+    candidate_index = 0
+    while candidate_index < len(candidates):
+        settings = candidates[candidate_index]
+        display_index = candidate_index + 1
+        try:
+            result = run_candidate(
+                serial_module=serial_module,
+                index=display_index,
+                total=len(candidates),
+                settings=settings,
+                options=options,
+                payload=payload,
+                logger=logger,
+                progress=console_progress,
+            )
+        except KeyboardInterrupt:
+            action = prompt_operator_break_action("SCAN")
+            if action == "resume":
+                logger.info(
+                    "operator resumed scan at candidate %s/%s %s",
+                    display_index,
+                    len(candidates),
+                    settings.label(),
+                )
+                continue
+            operator_break_action = action
+            operator_break_stage = "SCAN"
+            early_stopped = True
+            early_stop_reason = f"operator-break-{action}"
+            logger.info(
+                "operator break during scan; action=%s completed=%s/%s",
+                action,
+                len(results),
+                len(candidates),
+            )
+            break
         results.append(result)
         print(format_progress(result), flush=True)
         print(format_scan_eta(len(results), len(candidates), scan_started), flush=True)
@@ -5063,8 +5176,10 @@ def run_scan(options: ScanOptions) -> int:
                 logger.info("operator chose to continue after top match: %s", result.settings.label())
             else:
                 early_stopped = True
+                early_stop_reason = "operator-ended-after-top-match"
                 logger.info("operator ended scan after top match: %s", result.settings.label())
                 break
+        candidate_index += 1
 
     completed_at = dt.datetime.now(dt.timezone.utc).isoformat()
     elapsed_sec = time.monotonic() - scan_started
@@ -5081,9 +5196,9 @@ def run_scan(options: ScanOptions) -> int:
     metadata["completed_candidates"] = len(results)
     metadata["elapsed_sec"] = elapsed_sec
     metadata["switch_note"] = options.switch_note
-    metadata["early_stop_reason"] = (
-        "operator-ended-after-top-match" if early_stopped else None
-    )
+    metadata["early_stop_reason"] = early_stop_reason
+    metadata["operator_break_action"] = operator_break_action
+    metadata["operator_break_stage"] = operator_break_stage
     metadata["recommendation_status"] = scan_recommendation_status(results)
     ranked_results = sorted(results, key=result_sort_key, reverse=True)
     best_result = ranked_results[0] if ranked_results else None
@@ -5130,6 +5245,7 @@ def run_scan(options: ScanOptions) -> int:
         elapsed_sec=elapsed_sec,
         early_stopped=early_stopped,
         top=options.top,
+        early_stop_reason=early_stop_reason,
     )
     print_wrapped_value("  NOTE:                 ", f"SCAN TYPE {scan_type_label(scan_mode)}.")
     if exploratory_narrowing_accepted:
@@ -5172,7 +5288,7 @@ def run_scan(options: ScanOptions) -> int:
                 f"QUICK BAUD FOCUS RELEASED: {report.release_reason}.",
             )
     validation_results: list[CandidateResult] = []
-    if options.auto_validate_top_matches and results:
+    if options.auto_validate_top_matches and results and operator_break_action is None:
         ranked = ranked_top_results(results, options.top)
         top_score = ranked[0].score if ranked else 0.0
         shortlist = [result for result in ranked if abs(result.score - top_score) <= 0.0001]
@@ -5192,26 +5308,54 @@ def run_scan(options: ScanOptions) -> int:
             )
             stage2_payload = generate_payload(options.validate_size_1_bytes)
             stage2_results: list[CandidateResult] = []
-            for index, candidate in enumerate(shortlist, start=1):
+            validation_index = 0
+            while validation_index < len(shortlist):
+                candidate = shortlist[validation_index]
+                display_index = validation_index + 1
                 print(
                     f"VALIDATION PASS 1: {stage2_payload.byte_count} BYTES "
-                    f"{index}/{len(shortlist)} {candidate.settings.label()}"
+                    f"{display_index}/{len(shortlist)} {candidate.settings.label()}"
                 )
-                stage2_result = run_candidate(
-                    serial_module=serial_module,
-                    index=index,
-                    total=len(shortlist),
-                    settings=candidate.settings,
-                    options=stage2_options,
-                    payload=stage2_payload,
-                    logger=logger,
-                    progress=console_progress,
-                )
+                try:
+                    stage2_result = run_candidate(
+                        serial_module=serial_module,
+                        index=display_index,
+                        total=len(shortlist),
+                        settings=candidate.settings,
+                        options=stage2_options,
+                        payload=stage2_payload,
+                        logger=logger,
+                        progress=console_progress,
+                    )
+                except KeyboardInterrupt:
+                    action = prompt_operator_break_action("VALIDATION")
+                    if action == "resume":
+                        logger.info(
+                            "operator resumed validation at %s/%s %s",
+                            display_index,
+                            len(shortlist),
+                            candidate.settings.label(),
+                        )
+                        continue
+                    operator_break_action = action
+                    operator_break_stage = "VALIDATION"
+                    logger.info(
+                        "operator break during validation; action=%s completed=%s/%s",
+                        action,
+                        len(stage2_results),
+                        len(shortlist),
+                    )
+                    break
                 stage2_results.append(stage2_result)
                 print(format_progress(stage2_result), flush=True)
+                validation_index += 1
             tied_after_1 = top_tied_results(stage2_results)
             final_stage2_results = stage2_results
-            if len(tied_after_1) > 1 and options.validate_size_2_tie_bytes > 0:
+            if (
+                operator_break_action is None
+                and len(tied_after_1) > 1
+                and options.validate_size_2_tie_bytes > 0
+            ):
                 print(
                     f"TIE REMAINS ({len(tied_after_1)}). "
                     f"RUNNING PASS 2 AT {options.validate_size_2_tie_bytes} BYTES."
@@ -5222,25 +5366,51 @@ def run_scan(options: ScanOptions) -> int:
                 )
                 stage2_payload = generate_payload(options.validate_size_2_tie_bytes)
                 tie_results: list[CandidateResult] = []
-                for index, candidate in enumerate(tied_after_1, start=1):
+                tie_index = 0
+                while tie_index < len(tied_after_1):
+                    candidate = tied_after_1[tie_index]
+                    display_index = tie_index + 1
                     print(
                         f"VALIDATION PASS 2: {stage2_payload.byte_count} BYTES "
-                        f"{index}/{len(tied_after_1)} {candidate.settings.label()}"
+                        f"{display_index}/{len(tied_after_1)} "
+                        f"{candidate.settings.label()}"
                     )
-                    tie_result = run_candidate(
-                        serial_module=serial_module,
-                        index=index,
-                        total=len(tied_after_1),
-                        settings=candidate.settings,
-                        options=stage2_options,
-                        payload=stage2_payload,
-                        logger=logger,
-                        progress=console_progress,
-                    )
+                    try:
+                        tie_result = run_candidate(
+                            serial_module=serial_module,
+                            index=display_index,
+                            total=len(tied_after_1),
+                            settings=candidate.settings,
+                            options=stage2_options,
+                            payload=stage2_payload,
+                            logger=logger,
+                            progress=console_progress,
+                        )
+                    except KeyboardInterrupt:
+                        action = prompt_operator_break_action("VALIDATION")
+                        if action == "resume":
+                            logger.info(
+                                "operator resumed validation pass 2 at %s/%s %s",
+                                display_index,
+                                len(tied_after_1),
+                                candidate.settings.label(),
+                            )
+                            continue
+                        operator_break_action = action
+                        operator_break_stage = "VALIDATION"
+                        logger.info(
+                            "operator break during validation pass 2; "
+                            "action=%s completed=%s/%s",
+                            action,
+                            len(tie_results),
+                            len(tied_after_1),
+                        )
+                        break
                     tie_results.append(tie_result)
                     print(format_progress(tie_result), flush=True)
+                    tie_index += 1
                 final_stage2_results = tie_results
-            elif len(tied_after_1) > 1:
+            elif operator_break_action is None and len(tied_after_1) > 1:
                 print("TIE REMAINS AFTER PASS 1. PASS 2 IS OFF.")
 
             print("STAGE 2 FINAL RANKING:")
@@ -5250,6 +5420,11 @@ def run_scan(options: ScanOptions) -> int:
                 report_title="PHASE 2 FINAL REPORT",
             )
             validation_results = list(final_stage2_results)
+    if operator_break_action is not None:
+        metadata["operator_break_action"] = operator_break_action
+        metadata["operator_break_stage"] = operator_break_stage
+        if operator_break_stage == "VALIDATION":
+            metadata["early_stop_reason"] = f"operator-break-{operator_break_action}"
     write_text_report(
         options.text_report,
         metadata,
@@ -5261,6 +5436,12 @@ def run_scan(options: ScanOptions) -> int:
     print_wrapped_value("  TEXT REPORT: ", f"{options.text_report} (APPENDED)")
     print_wrapped_value("  DEBUG LOG:   ", options.log_file)
     print(border_line(REPORT_WIDTH))
+    if operator_break_action == "menu":
+        raise ReturnToMainMenuAfterReport()
+    if operator_break_action == "quit":
+        raise QuitProgramAfterReport()
+    if operator_break_action is not None:
+        return OPERATOR_BREAK_EXIT_CODE
     return 0
 
 
@@ -5283,7 +5464,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     last_status = 0
     scan_started = False
     while True:
-        selected_options = interactive_menu(options)
+        try:
+            selected_options = interactive_menu(options)
+        except ReturnToMainMenuAfterReport:
+            last_status = OPERATOR_BREAK_EXIT_CODE
+            continue
+        except QuitProgramAfterReport:
+            return OPERATOR_BREAK_EXIT_CODE
         if selected_options is None:
             print("PROGRAM ENDED." if scan_started else "NO SCAN STARTED.")
             return last_status
@@ -5293,10 +5480,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             try:
                 last_status = run_scan(options)
                 action = prompt_after_scan_action()
+            except ReturnToMainMenuAfterReport:
+                last_status = OPERATOR_BREAK_EXIT_CODE
+                break
+            except QuitProgramAfterReport:
+                return OPERATOR_BREAK_EXIT_CODE
             except KeyboardInterrupt:
                 print()
                 print("INTERRUPTED BY OPERATOR.")
-                last_status = 130
+                last_status = OPERATOR_BREAK_EXIT_CODE
                 action = prompt_after_scan_action("TEST INTERRUPTED")
             if action == "rerun":
                 continue
@@ -5311,4 +5503,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print()
         print("INTERRUPTED BY OPERATOR.")
-        raise SystemExit(130)
+        raise SystemExit(OPERATOR_BREAK_EXIT_CODE)

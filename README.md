@@ -41,6 +41,8 @@ Use the default settings, then select `1. Start scan`.
 
 After a scan finishes or is interrupted by the operator, the program stays in the terminal UI and asks whether to run the same settings again, return to the main menu, or quit.
 
+During a running scan, validation pass, or memory test, press `Ctrl+C` for the `OPERATOR BREAK` menu. The menu can resume the same test, end the test and write a partial report, return to the main menu after writing the report, or quit after writing the report.
+
 ## Scan Type
 
 When a scan starts, the tool asks:
