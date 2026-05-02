@@ -27,7 +27,7 @@ python serial_probe.py --help
 
 The first screen is the command menu. Use `9 CURRENT SETTINGS` to view ports, baud range, number of settings to test, test message size, repeat count, timing, old-output clearing, Phase 0 liveness settings, quick baud focus rules, report files, and estimated scan time. It also shows that scan type is asked at scan start and that blank means `FULL`. Use `11 MEMORY TEST` after you have a likely switch setting. The normal full scan tests every selected combination unless you explicitly choose quick exploratory narrowing.
 
-The terminal UI is written for an 80-column early terminal style. Screens use terse uppercase operator text and bright green text when the console supports ANSI color. PyCharm runs are treated as color-capable. Set `NO_COLOR=1` before running if you want plain console text.
+The terminal UI is written for an 80-column by 25-line early terminal style. Long operator screens pause with `PRESS ENTER FOR MORE, Q TO STOP:`. Screens use terse uppercase operator text and bright green text when the console supports ANSI color. PyCharm runs are treated as color-capable. Set `NO_COLOR=1` before running if you want plain console text.
 
 Status screens, setting-change notices, and the final report use `*` borders to match the style of terminal reports from early printer and communications utilities.
 
@@ -38,6 +38,8 @@ python serial_probe.py
 ```
 
 Use the default settings, then select `1. Start scan`.
+
+After a scan finishes or is interrupted by the operator, the program stays in the terminal UI and asks whether to run the same settings again, return to the main menu, or quit.
 
 ## Scan Type
 

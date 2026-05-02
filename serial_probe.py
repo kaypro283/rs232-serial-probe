@@ -108,6 +108,8 @@ ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
 SCREEN_WIDTH = 72
 REPORT_WIDTH = 78
 PROGRESS_WIDTH = 70
+TERMINAL_COLUMNS = 80
+PAGE_BODY_LINES = 22
 RECOMMENDATION_MIN_SCORE = 90.0
 TOP_MATCH_MIN_SCORE = 99.0
 TIE_SCORE_TOLERANCE = 0.5
@@ -802,9 +804,8 @@ def enable_terminal_style() -> None:
 
 def print_banner() -> None:
     """Print the terminal-style program banner."""
-    print(border_line(SCREEN_WIDTH))
-    print(bordered_text("SERIAL PROBE 1.0  -  PRINTER BUFFER SETUP", SCREEN_WIDTH))
-    print(border_line(SCREEN_WIDTH))
+    for line in banner_lines():
+        print(line)
 
 
 def border_line(width: int = SCREEN_WIDTH) -> str:
@@ -817,6 +818,63 @@ def bordered_text(text: str, width: int = SCREEN_WIDTH) -> str:
     inner_width = max(width - 4, 1)
     cleaned = text[:inner_width]
     return f"* {cleaned.center(inner_width)} *"
+
+
+def banner_lines() -> list[str]:
+    """Return the terminal-style program banner lines."""
+    return [
+        border_line(SCREEN_WIDTH),
+        bordered_text("SERIAL PROBE 1.0  -  PRINTER BUFFER SETUP", SCREEN_WIDTH),
+        border_line(SCREEN_WIDTH),
+    ]
+
+
+def print_paged_lines(
+    lines: Sequence[str],
+    page_lines: int = PAGE_BODY_LINES,
+) -> None:
+    """Print lines with a simple 80x25-friendly page pause."""
+    all_lines = list(lines)
+    if page_lines <= 0:
+        page_lines = len(all_lines)
+    for index, line in enumerate(all_lines, start=1):
+        print(line)
+        if index >= len(all_lines) or index % page_lines != 0:
+            continue
+        try:
+            choice = input("PRESS ENTER FOR MORE, Q TO STOP: ")
+        except EOFError:
+            print()
+            for rest in all_lines[index:]:
+                print(rest)
+            return
+        if choice.lstrip("\ufeff").strip().lower() in {"q", "quit", "0"}:
+            return
+        print()
+
+
+def wrapped_value_lines(
+    prefix: str,
+    value: object,
+    width: int = TERMINAL_COLUMNS,
+) -> list[str]:
+    """Return prefixed lines wrapped to the terminal width."""
+    available = max(20, width - len(prefix))
+    wrapped = textwrap.wrap(
+        str(value),
+        width=available,
+        break_long_words=True,
+    ) or [""]
+    return [
+        prefix + wrapped[0],
+        *(" " * len(prefix) + line for line in wrapped[1:]),
+    ]
+
+
+def print_wrapped_value(prefix: str, value: object) -> None:
+    """Print a prefixed value wrapped to the terminal width."""
+    for line in wrapped_value_lines(prefix, value):
+        print(line)
 
 
 def print_report_title(title: str) -> None:
@@ -1056,7 +1114,7 @@ def prioritize_discovery_candidates(
 def console_progress(message: str) -> None:
     """Print a timestamped live progress message."""
     prefix = f"{time.strftime('%H:%M:%S')} "
-    width = max(20, 80 - len(prefix))
+    width = max(20, TERMINAL_COLUMNS - len(prefix))
     lines = str(message).splitlines() or [""]
     for line_index, line in enumerate(lines):
         wrapped = textwrap.wrap(
@@ -2100,7 +2158,7 @@ def print_result_details(result: CandidateResult) -> None:
     )
     print(f"    STOP BITS:          {result.settings.stop_bits}")
     print(f"    FLOW CONTROL:       {flow_control_name(result.settings.flow_control)}")
-    print(f"    SETTING:            {result.settings.label()}")
+    print_wrapped_value("    SETTING:            ", result.settings.label())
     print(
         f"    RESULT:             "
         f"{result_indicator(result.score, result.status, result.error)}"
@@ -2116,9 +2174,9 @@ def print_result_details(result: CandidateResult) -> None:
     if result.status == "stale-output":
         print("    NOTE:               OUTPUT NEVER WENT QUIET.")
         if result.error:
-            print(f"    DETAIL:             {result.error}")
+            print_wrapped_value("    DETAIL:             ", result.error)
     elif result.error:
-        print(f"    ERROR:              {result.error}")
+        print_wrapped_value("    ERROR:              ", result.error)
     elif result.metrics.extra_bytes > result.bytes_sent:
         print("    NOTE:               EXTRA OUTPUT/BACKLOG PRESENT.")
 
@@ -2136,7 +2194,7 @@ def ask_continue_after_top_match(result: CandidateResult) -> bool:
     print(border_line(REPORT_WIDTH))
     print(bordered_text("TOP MATCH FOUND", REPORT_WIDTH))
     print(border_line(REPORT_WIDTH))
-    print(f"    SETTING:            {result.settings.label()}")
+    print_wrapped_value("    SETTING:            ", result.settings.label())
     print(f"    SCORE:              {result.score:.2f}/100")
     print("    CONTINUE TO LOOK FOR POSSIBLE TIES.")
     print("    ENTER N TO END NOW AND WRITE REPORT.")
@@ -2934,9 +2992,9 @@ def print_phase0_summary(report: BaudLivenessReport) -> None:
     print(f"  ALIVE BAUDS:          {len(report.alive_bauds)}")
     print(f"  FIXED SETTINGS:       {phase0_fixed_settings_label()}")
     if report.alive_bauds:
-        print(
-            "  ALIVE LIST:           "
-            + ", ".join(str(baud) for baud in report.alive_bauds)
+        print_wrapped_value(
+            "  ALIVE LIST:           ",
+            ", ".join(str(baud) for baud in report.alive_bauds),
         )
         print(
             "  QUICK CANDIDATES:     "
@@ -2945,7 +3003,7 @@ def print_phase0_summary(report: BaudLivenessReport) -> None:
     if report.fallback_to_all_bauds:
         print("  QUICK CANDIDATES:     ALL SELECTED SETTINGS")
         if report.fallback_reason:
-            print(f"  FALLBACK:             {report.fallback_reason}")
+            print_wrapped_value("  FALLBACK:             ", report.fallback_reason)
     print(border_line(REPORT_WIDTH))
 
 
@@ -2993,13 +3051,13 @@ def print_baud_focus_report(report: BaudFocusReport) -> None:
             )
         )
         if report.engage_reason:
-            print(f"  FOCUS REASON:        {report.engage_reason}")
+            print_wrapped_value("  FOCUS REASON:        ", report.engage_reason)
         if report.release_reason:
-            print(f"  FOCUS RELEASE:       {report.release_reason}")
+            print_wrapped_value("  FOCUS RELEASE:       ", report.release_reason)
         return
     print("  QUICK BAUD FOCUS:    NOT ENGAGED")
     if report.disabled_reason:
-        print(f"  FOCUS DISABLED:      {report.disabled_reason}")
+        print_wrapped_value("  FOCUS DISABLED:      ", report.disabled_reason)
 
 
 def print_exploratory_summary(selection: ExploratorySelection) -> None:
@@ -3023,7 +3081,7 @@ def print_exploratory_summary(selection: ExploratorySelection) -> None:
         )
     print_baud_focus_report(selection.baud_focus)
     if selection.fallback_reason:
-        print(f"  FINDING:              {selection.fallback_reason}")
+        print_wrapped_value("  FINDING:              ", selection.fallback_reason)
     elif selection.shortlist_results:
         print(
             "  FINDING:              "
@@ -3074,7 +3132,7 @@ def print_exploratory_summary(selection: ExploratorySelection) -> None:
         print()
         print("  NOTES:")
         for note in selection.notes:
-            print(f"    {note}")
+            print_wrapped_value("    ", note)
     print(border_line(REPORT_WIDTH))
 
 
@@ -3405,7 +3463,10 @@ def run_exploratory_scan(
                 if block_reason:
                     focus_active = False
                     focus_release_reason = block_reason
-                    print(f"QUICK BAUD FOCUS CANCELED: {block_reason}")
+                    print_wrapped_value(
+                        "",
+                        f"QUICK BAUD FOCUS CANCELED: {block_reason}",
+                    )
                     print("RETURNING TO FULL BAUD SWEEP")
                     logger.info(
                         "baud focus canceled for %s: %s",
@@ -3417,7 +3478,11 @@ def run_exploratory_scan(
                     if decision.disabled_reason:
                         focus_active = False
                         focus_release_reason = decision.disabled_reason
-                        print(f"QUICK BAUD FOCUS CANCELED: {decision.disabled_reason}")
+                        print_wrapped_value(
+                            "",
+                            "QUICK BAUD FOCUS CANCELED: "
+                            f"{decision.disabled_reason}",
+                        )
                         print("RETURNING TO FULL BAUD SWEEP")
                         logger.info(
                             "baud focus canceled for %s: %s",
@@ -3443,7 +3508,11 @@ def run_exploratory_scan(
                 decision = select_baud_focus(results, baud_order, grouped, options)
                 if decision.disabled_reason:
                     focus_disabled_reason = decision.disabled_reason
-                    print(f"QUICK BAUD FOCUS DISABLED: {decision.disabled_reason}")
+                    print_wrapped_value(
+                        "",
+                        "QUICK BAUD FOCUS DISABLED: "
+                        f"{decision.disabled_reason}",
+                    )
                     logger.info("baud focus disabled: %s", decision.disabled_reason)
                 elif decision.baud is not None:
                     focus_active = True
@@ -3451,9 +3520,12 @@ def run_exploratory_scan(
                     focused_baud = decision.baud
                     focus_engage_reason = decision.reason
                     tested_before_engage = len(results)
-                    print(
-                        f"QUICK BAUD FOCUS ENGAGED: {focused_baud} "
-                        f"{focus_engage_reason or ''}".rstrip()
+                    print_wrapped_value(
+                        "",
+                        (
+                            f"QUICK BAUD FOCUS ENGAGED: {focused_baud} "
+                            f"{focus_engage_reason or ''}"
+                        ).rstrip(),
                     )
                     logger.info(
                         "baud focus engaged for %s: %s",
@@ -3609,48 +3681,55 @@ def prompt_scan_mode() -> str:
 
 def print_menu_help() -> None:
     """Print short help for the interactive CLI."""
-    print_banner()
-    print("START: PYTHON SERIAL_PROBE.PY")
-    print()
-    print("HELP")
-    print()
-    print("PURPOSE")
-    print("  FIND SERIAL SWITCH SETTINGS FOR A PRINTER BUFFER.")
-    print()
-    print("METHOD")
-    print("  SEND KNOWN ASCII TEXT TO INPUT PORT.")
-    print("  READ OUTPUT PORT.")
-    print("  TEST EACH SELECTED SERIAL SETTING.")
-    print("  RANK BY MATCH QUALITY.")
-    print("  USE 11 MEMORY TEST AFTER A GOOD SETTING IS FOUND.")
-    print()
-    print("OPERATOR NOTES:")
-    print("  SCAN TYPE:       FULL OR QUICK AT SCAN START; BLANK=FULL.")
-    print("  FULL MODE:       MOST RELIABLE FOR SWITCH MAPPING; QUICK MODE ASKS.")
-    print("  QUICK MODE:      RUNS DISCOVERY AND MAY NARROW PHASE 2.")
-    print("  DEVICE PATH:     COM1 -> BUFFER INPUT -> BUFFER OUTPUT -> COM5.")
-    print("  PORT SETTINGS:   PROGRAM SETS COM PORTS; DEVICE MANAGER IS IGNORED.")
-    print("  TEST SIZE:       BYTES SENT FOR EACH SETTING.")
-    print("  TEST COUNT:      NUMBER OF TRIES PER SETTING.")
-    print("  DISCOVERY:       QUICK=YES; FULL ASKS; FIXED INTERNAL SETTINGS.")
-    print("  PHASE 0:         QUICK MODE FIRST TESTS EACH BAUD AT 8M1 FLOW=NONE.")
-    print("  TURBO:           FASTER DISCOVERY TIMING; FULL EXHAUSTIVE STILL AVAILABLE.")
-    print("  QUICK BAUD FOCUS: QUICK-ONLY SPEED-UP; FULL SCAN DOES NOT NEED IT.")
-    print("  ASK ON MATCH:    PAUSE AFTER PASS; ASK CONTINUE.")
-    print("  CLEAR OUTPUT:    DISCARD OLD BUFFER DATA FIRST.")
-    print("  MAX CLEAR:       DEFAULT 32768 BYTES.")
-    print("  TOP ROWS:        BEST RESULTS SHOWN AT END.")
-    print("  MEMORY TEST:     COMMAND 11 AFTER SCAN.")
+    print_paged_lines(
+        [
+            *banner_lines(),
+            "START: PYTHON SERIAL_PROBE.PY",
+            "",
+            "HELP",
+            "",
+            "PURPOSE",
+            "  FIND SERIAL SWITCH SETTINGS FOR A PRINTER BUFFER.",
+            "",
+            "METHOD",
+            "  SEND KNOWN ASCII TEXT TO INPUT PORT.",
+            "  READ OUTPUT PORT.",
+            "  TEST EACH SELECTED SERIAL SETTING.",
+            "  RANK BY MATCH QUALITY.",
+            "  USE 11 MEMORY TEST AFTER A GOOD SETTING IS FOUND.",
+            "",
+            "OPERATOR NOTES:",
+            "  SCAN TYPE:       FULL OR QUICK AT SCAN START; BLANK=FULL.",
+            "  FULL MODE:       MOST RELIABLE FOR SWITCH MAPPING; QUICK MODE ASKS.",
+            "  QUICK MODE:      RUNS DISCOVERY AND MAY NARROW PHASE 2.",
+            "  DEVICE PATH:     COM1 -> BUFFER INPUT -> BUFFER OUTPUT -> COM5.",
+            "  PORT SETTINGS:   PROGRAM SETS COM PORTS; DEVICE MANAGER IS IGNORED.",
+            "  TEST SIZE:       BYTES SENT FOR EACH SETTING.",
+            "  TEST COUNT:      NUMBER OF TRIES PER SETTING.",
+            "  DISCOVERY:       QUICK=YES; FULL ASKS; FIXED INTERNAL SETTINGS.",
+            "  PHASE 0:         QUICK TESTS EACH BAUD AT 8M1 FLOW=NONE.",
+            "  TURBO:           FASTER DISCOVERY TIMING.",
+            "  QUICK BAUD FOCUS: QUICK-ONLY SPEED-UP; FULL DOES NOT NEED IT.",
+            "  ASK ON MATCH:    PAUSE AFTER PASS; ASK CONTINUE.",
+            "  CLEAR OUTPUT:    DISCARD OLD BUFFER DATA FIRST.",
+            "  MAX CLEAR:       DEFAULT 32768 BYTES.",
+            "  TOP ROWS:        BEST RESULTS SHOWN AT END.",
+            "  MEMORY TEST:     COMMAND 11 AFTER SCAN.",
+            "  AFTER SCAN:      RUN AGAIN, MAIN MENU, OR QUIT.",
+        ]
+    )
+
+
+def setting_lines(label: str, value: object) -> list[str]:
+    """Return aligned current-settings rows."""
+    prefix = f"  {label.upper():<20} "
+    return wrapped_value_lines(prefix, value)
 
 
 def print_setting(label: str, value: object) -> None:
     """Print one aligned current-settings row."""
-    prefix = f"  {label.upper():<20} "
-    width = max(20, 80 - len(prefix))
-    wrapped = textwrap.wrap(str(value), width=width, break_long_words=True) or [""]
-    print(prefix + wrapped[0])
-    for line in wrapped[1:]:
-        print(" " * len(prefix) + line)
+    for line in setting_lines(label, value):
+        print(line)
 
 
 def print_configuration(options: ScanOptions) -> None:
@@ -3669,80 +3748,108 @@ def print_configuration(options: ScanOptions) -> None:
         wire = 0.0
         overhead = 0.0
         range_error = str(exc)
-    print()
-    print_banner()
-    print("CURRENT SETTINGS")
-    print_setting("SCAN TYPE:", "ASK AT START; BLANK=FULL")
-    print_setting("PORTS:", f"{options.in_port} -> {options.out_port}")
-    print_setting("BAUD RANGE:", f"{options.min_baud}..{options.max_baud}")
-    print_setting("SETTINGS:", len(candidates))
+    lines: list[str] = ["", *banner_lines(), "CURRENT SETTINGS"]
+    lines.extend(setting_lines("SCAN TYPE:", "ASK AT START; BLANK=FULL"))
+    lines.extend(setting_lines("PORTS:", f"{options.in_port} -> {options.out_port}"))
+    lines.extend(
+        setting_lines("BAUD RANGE:", f"{options.min_baud}..{options.max_baud}")
+    )
+    lines.extend(setting_lines("SETTINGS:", len(candidates)))
     if baud_order:
-        print_setting("BAUD ORDER:", f"{baud_order[0]} DOWN TO {baud_order[-1]}")
+        lines.extend(
+            setting_lines("BAUD ORDER:", f"{baud_order[0]} DOWN TO {baud_order[-1]}")
+        )
     if range_error:
-        print_setting("RANGE ERROR:", range_error)
-    print_setting(
-        "COUNT FORMULA:",
-        f"{len(bauds)} BAUD X "
-        f"{len(DATA_BITS)} DATA X {len(PARITIES)} PARITY X "
-        f"{len(STOP_BITS)} STOP X {len(FLOW_CONTROLS)} FLOW",
-    )
-    print_setting("TEST BYTES:", f"{options.payload_bytes} BYTES")
-    print_setting("TEST COUNT:", options.bursts)
-    print_setting(
-        "QUICK MODE:",
-        f"ASK AT START; FIXED INTERNAL {exploratory_fixed_settings_label()}",
-    )
-    print_setting("PHASE 0:", phase0_fixed_settings_label())
-    print_setting("QUICK BAUD FOCUS:", baud_focus_settings_label(options))
-    print_setting(
-        "TURBO DISCOVERY:",
-        "ON" if options.turbo_discovery_enabled else "OFF",
-    )
-    print_setting("EFFECTIVE TIMING:", effective_timing_range_label(options, candidates))
-    print_setting(
-        "CANDIDATE ORDER:",
-        (
-            "TURBO PRIORITY; LOW-VALUE FRAMES DEFERRED"
-            if options.turbo_discovery_enabled
-            else "EXHAUSTIVE PROGRAM ORDER"
-        ),
-    )
-    print_setting("ASK ON MATCH:", "YES" if options.ask_on_top_match else "NO")
-    print_setting(
-        "AUTO VALIDATE:",
-        (
-            "OFF"
-            if not options.auto_validate_top_matches
-            else (
-                f"ON, SIZE1={options.validate_size_1_bytes} BYTES, "
-                f"SIZE2={options.validate_size_2_tie_bytes} BYTES"
-                if options.validate_size_2_tie_bytes > 0
-                else f"ON, SIZE1={options.validate_size_1_bytes} BYTES, SIZE2=OFF"
-            )
-        ),
-    )
-    print_setting("READ WAIT:", f"{options.read_timeout:.2f}S")
-    print_setting("OPEN PAUSE:", f"{options.settle_ms} MS")
-    print_setting(
-        "CLEAR OUTPUT:",
-        (
-            "NO"
-            if options.no_pre_drain
-            else (
-                f"YES, QUIET={options.pre_drain_quiet:.2f}S, "
-                f"LIMIT={options.pre_drain_timeout:.2f}S, "
-                f"MAX={options.max_drain_bytes} BYTES"
-            )
+        lines.extend(setting_lines("RANGE ERROR:", range_error))
+    lines.extend(
+        setting_lines(
+            "COUNT FORMULA:",
+            f"{len(bauds)} BAUD X "
+            f"{len(DATA_BITS)} DATA X {len(PARITIES)} PARITY X "
+            f"{len(STOP_BITS)} STOP X {len(FLOW_CONTROLS)} FLOW",
         )
     )
-    print_setting("TOP ROWS:", options.top)
-    print_setting("MEMORY TEST:", "USE 11 AFTER SCAN")
-    print_setting("REPORT FILE:", options.text_report)
-    print_setting("SWITCH NOTE:", options.switch_note or "(ASK AT SCAN START)")
-    print_setting("LOG FILE:", options.log_file)
-    print_setting("SEND TIME:", format_duration(wire).upper())
-    print_setting("WAIT TIME:", f"{format_duration(overhead).upper()} IF QUIET")
-    print_setting("TOTAL EST.:", format_duration(wire + overhead).upper())
+    lines.extend(setting_lines("TEST BYTES:", f"{options.payload_bytes} BYTES"))
+    lines.extend(setting_lines("TEST COUNT:", options.bursts))
+    lines.extend(
+        setting_lines(
+            "QUICK MODE:",
+            f"ASK AT START; FIXED INTERNAL {exploratory_fixed_settings_label()}",
+        )
+    )
+    lines.extend(setting_lines("PHASE 0:", phase0_fixed_settings_label()))
+    lines.extend(
+        setting_lines("QUICK BAUD FOCUS:", baud_focus_settings_label(options))
+    )
+    lines.extend(
+        setting_lines(
+            "TURBO DISCOVERY:",
+            "ON" if options.turbo_discovery_enabled else "OFF",
+        )
+    )
+    lines.extend(
+        setting_lines(
+            "EFFECTIVE TIMING:",
+            effective_timing_range_label(options, candidates),
+        )
+    )
+    lines.extend(
+        setting_lines(
+            "CANDIDATE ORDER:",
+            (
+                "TURBO PRIORITY; LOW-VALUE FRAMES DEFERRED"
+                if options.turbo_discovery_enabled
+                else "EXHAUSTIVE PROGRAM ORDER"
+            ),
+        )
+    )
+    lines.extend(
+        setting_lines("ASK ON MATCH:", "YES" if options.ask_on_top_match else "NO")
+    )
+    lines.extend(
+        setting_lines(
+            "AUTO VALIDATE:",
+            (
+                "OFF"
+                if not options.auto_validate_top_matches
+                else (
+                    f"ON, SIZE1={options.validate_size_1_bytes} BYTES, "
+                    f"SIZE2={options.validate_size_2_tie_bytes} BYTES"
+                    if options.validate_size_2_tie_bytes > 0
+                    else f"ON, SIZE1={options.validate_size_1_bytes} BYTES, SIZE2=OFF"
+                )
+            ),
+        )
+    )
+    lines.extend(setting_lines("READ WAIT:", f"{options.read_timeout:.2f}S"))
+    lines.extend(setting_lines("OPEN PAUSE:", f"{options.settle_ms} MS"))
+    lines.extend(
+        setting_lines(
+            "CLEAR OUTPUT:",
+            (
+                "NO"
+                if options.no_pre_drain
+                else (
+                    f"YES, QUIET={options.pre_drain_quiet:.2f}S, "
+                    f"LIMIT={options.pre_drain_timeout:.2f}S, "
+                    f"MAX={options.max_drain_bytes} BYTES"
+                )
+            ),
+        )
+    )
+    lines.extend(setting_lines("TOP ROWS:", options.top))
+    lines.extend(setting_lines("MEMORY TEST:", "USE 11 AFTER SCAN"))
+    lines.extend(setting_lines("REPORT FILE:", options.text_report))
+    lines.extend(
+        setting_lines("SWITCH NOTE:", options.switch_note or "(ASK AT SCAN START)")
+    )
+    lines.extend(setting_lines("LOG FILE:", options.log_file))
+    lines.extend(setting_lines("SEND TIME:", format_duration(wire).upper()))
+    lines.extend(
+        setting_lines("WAIT TIME:", f"{format_duration(overhead).upper()} IF QUIET")
+    )
+    lines.extend(setting_lines("TOTAL EST.:", format_duration(wire + overhead).upper()))
+    print_paged_lines(lines)
 
 
 def configure_baud_range(options: ScanOptions) -> ScanOptions:
@@ -3802,7 +3909,8 @@ def configure_payload(options: ScanOptions) -> ScanOptions:
 def configure_timing(options: ScanOptions) -> ScanOptions:
     """Prompt for timing settings."""
     print("DISCOVERY TIMING")
-    print("TURBO APPLIES ONLY TO SCAN DISCOVERY; VALIDATION AND MEMORY TESTS STAY CONSERVATIVE.")
+    print("TURBO APPLIES ONLY TO SCAN DISCOVERY.")
+    print("VALIDATION AND MEMORY TESTS STAY CONSERVATIVE.")
     turbo_enabled = prompt_yes_no(
         "TURBO DISCOVERY MODE",
         options.turbo_discovery_enabled,
@@ -4479,7 +4587,7 @@ def print_memory_report(
     print(f"    PARITY:            {parity_name(settings.parity)} ({settings.parity_code()})")
     print(f"    STOP BITS:         {settings.stop_bits}")
     print(f"    FLOW CONTROL:      {flow_control_name(settings.flow_control)}")
-    print(f"    SETTING:           {settings.label()}")
+    print_wrapped_value("    SETTING:           ", settings.label())
     print()
     print(f"  RESULT:              {memory_test_interpretation(results).upper()}")
     print(border_line(REPORT_WIDTH))
@@ -4506,8 +4614,8 @@ def print_memory_report(
         print("  NOTE: EARLY BYTES ARRIVED BEFORE RELEASE.")
     print()
     print_report_title("MEMORY TEST FILES")
-    print(f"  TEXT REPORT: {text_report} (APPENDED)")
-    print(f"  DEBUG LOG:   {log_file}")
+    print_wrapped_value("  TEXT REPORT: ", f"{text_report} (APPENDED)")
+    print_wrapped_value("  DEBUG LOG:   ", log_file)
     print(border_line(REPORT_WIDTH))
 
 
@@ -4606,9 +4714,10 @@ def print_commands() -> None:
     print("  0 QUIT")
 
 
-def interactive_menu() -> ScanOptions | None:
+def interactive_menu(options: ScanOptions | None = None) -> ScanOptions | None:
     """Show the command-line style configuration menu."""
-    options = default_scan_options()
+    if options is None:
+        options = default_scan_options()
     while True:
         print_commands()
         try:
@@ -4658,6 +4767,32 @@ def interactive_menu() -> ScanOptions | None:
             return None
         else:
             print("ENTER A NUMBER FROM 0 TO 12.")
+
+
+def prompt_after_scan_action(title: str = "SCAN COMPLETE") -> str:
+    """Ask what to do after a scan finishes or stops."""
+    print()
+    print(border_line(REPORT_WIDTH))
+    print(bordered_text(title, REPORT_WIDTH))
+    print(border_line(REPORT_WIDTH))
+    print("  1 RUN SAME SETTINGS AGAIN")
+    print("  2 RETURN TO MAIN MENU")
+    print("  0 QUIT")
+    print(border_line(REPORT_WIDTH))
+    while True:
+        try:
+            choice = input("ENTER SELECTION [2]: ").lstrip("\ufeff").strip().lower()
+        except EOFError:
+            return "menu"
+        if choice == "":
+            return "menu"
+        if choice in {"1", "r", "rerun", "run"}:
+            return "rerun"
+        if choice in {"2", "m", "menu", "main"}:
+            return "menu"
+        if choice in {"0", "q", "quit", "exit"}:
+            return "quit"
+        print("ENTER 1, 2, OR 0.")
 
 
 def metadata_for_scan(
@@ -4996,36 +5131,46 @@ def run_scan(options: ScanOptions) -> int:
         early_stopped=early_stopped,
         top=options.top,
     )
-    print(f"  NOTE:                 SCAN TYPE {scan_type_label(scan_mode)}.")
+    print_wrapped_value("  NOTE:                 ", f"SCAN TYPE {scan_type_label(scan_mode)}.")
     if exploratory_narrowing_accepted:
-        print(
-            "  NOTE:                 FULL ANALYSIS USED QUICK EXPLORATORY "
-            f"CANDIDATES ({len(candidates)}/{len(all_candidates)})."
+        print_wrapped_value(
+            "  NOTE:                 ",
+            "FULL ANALYSIS USED QUICK EXPLORATORY "
+            f"CANDIDATES ({len(candidates)}/{len(all_candidates)}).",
         )
     elif phase2_candidate_source == PHASE2_CANDIDATE_SOURCE_VIABLE:
-        print(
-            "  NOTE:                 FULL ANALYSIS USED QUICK EXPLORATORY "
-            f"SIGNAL CANDIDATES ({len(candidates)}/{len(all_candidates)})."
+        print_wrapped_value(
+            "  NOTE:                 ",
+            "FULL ANALYSIS USED QUICK EXPLORATORY "
+            f"SIGNAL CANDIDATES ({len(candidates)}/{len(all_candidates)}).",
         )
     elif exploratory_requested:
         print("  NOTE:                 QUICK EXPLORATORY DID NOT NARROW FULL ANALYSIS.")
     if exploratory_selection is not None:
         phase0 = exploratory_selection.phase0_liveness
-        print(
-            "  NOTE:                 PHASE 0 BAUD LIVENESS "
-            f"{len(phase0.alive_bauds)}/{len(phase0.tested_bauds)}."
+        print_wrapped_value(
+            "  NOTE:                 ",
+            "PHASE 0 BAUD LIVENESS "
+            f"{len(phase0.alive_bauds)}/{len(phase0.tested_bauds)}.",
         )
         if phase0.fallback_to_all_bauds and phase0.fallback_reason:
-            print(f"  NOTE:                 PHASE 0 FALLBACK: {phase0.fallback_reason}")
+            print_wrapped_value(
+                "  NOTE:                 ",
+                f"PHASE 0 FALLBACK: {phase0.fallback_reason}",
+            )
     if exploratory_selection is not None and exploratory_selection.baud_focus.engaged:
         report = exploratory_selection.baud_focus
-        print(
-            "  NOTE:                 QUICK BAUD FOCUS "
+        print_wrapped_value(
+            "  NOTE:                 ",
+            "QUICK BAUD FOCUS "
             f"{report.focused_baud}; "
-            f"DEFERRED={report.deferred_candidate_count}."
+            f"DEFERRED={report.deferred_candidate_count}.",
         )
         if report.release_reason:
-            print(f"  NOTE:                 QUICK BAUD FOCUS RELEASED: {report.release_reason}.")
+            print_wrapped_value(
+                "  NOTE:                 ",
+                f"QUICK BAUD FOCUS RELEASED: {report.release_reason}.",
+            )
     validation_results: list[CandidateResult] = []
     if options.auto_validate_top_matches and results:
         ranked = ranked_top_results(results, options.top)
@@ -5113,8 +5258,8 @@ def run_scan(options: ScanOptions) -> int:
     )
     print()
     print_report_title("REPORT FILES")
-    print(f"  TEXT REPORT: {options.text_report} (APPENDED)")
-    print(f"  DEBUG LOG:   {options.log_file}")
+    print_wrapped_value("  TEXT REPORT: ", f"{options.text_report} (APPENDED)")
+    print_wrapped_value("  DEBUG LOG:   ", options.log_file)
     print(border_line(REPORT_WIDTH))
     return 0
 
@@ -5134,11 +5279,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("RUN WITHOUT OPTIONS:")
         print("  PYTHON SERIAL_PROBE.PY")
         return 2
-    options = interactive_menu()
-    if options is None:
-        print("NO SCAN STARTED.")
-        return 0
-    return run_scan(options)
+    options = default_scan_options()
+    last_status = 0
+    scan_started = False
+    while True:
+        selected_options = interactive_menu(options)
+        if selected_options is None:
+            print("PROGRAM ENDED." if scan_started else "NO SCAN STARTED.")
+            return last_status
+        options = selected_options
+        while True:
+            scan_started = True
+            try:
+                last_status = run_scan(options)
+                action = prompt_after_scan_action()
+            except KeyboardInterrupt:
+                print()
+                print("INTERRUPTED BY OPERATOR.")
+                last_status = 130
+                action = prompt_after_scan_action("TEST INTERRUPTED")
+            if action == "rerun":
+                continue
+            if action == "menu":
+                break
+            return last_status
 
 
 if __name__ == "__main__":
