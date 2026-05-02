@@ -24,7 +24,7 @@ import sys
 import threading
 import textwrap
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -86,10 +86,14 @@ EXPLORATORY_PROGRESS_INTERVAL = 1.0
 EXPLORATORY_PRE_DRAIN_TIMEOUT = 0.5
 EXPLORATORY_PRE_DRAIN_QUIET = 0.1
 EXPLORATORY_MAX_DRAIN_BYTES = DEFAULT_MAX_DRAIN_BYTES
-EXPLORATORY_SHORTLIST_LIMIT = 24
-EXPLORATORY_MIN_NARROW_SCORE = 90.0
+EXPLORATORY_SHORTLIST_LIMIT = 12
+EXPLORATORY_MIN_NARROW_SCORE = 30.0
 EXPLORATORY_SCORE_TOLERANCE = 10.0
 EXPLORATORY_SUMMARY_ROWS = 8
+PHASE2_VIABLE_SIGNAL_STATUSES = {"weak", "partial", "strong", "exact"}
+PHASE2_CANDIDATE_SOURCE_NARROWED = "exploratory-narrowed"
+PHASE2_CANDIDATE_SOURCE_VIABLE = "exploratory-viable-signals"
+PHASE2_CANDIDATE_SOURCE_FULL = "all-selected-settings"
 BAUD_FOCUS_ENABLED_DEFAULT = True
 BAUD_FOCUS_STRONG_SCORE_THRESHOLD = 90.0
 BAUD_FOCUS_LEAD_GAP_THRESHOLD = 20.0
@@ -368,6 +372,7 @@ class ExploratorySelection:
     truncated: bool
     baud_focus: BaudFocusReport
     phase0_liveness: BaudLivenessReport
+    viable_candidates: list[SerialSettings] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -2672,6 +2677,13 @@ def is_exploratory_signal(result: CandidateResult) -> bool:
     return result.score >= EXPLORATORY_MIN_NARROW_SCORE
 
 
+def is_phase2_viable_signal(result: CandidateResult) -> bool:
+    """Return True when an exploratory row has any usable life signal."""
+    if result.error:
+        return False
+    return result.status in PHASE2_VIABLE_SIGNAL_STATUSES
+
+
 def select_exploratory_candidates(
     results: Sequence[CandidateResult],
     all_candidates: Sequence[SerialSettings],
@@ -2688,6 +2700,9 @@ def select_exploratory_candidates(
     shortlist_results: list[CandidateResult] = []
     narrowed_candidates: list[SerialSettings] = []
     truncated = False
+    viable_candidates = [
+        result.settings for result in ranked_results if is_phase2_viable_signal(result)
+    ]
 
     stale_count = sum(1 for result in results if result.status == "stale-output")
     no_data_count = sum(1 for result in results if result.status == "no-data")
@@ -2762,7 +2777,12 @@ def select_exploratory_candidates(
             )
 
     if fallback_reason:
-        notes.append("FULL SCAN WILL USE ALL SELECTED SETTINGS.")
+        if viable_candidates:
+            notes.append(
+                f"SIGNAL-ONLY PHASE 2 AVAILABLE: {len(viable_candidates)} SETTINGS."
+            )
+        else:
+            notes.append("FULL SCAN WILL USE ALL SELECTED SETTINGS.")
 
     return ExploratorySelection(
         results=list(results),
@@ -2776,7 +2796,29 @@ def select_exploratory_candidates(
         truncated=truncated,
         baud_focus=baud_focus,
         phase0_liveness=phase0_liveness,
+        viable_candidates=viable_candidates,
     )
+
+
+def phase2_candidates_after_exploratory(
+    all_candidates: Sequence[SerialSettings],
+    selection: ExploratorySelection | None,
+    narrowing_accepted: bool,
+) -> tuple[list[SerialSettings], str]:
+    """Return phase-2 candidates and a metadata source label."""
+    if selection is None:
+        return list(all_candidates), PHASE2_CANDIDATE_SOURCE_FULL
+    if narrowing_accepted and selection.narrowed_candidates:
+        return (
+            list(selection.narrowed_candidates),
+            PHASE2_CANDIDATE_SOURCE_NARROWED,
+        )
+    if selection.viable_candidates:
+        return (
+            list(selection.viable_candidates),
+            PHASE2_CANDIDATE_SOURCE_VIABLE,
+        )
+    return list(all_candidates), PHASE2_CANDIDATE_SOURCE_FULL
 
 
 def print_phase0_start(
@@ -2932,6 +2974,10 @@ def print_exploratory_summary(selection: ExploratorySelection) -> None:
             "  FULL-SCAN CANDIDATES: "
             f"{len(selection.narrowed_candidates)} AFTER FLOW EXPANSION"
         )
+    print(
+        "  SIGNAL CANDIDATES:    "
+        f"{len(selection.viable_candidates)} FOR PHASE 2 FALLBACK"
+    )
 
     top_rows = [
         result for result in selection.ranked_results if result.score > 0.0
@@ -2979,8 +3025,11 @@ def exploratory_metadata(
     original_candidate_count: int,
     final_candidate_count: int,
     options: ScanOptions,
+    phase2_candidate_source: str = PHASE2_CANDIDATE_SOURCE_FULL,
 ) -> dict[str, Any]:
     """Return JSON metadata for exploratory mode and candidate narrowing."""
+    if narrowing_accepted:
+        phase2_candidate_source = PHASE2_CANDIDATE_SOURCE_NARROWED
     phase0_fixed_settings = {
         "payload_bytes": phase0_payload_bytes(),
         "read_timeout": PHASE0_READ_TIMEOUT,
@@ -3028,14 +3077,14 @@ def exploratory_metadata(
         "narrowing_accepted": narrowing_accepted,
         "original_candidate_count": original_candidate_count,
         "final_candidate_count": final_candidate_count,
-        "candidate_source": (
-            "exploratory-narrowed"
-            if narrowing_accepted
-            else "all-selected-settings"
-        ),
+        "candidate_source": phase2_candidate_source,
+        "phase2_candidate_source": phase2_candidate_source,
     }
     if selection is None:
         metadata["ran"] = False
+        metadata["shortlist_count"] = 0
+        metadata["narrowed_candidate_count"] = 0
+        metadata["viable_signal_candidate_count"] = 0
         metadata["baud_focus"] = dataclass_to_jsonable(
             empty_baud_focus_report(
                 options.baud_focus_enabled,
@@ -3065,6 +3114,7 @@ def exploratory_metadata(
             "baud_focus": dataclass_to_jsonable(selection.baud_focus),
             "shortlist_count": len(selection.shortlist_results),
             "narrowed_candidate_count": len(selection.narrowed_candidates),
+            "viable_signal_candidate_count": len(selection.viable_candidates),
             "shortlist_settings": [
                 dataclass_to_jsonable(result.settings)
                 for result in selection.shortlist_results
@@ -3072,6 +3122,10 @@ def exploratory_metadata(
             "narrowed_candidate_settings": [
                 dataclass_to_jsonable(settings)
                 for settings in selection.narrowed_candidates
+            ],
+            "viable_signal_candidate_settings": [
+                dataclass_to_jsonable(settings)
+                for settings in selection.viable_candidates
             ],
             "top_results": [
                 dataclass_to_jsonable(result)
@@ -3369,11 +3423,12 @@ def run_exploratory_scan(
     )
     print_exploratory_summary(selection)
     logger.info(
-        "quick exploratory completed; candidates=%s fallback=%s shortlist=%s narrowed=%s baud_focus=%s",
+        "quick exploratory completed; candidates=%s fallback=%s shortlist=%s narrowed=%s viable=%s baud_focus=%s",
         len(results),
         selection.fallback_reason,
         len(selection.shortlist_results),
         len(selection.narrowed_candidates),
+        len(selection.viable_candidates),
         dataclass_to_jsonable(baud_focus_report),
     )
     return selection
@@ -4654,6 +4709,7 @@ def run_scan(options: ScanOptions) -> int:
 
     exploratory_selection: ExploratorySelection | None = None
     exploratory_narrowing_accepted = False
+    phase2_candidate_source = PHASE2_CANDIDATE_SOURCE_FULL
     if exploratory_requested:
         exploratory_selection = run_exploratory_scan(
             serial_module=serial_module,
@@ -4671,7 +4727,11 @@ def run_scan(options: ScanOptions) -> int:
                     False,
                 )
             if exploratory_narrowing_accepted:
-                candidates = list(exploratory_selection.narrowed_candidates)
+                candidates, phase2_candidate_source = phase2_candidates_after_exploratory(
+                    all_candidates,
+                    exploratory_selection,
+                    exploratory_narrowing_accepted,
+                )
                 logger.info(
                     "exploratory narrowing accepted; full candidates=%s/%s",
                     len(candidates),
@@ -4679,15 +4739,53 @@ def run_scan(options: ScanOptions) -> int:
                 )
             else:
                 logger.info("operator declined exploratory narrowing")
-                print("FULL ANALYSIS WILL TEST ALL SELECTED SETTINGS.")
+                candidates, phase2_candidate_source = phase2_candidates_after_exploratory(
+                    all_candidates,
+                    exploratory_selection,
+                    exploratory_narrowing_accepted,
+                )
+                if phase2_candidate_source == PHASE2_CANDIDATE_SOURCE_VIABLE:
+                    print(
+                        "PHASE 2 SIGNAL-ONLY MODE: "
+                        f"TESTING {len(candidates)}/{len(all_candidates)} "
+                        "SETTINGS WITH QUICK LIFE SIGNAL."
+                    )
+                else:
+                    print("FULL ANALYSIS WILL TEST ALL SELECTED SETTINGS.")
         else:
             logger.info(
                 "exploratory narrowing unavailable: %s",
                 exploratory_selection.fallback_reason,
             )
-            print("FULL ANALYSIS WILL TEST ALL SELECTED SETTINGS.")
+            candidates, phase2_candidate_source = phase2_candidates_after_exploratory(
+                all_candidates,
+                exploratory_selection,
+                exploratory_narrowing_accepted,
+            )
+            if phase2_candidate_source == PHASE2_CANDIDATE_SOURCE_VIABLE:
+                print(
+                    "PHASE 2 SIGNAL-ONLY MODE: "
+                    f"TESTING {len(candidates)}/{len(all_candidates)} "
+                    "SETTINGS WITH QUICK LIFE SIGNAL."
+                )
+            else:
+                print("FULL ANALYSIS WILL TEST ALL SELECTED SETTINGS.")
+        logger.info(
+            "phase 2 candidate source=%s candidates=%s/%s narrowed=%s viable=%s",
+            phase2_candidate_source,
+            len(candidates),
+            len(all_candidates),
+            len(exploratory_selection.narrowed_candidates),
+            len(exploratory_selection.viable_candidates),
+        )
     else:
         logger.info("operator skipped quick exploratory mode")
+        logger.info(
+            "phase 2 candidate source=%s candidates=%s/%s",
+            phase2_candidate_source,
+            len(candidates),
+            len(all_candidates),
+        )
 
     scan_started = time.monotonic()
     started_at = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -4703,6 +4801,12 @@ def run_scan(options: ScanOptions) -> int:
     if exploratory_narrowing_accepted:
         print("MODE: FULL ANALYSIS OF QUICK EXPLORATORY SHORTLIST.")
         print(f"SETTINGS: {len(candidates)}/{len(all_candidates)} SELECTED BY QUICK MODE.")
+    elif phase2_candidate_source == PHASE2_CANDIDATE_SOURCE_VIABLE:
+        print("MODE: FULL ANALYSIS OF QUICK EXPLORATORY SIGNAL SETTINGS.")
+        print(
+            f"SETTINGS: {len(candidates)}/{len(all_candidates)} "
+            "SELECTED BY QUICK LIFE SIGNAL."
+        )
     else:
         print("MODE: TEST ALL SELECTED SERIAL SETTINGS.")
         if exploratory_requested:
@@ -4813,6 +4917,8 @@ def run_scan(options: ScanOptions) -> int:
     metadata["tie_score_tolerance"] = TIE_SCORE_TOLERANCE
     metadata["full_candidate_count_before_exploratory"] = len(all_candidates)
     metadata["full_candidate_count_after_exploratory"] = len(candidates)
+    metadata["phase2_candidate_source"] = phase2_candidate_source
+    metadata["phase2_candidate_count"] = len(candidates)
     metadata["exploratory_mode"] = exploratory_metadata(
         requested=exploratory_requested,
         narrowing_accepted=exploratory_narrowing_accepted,
@@ -4820,15 +4926,17 @@ def run_scan(options: ScanOptions) -> int:
         original_candidate_count=len(all_candidates),
         final_candidate_count=len(candidates),
         options=options,
+        phase2_candidate_source=phase2_candidate_source,
     )
     write_json_report(options.json_report, metadata, results)
     write_csv_report(options.csv_report, results, metadata)
     logger.info(
-        "serial_probe completed; candidates=%s/%s early_stopped=%s exploratory_narrowed=%s",
+        "serial_probe completed; candidates=%s/%s early_stopped=%s exploratory_narrowed=%s phase2_source=%s",
         len(results),
         len(all_candidates),
         early_stopped,
         exploratory_narrowing_accepted,
+        phase2_candidate_source,
     )
     logger.info("json_report=%s", options.json_report)
     logger.info("csv_report=%s", options.csv_report)
@@ -4849,6 +4957,11 @@ def run_scan(options: ScanOptions) -> int:
         print(
             "  NOTE:                 FULL ANALYSIS USED QUICK EXPLORATORY "
             f"CANDIDATES ({len(candidates)}/{len(all_candidates)})."
+        )
+    elif phase2_candidate_source == PHASE2_CANDIDATE_SOURCE_VIABLE:
+        print(
+            "  NOTE:                 FULL ANALYSIS USED QUICK EXPLORATORY "
+            f"SIGNAL CANDIDATES ({len(candidates)}/{len(all_candidates)})."
         )
     elif exploratory_requested:
         print("  NOTE:                 QUICK EXPLORATORY DID NOT NARROW FULL ANALYSIS.")
