@@ -2253,7 +2253,7 @@ def write_text_report(
         "",
         "ASSUMPTIONS:",
         "  BUFFER IS PHYSICALLY BETWEEN THE TWO COM PORTS.",
-        "  BOTH BUFFER SWITCH BANKS ARE SET THE SAME WAY FOR THIS RUN.",
+        "  SWITCH BANKS ARE NOT ASSUMED TO BE TWO COMPLETE PORT PROFILES.",
         "  THE PROGRAM SETS BOTH PC COM PORTS; DEVICE MANAGER DEFAULTS ARE NOT USED.",
         "",
     ]
@@ -3434,7 +3434,7 @@ def print_phase0_start(
     """Print the Phase 0 liveness sweep start banner."""
     print()
     print_report_title("PHASE 0 BAUD LIVENESS SWEEP")
-    print("MODE: FIXED 8E1 FLOW=NONE; BAUD GATE FOR QUICK EXPLORATORY.")
+    print("MODE: FIXED 8E1 FLOW=NONE; SAME-BAUD LIVENESS GATE.")
     print(
         f"PORTS: {options.in_port} -> {options.out_port}; "
         f"TEST={payload.byte_count} BYTES X {phase0_options.bursts}"
@@ -4157,7 +4157,7 @@ def run_dual_phase0_baud_matrix(
     ]
     print()
     print_report_title("DUAL PHASE 0 BAUD MATRIX")
-    print("MODE: TWO SWITCH BANKS; INPUT AND OUTPUT BAUDS MAY DIFFER.")
+    print("MODE: ADVANCED INPUT/OUTPUT BAUD MATRIX; PC PORT BAUDS MAY DIFFER.")
     print(
         f"PORTS: IN {options.in_port} -> BUFFER -> OUT {options.out_port}; "
         f"TEST={phase0_payload.byte_count} BYTES X {phase0_options.bursts}"
@@ -4531,7 +4531,7 @@ def write_dual_bank_text_report(
         [
             "",
             "INTERPRETATION NOTES:",
-            "  DUAL-BANK MODE DOES NOT ASSUME SW1 AND SW2 USE THE SAME SETTING.",
+            "  ADVANCED MODE DOES NOT TREAT SW1/SW2 AS COMPLETE PORT PROFILES.",
             "  INPUT VALUES ARE FOR THE PC TRANSMIT PORT INTO THE BUFFER.",
             "  OUTPUT VALUES ARE FOR THE PC RECEIVE PORT FROM THE BUFFER.",
             "  INPUT FLOW AND OUTPUT FLOW ARE TESTED AS SEPARATE PORT SETTINGS.",
@@ -4878,14 +4878,6 @@ def prompt_phase0_only_sweep() -> bool:
     )
 
 
-def prompt_same_bank_settings() -> bool:
-    """Ask whether both buffer switch banks should be treated as identical."""
-    return prompt_yes_no_question(
-        "Assume both buffer switch banks use the same serial setting?",
-        True,
-    )
-
-
 def print_menu_help() -> None:
     """Print short help for the interactive CLI."""
     print_paged_lines(
@@ -4907,7 +4899,7 @@ def print_menu_help() -> None:
             "",
             "OPERATOR NOTES:",
             "  START SCAN:      FIRST ASKS WHETHER TO RUN ONLY PHASE 0.",
-            "  BANKS:           SAME BANK MODE IS OLD BEHAVIOR; DUAL BANK TESTS PAIRS.",
+            "  SWITCHES:        SW1/SW2 ARE NOT TREATED AS TWO COMPLETE PORT PROFILES.",
             "  SCAN TYPE:       FULL OR QUICK AT SCAN START; BLANK=FULL.",
             "  FULL MODE:       MOST RELIABLE FOR SWITCH MAPPING; QUICK MODE ASKS.",
             "  QUICK MODE:      RUNS DISCOVERY AND MAY NARROW PHASE 2.",
@@ -4916,7 +4908,7 @@ def print_menu_help() -> None:
             "  TEST SIZE:       BYTES SENT FOR EACH SETTING.",
             "  TEST COUNT:      NUMBER OF TRIES PER SETTING.",
             "  DISCOVERY:       QUICK=YES; FULL ASKS; FIXED INTERNAL SETTINGS.",
-            "  PHASE 0:         QUICK TESTS EACH BAUD AT 8E1 FLOW=NONE.",
+            "  PHASE 0:         TESTS SHARED BAUD AT 8E1 FLOW=NONE.",
             "  TURBO:           FASTER DISCOVERY TIMING.",
             "  QUICK BAUD FOCUS: QUICK-ONLY SPEED-UP; FULL DOES NOT NEED IT.",
             "  ASK ON MATCH:    PAUSE AFTER PASS; ASK CONTINUE.",
@@ -6836,7 +6828,7 @@ def run_dual_bank_scan(
 
     print()
     print_report_title("DUAL BANK SCAN START")
-    print("MODEL: SW1/SW2 MAY CONTROL DIFFERENT BUFFER PORTS.")
+    print("MODEL: ADVANCED PC INPUT/OUTPUT PORT SETTINGS MAY DIFFER.")
     print("INPUT SIDE:  PC TRANSMIT PORT INTO BUFFER.")
     print("OUTPUT SIDE: PC RECEIVE PORT FROM BUFFER.")
     print_wrapped_value(
@@ -7223,28 +7215,14 @@ def metadata_for_scan(
 def run_scan(options: ScanOptions) -> int:
     """Run the serial probe scan and write reports."""
     phase0_only = prompt_phase0_only_sweep()
-    same_bank_settings = prompt_same_bank_settings()
     serial_module = import_or_install_pyserial()
     logger = setup_logging(options.log_file)
     pyserial_version = str(getattr(serial_module, "VERSION", "unknown"))
     logger.info("serial_probe started")
+    logger.info("switch-bank prompt skipped; using same-baud staged discovery model")
 
     if phase0_only:
-        if same_bank_settings:
-            return run_phase0_only_sweep(
-                serial_module=serial_module,
-                options=options,
-                logger=logger,
-            )
-        return run_dual_bank_scan(
-            serial_module=serial_module,
-            options=options,
-            logger=logger,
-            phase0_only=True,
-        )
-
-    if not same_bank_settings:
-        return run_dual_bank_scan(
+        return run_phase0_only_sweep(
             serial_module=serial_module,
             options=options,
             logger=logger,
@@ -7387,7 +7365,7 @@ def run_scan(options: ScanOptions) -> int:
     else:
         print("FULL MODE: QUICK DISCOVERY RUNS ONLY IF YOU ANSWER YES.")
     print("DEVICE PATH: COM INPUT -> BUFFER -> COM OUTPUT.")
-    print("ASSUMPTION: BOTH BUFFER SWITCH BANKS ARE SET THE SAME WAY.")
+    print("SWITCH MODEL: BAUD FIRST; SW1/SW2 ARE NOT TWO COMPLETE PORT PROFILES.")
     print("NOTE: PROGRAM SETS COM PORTS; DEVICE MANAGER DEFAULTS ARE NOT USED.")
     if options.switch_note:
         print(f"SWITCH NOTE: {options.switch_note}")
