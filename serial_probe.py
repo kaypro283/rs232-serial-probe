@@ -52,6 +52,10 @@ DEFAULT_PRE_DRAIN_TIMEOUT = 0.5
 DEFAULT_PRE_DRAIN_QUIET = 0.1
 DEFAULT_MAX_DRAIN_BYTES = 32_768
 TURBO_DISCOVERY_ENABLED_DEFAULT = False
+FLOW_VALIDATE_PAYLOAD_BYTES = 1024
+FLOW_VALIDATE_READ_TIMEOUT = 2.0
+FLOW_VALIDATE_HOLD_SECONDS = 1.0
+FLOW_VALIDATE_RELEASE_SETTLE_SECONDS = 0.15
 TURBO_SETTLE_MS = 10
 TURBO_PRE_DRAIN_TIMEOUT = 0.25
 TURBO_PRE_DRAIN_QUIET = 0.05
@@ -77,6 +81,8 @@ PHASE0_BASELINE_DATA_BITS = 8
 PHASE0_BASELINE_PARITY = "mark"
 PHASE0_BASELINE_STOP_BITS = 1
 PHASE0_BASELINE_FLOW_CONTROL = "none"
+DUAL_PHASE0_BAUD_PAIR_LIMIT = 6
+DUAL_PHASE0_FALLBACK_PAIR_LIMIT = 4
 EXPLORATORY_PAYLOAD_BYTES = 160
 EXPLORATORY_READ_TIMEOUT = 0.4
 EXPLORATORY_SETTLE_MS = 20
@@ -152,6 +158,63 @@ class SerialSettings:
             f"{self.baud} {self.data_bits}{self.parity_code()}"
             f"{self.stop_bits} FLOW={flow}"
         )
+
+
+@dataclass(frozen=True)
+class DualSerialSettings:
+    """Independent input and output serial settings for a dual-bank buffer."""
+
+    input_settings: SerialSettings
+    output_settings: SerialSettings
+
+    @property
+    def baud(self) -> int:
+        """Return input baud for write-side timing helpers."""
+        return self.input_settings.baud
+
+    @property
+    def data_bits(self) -> int:
+        """Return input data bits for write-side timing helpers."""
+        return self.input_settings.data_bits
+
+    @property
+    def parity(self) -> str:
+        """Return input parity for write-side timing helpers."""
+        return self.input_settings.parity
+
+    @property
+    def stop_bits(self) -> int:
+        """Return input stop bits for write-side timing helpers."""
+        return self.input_settings.stop_bits
+
+    @property
+    def flow_control(self) -> str:
+        """Return input flow control for compatibility with result helpers."""
+        return self.input_settings.flow_control
+
+    def parity_code(self) -> str:
+        """Return the input-side parity code for compatibility helpers."""
+        return self.input_settings.parity_code()
+
+    def input_mode(self) -> str:
+        """Return compact input-side baud/frame text."""
+        return (
+            f"{self.input_settings.baud} "
+            f"{self.input_settings.data_bits}{self.input_settings.parity_code()}"
+            f"{self.input_settings.stop_bits}"
+        )
+
+    def output_mode(self) -> str:
+        """Return compact output-side baud/frame text."""
+        return (
+            f"{self.output_settings.baud} "
+            f"{self.output_settings.data_bits}{self.output_settings.parity_code()}"
+            f"{self.output_settings.stop_bits}"
+        )
+
+    def label(self) -> str:
+        """Return a compact human-readable dual-bank setting label."""
+        return f"IN {self.input_mode()} -> OUT {self.output_mode()}"
 
 
 @dataclass(frozen=True)
@@ -233,7 +296,7 @@ class CandidateResult:
 
     index: int
     total: int
-    settings: SerialSettings
+    settings: SerialSettings | DualSerialSettings
     bytes_sent: int
     bytes_received: int
     bytes_drained_before: int
@@ -273,6 +336,8 @@ class ScanOptions:
     auto_validate_top_matches: bool
     validate_size_1_bytes: int
     validate_size_2_tie_bytes: int
+    auto_validate_flow_control: bool
+    flow_validate_size_bytes: int
     baud_focus_enabled: bool
     baud_focus_strong_score_threshold: float
     baud_focus_lead_gap_threshold: float
@@ -368,6 +433,38 @@ class BaudLivenessReport:
 
 
 @dataclass(frozen=True)
+class DualBaudLivenessResult:
+    """Phase 0 result for one input/output baud pair."""
+
+    input_baud: int
+    output_baud: int
+    alive: bool
+    reason: str
+    settings: DualSerialSettings
+    score: float
+    status: str
+    error: str | None
+    bytes_sent: int
+    bytes_received: int
+    bytes_drained_before: int
+    elapsed_sec: float
+    metrics: ScoreMetrics
+
+
+@dataclass(frozen=True)
+class DualBaudLivenessReport:
+    """Run summary for the dual-bank Phase 0 baud matrix."""
+
+    ran: bool
+    tested_pairs: list[tuple[int, int]]
+    alive_pairs: list[tuple[int, int]]
+    selected_pairs: list[tuple[int, int]]
+    fallback_reason: str | None
+    elapsed_sec: float
+    results: list[DualBaudLivenessResult]
+
+
+@dataclass(frozen=True)
 class ExploratorySelection:
     """Ranked exploratory findings and the optional full-scan candidate subset."""
 
@@ -400,6 +497,25 @@ class MemoryTestResult:
     score: float
     indicator: str
     status: str
+    error: str | None
+    elapsed_sec: float
+    metrics: ScoreMetrics
+
+
+@dataclass(frozen=True)
+class FlowControlValidationResult:
+    """Result from one post-scan flow-control validation."""
+
+    flow_control: str
+    method: str
+    settings: SerialSettings
+    bytes_sent: int
+    bytes_received: int
+    bytes_seen_while_held: int
+    score: float
+    indicator: str
+    status: str
+    reason: str
     error: str | None
     elapsed_sec: float
     metrics: ScoreMetrics
@@ -729,13 +845,13 @@ def serial_constants(serial_module: Any, settings: SerialSettings) -> dict[str, 
     }
 
 
-def estimated_frame_bits(settings: SerialSettings) -> float:
+def estimated_frame_bits(settings: SerialSettings | DualSerialSettings) -> float:
     """Estimate serial frame width in bits per transmitted byte."""
     parity_bits = 0 if settings.parity == "none" else 1
     return 1 + settings.data_bits + parity_bits + settings.stop_bits
 
 
-def write_chunk_size(settings: SerialSettings) -> int:
+def write_chunk_size(settings: SerialSettings | DualSerialSettings) -> int:
     """Choose a write chunk size that behaves well at very low baud rates."""
     bytes_per_second = max(1.0, settings.baud / estimated_frame_bits(settings))
     quarter_second = int(bytes_per_second * 0.25)
@@ -1223,7 +1339,7 @@ def drain_output_until_quiet(
 def execute_burst(
     in_serial: Any,
     out_serial: Any,
-    settings: SerialSettings,
+    settings: SerialSettings | DualSerialSettings,
     payload: ProbePayload,
     burst_index: int,
     burst_total: int,
@@ -1509,7 +1625,7 @@ def aggregate_metrics(trials: Sequence[TrialResult]) -> ScoreMetrics:
 def aggregate_candidate_result(
     index: int,
     total: int,
-    settings: SerialSettings,
+    settings: SerialSettings | DualSerialSettings,
     trials: list[TrialResult],
     elapsed_sec: float,
     opening_error: str | None = None,
@@ -1738,6 +1854,175 @@ def run_candidate(
     return result
 
 
+def run_dual_candidate(
+    serial_module: Any,
+    index: int,
+    total: int,
+    settings: DualSerialSettings,
+    options: ScanOptions,
+    payload: ProbePayload,
+    logger: logging.Logger,
+    progress: ProgressCallback | None = None,
+) -> CandidateResult:
+    """Run one dual-bank candidate using independent input/output settings."""
+    started = time.monotonic()
+    trials: list[TrialResult] = []
+    input_settings = settings.input_settings
+    output_settings = settings.output_settings
+    effective_timing = effective_discovery_timing(
+        options,
+        input_settings,
+        payload.byte_count,
+    )
+    logger.info("dual candidate %s/%s: %s", index, total, settings.label())
+    if progress:
+        per_burst = estimated_transmit_seconds(input_settings, payload.byte_count)
+        total_estimate = per_burst * options.bursts
+        progress(border_line(PROGRESS_WIDTH))
+        progress(
+            bordered_text(
+                f"DUAL {index}/{total}",
+                PROGRESS_WIDTH,
+            )
+        )
+        progress(border_line(PROGRESS_WIDTH))
+        progress(
+            f"[{index:04d}/{total:04d} {settings.label()}] TESTING | "
+            f"TEST={payload.byte_count} BYTES, COUNT={options.bursts}, "
+            f"SEND={format_duration(per_burst)}/TEST "
+            f"({format_duration(total_estimate)} TOTAL), "
+            f"READ={effective_timing.read_timeout:.2f}S"
+        )
+        progress(
+            f"[{index:04d}/{total:04d} {settings.label()}] "
+            f"OPEN OUT {options.out_port} AS {output_settings.label()} "
+            f"AND IN {options.in_port} AS {input_settings.label()}"
+        )
+
+    try:
+        open_started = time.monotonic()
+        with open_serial_port(
+            serial_module,
+            options.out_port,
+            output_settings,
+            effective_timing.read_timeout,
+        ) as out_serial:
+            with open_serial_port(
+                serial_module,
+                options.in_port,
+                input_settings,
+                effective_timing.read_timeout,
+            ) as in_serial:
+                open_elapsed = time.monotonic() - open_started
+                if progress:
+                    progress(
+                        f"[{index:04d}/{total:04d} {settings.label()}] "
+                        "PORTS OPEN; START TESTS"
+                    )
+                for burst_index in range(1, options.bursts + 1):
+                    trial = execute_burst(
+                        in_serial=in_serial,
+                        out_serial=out_serial,
+                        settings=settings,
+                        payload=payload,
+                        burst_index=burst_index,
+                        burst_total=options.bursts,
+                        candidate_index=index,
+                        candidate_total=total,
+                        read_timeout=effective_timing.read_timeout,
+                        completion_quiet=effective_timing.completion_quiet,
+                        settle_ms=effective_timing.settle_ms,
+                        progress_interval=options.progress_interval,
+                        no_pre_drain=options.no_pre_drain,
+                        pre_drain_timeout=effective_timing.pre_drain_timeout,
+                        pre_drain_quiet=effective_timing.pre_drain_quiet,
+                        max_drain_bytes=options.max_drain_bytes,
+                        logger=logger,
+                        progress=progress,
+                    )
+                    trials.append(trial)
+                    logger.debug(
+                        "dual candidate %s burst %s: sent=%s recv=%s drained=%s score=%.2f status=%s error=%s",
+                        index,
+                        burst_index,
+                        trial.bytes_sent,
+                        trial.bytes_received,
+                        trial.bytes_drained_before,
+                        trial.score,
+                        trial.status,
+                        trial.error,
+                    )
+    except Exception as exc:
+        elapsed = time.monotonic() - started
+        logger.exception("dual candidate %s failed before trials", index)
+        if progress:
+            progress(
+                f"[{index:04d}/{total:04d} {settings.label()}] "
+                f"ERROR OPEN/RUN: {exc}"
+            )
+        result = aggregate_candidate_result(
+            index=index,
+            total=total,
+            settings=settings,
+            trials=[],
+            elapsed_sec=elapsed,
+            opening_error=str(exc),
+        )
+        logger.info(
+            "dual candidate %s/%s timing: total=%.3fs open_setup=%.3fs drain=%.3fs write=%.3fs read_wait=%.3fs other=%.3fs",
+            index,
+            total,
+            result.elapsed_sec,
+            result.timing.open_setup_sec,
+            result.timing.drain_sec,
+            result.timing.write_sec,
+            result.timing.read_wait_sec,
+            result.timing.other_sec,
+        )
+        return result
+
+    elapsed = time.monotonic() - started
+    result = aggregate_candidate_result(
+        index=index,
+        total=total,
+        settings=settings,
+        trials=trials,
+        elapsed_sec=elapsed,
+    )
+    result = dataclasses.replace(
+        result,
+        timing=TimingBreakdown(
+            open_setup_sec=result.timing.open_setup_sec + open_elapsed,
+            drain_sec=result.timing.drain_sec,
+            write_sec=result.timing.write_sec,
+            read_wait_sec=result.timing.read_wait_sec,
+            other_sec=max(
+                0.0,
+                result.elapsed_sec
+                - (
+                    result.timing.open_setup_sec
+                    + open_elapsed
+                    + result.timing.drain_sec
+                    + result.timing.write_sec
+                    + result.timing.read_wait_sec
+                ),
+            ),
+        ),
+    )
+    logger.info(
+        "dual candidate %s/%s timing: total=%.3fs open_setup=%.3fs drain=%.3fs write=%.3fs read_wait=%.3fs other=%.3fs",
+        index,
+        total,
+        result.elapsed_sec,
+        result.timing.open_setup_sec,
+        result.timing.drain_sec,
+        result.timing.write_sec,
+        result.timing.read_wait_sec,
+        result.timing.other_sec,
+    )
+    return result
+
+
 def result_sort_key(result: CandidateResult) -> tuple[float, float, float, int]:
     """Return descending sort key fields for ranking candidates."""
     return (
@@ -1909,10 +2194,16 @@ def write_text_report(
     metadata: dict[str, Any],
     results: Sequence[CandidateResult],
     validation_results: Sequence[CandidateResult] | None = None,
+    flow_validation_results: Sequence[FlowControlValidationResult] | None = None,
 ) -> None:
     """Append one compact old-school text report entry."""
     path.parent.mkdir(parents=True, exist_ok=True)
     validation_results = [] if validation_results is None else list(validation_results)
+    flow_validation_results = (
+        []
+        if flow_validation_results is None
+        else list(flow_validation_results)
+    )
     options = metadata.get("options", {})
     exploratory = metadata.get("exploratory_mode", {})
     phase0 = exploratory.get("phase0_baud_liveness", {})
@@ -1989,6 +2280,13 @@ def write_text_report(
                 ),
             ]
         )
+    if flow_validation_results:
+        lines.extend(
+            [
+                "",
+                *flow_validation_report_lines(flow_validation_results),
+            ]
+        )
     lines.extend(
         [
             "",
@@ -1996,7 +2294,7 @@ def write_text_report(
             "  BAUD RATE IS USUALLY THE MOST RELIABLE FIELD FROM THIS TEST.",
             "  7/8 DATA BITS, PARITY, STOP BITS, AND FLOW CONTROL CAN TIE IF THE BUFFER",
             "  OR TEST DATA DOES NOT FORCE THOSE FEATURES TO MATTER.",
-            "  FLOW CONTROL NEEDS A SEPARATE STRESS/MEMORY TEST BEFORE TRUSTING IT.",
+            "  TRUST FLOW CONTROL ONLY AFTER FLOW VALIDATION OR A STRESS/MEMORY TEST.",
             border_line(REPORT_WIDTH),
         ]
     )
@@ -2427,6 +2725,8 @@ def default_scan_options() -> ScanOptions:
         auto_validate_top_matches=True,
         validate_size_1_bytes=8 * 1024,
         validate_size_2_tie_bytes=16 * 1024,
+        auto_validate_flow_control=True,
+        flow_validate_size_bytes=FLOW_VALIDATE_PAYLOAD_BYTES,
         baud_focus_enabled=BAUD_FOCUS_ENABLED_DEFAULT,
         baud_focus_strong_score_threshold=BAUD_FOCUS_STRONG_SCORE_THRESHOLD,
         baud_focus_lead_gap_threshold=BAUD_FOCUS_LEAD_GAP_THRESHOLD,
@@ -2465,6 +2765,8 @@ def validate_options(options: ScanOptions) -> None:
         and options.validate_size_2_tie_bytes < minimum_payload_size()
     ):
         raise ValueError(f"VALIDATE SIZE 2 MUST BE 0 OR AT LEAST {minimum_payload_size()} BYTES")
+    if options.flow_validate_size_bytes < minimum_payload_size():
+        raise ValueError(f"FLOW VALIDATE SIZE MUST BE AT LEAST {minimum_payload_size()} BYTES")
     if not 0.0 <= options.baud_focus_strong_score_threshold <= 100.0:
         raise ValueError("QUICK BAUD FOCUS SCORE MUST BE 0..100")
     if options.baud_focus_lead_gap_threshold < 0.0:
@@ -3443,6 +3745,527 @@ def run_phase0_only_sweep(
     return 0
 
 
+def dual_phase0_settings(input_baud: int, output_baud: int) -> DualSerialSettings:
+    """Return fixed baseline dual-bank settings for one baud pair."""
+    return DualSerialSettings(
+        input_settings=phase0_baseline_settings(input_baud),
+        output_settings=phase0_baseline_settings(output_baud),
+    )
+
+
+def dual_frame_candidates_for_pair(
+    input_baud: int,
+    output_baud: int,
+) -> list[DualSerialSettings]:
+    """Return independent input/output frame candidates for one baud pair."""
+    input_frames = [
+        SerialSettings(input_baud, data_bits, parity, stop_bits, "none")
+        for data_bits in DATA_BITS
+        for parity in PARITIES
+        for stop_bits in STOP_BITS
+    ]
+    output_frames = [
+        SerialSettings(output_baud, data_bits, parity, stop_bits, "none")
+        for data_bits in DATA_BITS
+        for parity in PARITIES
+        for stop_bits in STOP_BITS
+    ]
+    input_frames.sort(key=discovery_frame_priority)
+    output_frames.sort(key=discovery_frame_priority)
+    return [
+        DualSerialSettings(input_settings=input_frame, output_settings=output_frame)
+        for input_frame in input_frames
+        for output_frame in output_frames
+    ]
+
+
+def dual_baud_result_from_candidate(
+    result: CandidateResult,
+    decision: Phase0LivenessDecision,
+) -> DualBaudLivenessResult:
+    """Return a dual-bank Phase 0 baud result row."""
+    settings = result.settings
+    if not isinstance(settings, DualSerialSettings):
+        raise TypeError("dual baud result requires dual serial settings")
+    return DualBaudLivenessResult(
+        input_baud=settings.input_settings.baud,
+        output_baud=settings.output_settings.baud,
+        alive=decision.alive,
+        reason=decision.reason,
+        settings=settings,
+        score=result.score,
+        status=result.status,
+        error=result.error,
+        bytes_sent=result.bytes_sent,
+        bytes_received=result.bytes_received,
+        bytes_drained_before=result.bytes_drained_before,
+        elapsed_sec=result.elapsed_sec,
+        metrics=result.metrics,
+    )
+
+
+def format_dual_phase0_progress(
+    result: DualBaudLivenessResult,
+    index: int,
+    total: int,
+) -> str:
+    """Return one dual-bank Phase 0 console progress line."""
+    state = "ALIVE" if result.alive else "NOT ALIVE"
+    return (
+        f"D-PHASE0 [{index:04d}/{total:04d}] {state:<9} "
+        f"IN={result.input_baud:>6} OUT={result.output_baud:>6} "
+        f"READ={result.bytes_received:6d} CLR={result.bytes_drained_before:6d} "
+        f"SCORE={result.score:6.2f} {result.reason}"
+    )
+
+
+def select_dual_phase0_pairs(
+    results: Sequence[DualBaudLivenessResult],
+) -> tuple[list[tuple[int, int]], str | None]:
+    """Return baud pairs to expand into dual-bank frame testing."""
+    alive = [result for result in results if result.alive]
+    if alive:
+        alive.sort(
+            key=lambda result: (
+                result.score,
+                result.metrics.line_integrity_ratio,
+                result.metrics.exact_byte_match_ratio,
+                result.bytes_received,
+            ),
+            reverse=True,
+        )
+        return (
+            [
+                (result.input_baud, result.output_baud)
+                for result in alive[:DUAL_PHASE0_BAUD_PAIR_LIMIT]
+            ],
+            None,
+        )
+    signaled = [
+        result
+        for result in results
+        if not result.error
+        and result.status not in {"error", "no-data", "stale-output", "partial-write"}
+        and result.score > 0.0
+    ]
+    signaled.sort(
+        key=lambda result: (
+            result.score,
+            result.metrics.line_integrity_ratio,
+            result.metrics.exact_byte_match_ratio,
+            result.bytes_received,
+        ),
+        reverse=True,
+    )
+    if signaled:
+        return (
+            [
+                (result.input_baud, result.output_baud)
+                for result in signaled[:DUAL_PHASE0_FALLBACK_PAIR_LIMIT]
+            ],
+            "NO ALIVE BAUD PAIRS; USING BEST PARTIAL-SIGNAL PAIRS.",
+        )
+    return [], "NO DUAL-BANK BAUD PAIRS PRODUCED A USABLE SIGNAL."
+
+
+def print_dual_phase0_summary(report: DualBaudLivenessReport) -> None:
+    """Print a concise dual-bank Phase 0 summary."""
+    input_bauds = sorted({input_baud for input_baud, _ in report.alive_pairs}, reverse=True)
+    output_bauds = sorted({output_baud for _, output_baud in report.alive_pairs}, reverse=True)
+    print()
+    print_report_title("DUAL PHASE 0 RESULTS")
+    print(f"  RUN TIME:             {format_duration(report.elapsed_sec)}")
+    print(f"  BAUD PAIRS TESTED:    {len(report.tested_pairs)}")
+    print(f"  ALIVE PAIRS:          {len(report.alive_pairs)}")
+    if input_bauds:
+        print_wrapped_value(
+            "  INPUT BAUDS:          ",
+            ", ".join(str(baud) for baud in input_bauds),
+        )
+    if output_bauds:
+        print_wrapped_value(
+            "  OUTPUT BAUDS:         ",
+            ", ".join(str(baud) for baud in output_bauds),
+        )
+    if report.selected_pairs:
+        print_wrapped_value(
+            "  PAIRS FOR PHASE 1:    ",
+            ", ".join(
+                f"IN {input_baud}/OUT {output_baud}"
+                for input_baud, output_baud in report.selected_pairs
+            ),
+        )
+    if report.fallback_reason:
+        print_wrapped_value("  NOTE:                 ", report.fallback_reason)
+    print(border_line(REPORT_WIDTH))
+
+
+def run_dual_phase0_baud_matrix(
+    serial_module: Any,
+    options: ScanOptions,
+    logger: logging.Logger,
+) -> DualBaudLivenessReport:
+    """Run a fixed-frame input/output baud-pair liveness matrix."""
+    phase0_options = phase0_scan_options(options)
+    phase0_payload = generate_phase0_payload(phase0_options.payload_bytes)
+    baud_order = scan_bauds(options.min_baud, options.max_baud)
+    pairs = [
+        (input_baud, output_baud)
+        for input_baud in baud_order
+        for output_baud in baud_order
+    ]
+    print()
+    print_report_title("DUAL PHASE 0 BAUD MATRIX")
+    print("MODE: TWO SWITCH BANKS; INPUT AND OUTPUT BAUDS MAY DIFFER.")
+    print(
+        f"PORTS: IN {options.in_port} -> BUFFER -> OUT {options.out_port}; "
+        f"TEST={phase0_payload.byte_count} BYTES X {phase0_options.bursts}"
+    )
+    print("FIXED FRAME: 8M1 FLOW=NONE ON BOTH SIDES.")
+    print(f"BAUD PAIRS: {len(pairs)}.")
+    print(border_line(REPORT_WIDTH))
+    logger.info("dual phase 0 baud matrix started pairs=%s", len(pairs))
+
+    started = time.monotonic()
+    results: list[DualBaudLivenessResult] = []
+    expected_byte_count = phase0_payload.byte_count * phase0_options.bursts
+    for index, (input_baud, output_baud) in enumerate(pairs, start=1):
+        candidate_result = run_dual_candidate(
+            serial_module=serial_module,
+            index=index,
+            total=len(pairs),
+            settings=dual_phase0_settings(input_baud, output_baud),
+            options=phase0_options,
+            payload=phase0_payload,
+            logger=logger,
+            progress=None,
+        )
+        decision = classify_phase0_liveness(candidate_result, expected_byte_count)
+        liveness_result = dual_baud_result_from_candidate(
+            candidate_result,
+            decision,
+        )
+        results.append(liveness_result)
+        print(format_dual_phase0_progress(liveness_result, index, len(pairs)), flush=True)
+        print(format_scan_eta(len(results), len(pairs), started), flush=True)
+        logger.info(
+            "dual phase 0 in=%s out=%s: %s score=%.2f status=%s reason=%s read=%s cleared=%s error=%s",
+            input_baud,
+            output_baud,
+            "alive" if decision.alive else "not-alive",
+            candidate_result.score,
+            candidate_result.status,
+            decision.reason,
+            candidate_result.bytes_received,
+            candidate_result.bytes_drained_before,
+            candidate_result.error,
+        )
+
+    elapsed_sec = time.monotonic() - started
+    alive_pairs = [
+        (result.input_baud, result.output_baud)
+        for result in results
+        if result.alive
+    ]
+    selected_pairs, fallback_reason = select_dual_phase0_pairs(results)
+    report = DualBaudLivenessReport(
+        ran=True,
+        tested_pairs=list(pairs),
+        alive_pairs=alive_pairs,
+        selected_pairs=selected_pairs,
+        fallback_reason=fallback_reason,
+        elapsed_sec=elapsed_sec,
+        results=results,
+    )
+    print_dual_phase0_summary(report)
+    logger.info(
+        "dual phase 0 completed alive=%s/%s selected=%s reason=%s",
+        len(alive_pairs),
+        len(pairs),
+        selected_pairs,
+        fallback_reason,
+    )
+    return report
+
+
+def dual_result_settings(result: CandidateResult) -> DualSerialSettings:
+    """Return dual settings from a candidate result or raise a clear error."""
+    if not isinstance(result.settings, DualSerialSettings):
+        raise TypeError("expected dual-bank candidate result")
+    return result.settings
+
+
+def ranked_dual_top_results(
+    results: Sequence[CandidateResult],
+    top: int,
+) -> list[CandidateResult]:
+    """Return top non-zero dual-bank results."""
+    ranked = [
+        result
+        for result in sorted(results, key=result_sort_key, reverse=True)
+        if result.score > 0.0
+    ]
+    perfect_count = sum(1 for result in ranked if result.score >= PERFECT_SCORE)
+    return ranked[: max(top, perfect_count)]
+
+
+def format_dual_progress(result: CandidateResult) -> str:
+    """Return one console progress line for a dual-bank candidate."""
+    settings = dual_result_settings(result)
+    status = (
+        result.status.upper()
+        if not result.error
+        else f"{result.status.upper()}: {result.error[:60]}"
+    )
+    indicator = result_indicator(result.score, result.status, result.error)
+    return (
+        f"[{result.index:04d}/{result.total:04d}] RESULT {indicator} "
+        f"{settings.label():38s} "
+        f"SENT={result.bytes_sent:7d} READ={result.bytes_received:7d} "
+        f"CLR={result.bytes_drained_before:7d} "
+        f"SCORE={result.score:6.2f} {status}"
+    )
+
+
+def print_dual_ranked_table(
+    results: Sequence[CandidateResult],
+    top: int,
+    report_title: str = "DUAL BANK FINAL REPORT",
+) -> None:
+    """Print a ranked dual-bank result table."""
+    ranked = ranked_dual_top_results(results, top)
+    print()
+    print_report_title(report_title)
+    print("TOP OBSERVED INPUT/OUTPUT PAIRS (NON-ZERO SCORES)")
+    print(border_line(REPORT_WIDTH))
+    print("RK SCORE  IN BAUD MODE  OUT BAUD MODE  SENT   READ  CLR  EXCT LINE RESULT")
+    print(border_line(REPORT_WIDTH))
+    for rank, result in enumerate(ranked, start=1):
+        settings = dual_result_settings(result)
+        indicator = result_indicator(result.score, result.status, result.error)
+        print(
+            f"{rank:>2} "
+            f"{result.score:>5.1f} "
+            f"{settings.input_settings.baud:>7} "
+            f"{settings.input_settings.data_bits}{settings.input_settings.parity_code()}"
+            f"{settings.input_settings.stop_bits:<4} "
+            f"{settings.output_settings.baud:>8} "
+            f"{settings.output_settings.data_bits}{settings.output_settings.parity_code()}"
+            f"{settings.output_settings.stop_bits:<5} "
+            f"{result.bytes_sent:>6} "
+            f"{result.bytes_received:>6} "
+            f"{result.bytes_drained_before:>4} "
+            f"{result.metrics.exact_byte_match_ratio:>4.2f} "
+            f"{result.metrics.line_integrity_ratio:>4.2f} "
+            f"{indicator}"
+        )
+    print(border_line(REPORT_WIDTH))
+    if not ranked:
+        print("NO NON-ZERO RESULTS.")
+
+
+def print_dual_result_details(result: CandidateResult) -> None:
+    """Print switch-setting and score details for one dual-bank result."""
+    settings = dual_result_settings(result)
+    print(f"    INPUT BAUD:         {settings.input_settings.baud}")
+    print(
+        f"    INPUT MODE:         "
+        f"{settings.input_settings.data_bits}"
+        f"{settings.input_settings.parity_code()}"
+        f"{settings.input_settings.stop_bits}"
+    )
+    print(f"    OUTPUT BAUD:        {settings.output_settings.baud}")
+    print(
+        f"    OUTPUT MODE:        "
+        f"{settings.output_settings.data_bits}"
+        f"{settings.output_settings.parity_code()}"
+        f"{settings.output_settings.stop_bits}"
+    )
+    print_wrapped_value("    SETTING:            ", settings.label())
+    print(
+        f"    RESULT:             "
+        f"{result_indicator(result.score, result.status, result.error)}"
+    )
+    print(f"    SCORE:              {result.score:.2f}/100")
+    print(f"    REPEAT:             {result.repeatability:.3f}")
+    print(f"    SENT/READ:          {result.bytes_sent}/{result.bytes_received}")
+    print(f"    EXACT RATIO:        {result.metrics.exact_byte_match_ratio:.3f}")
+    print(f"    LINE RATIO:         {result.metrics.line_integrity_ratio:.3f}")
+    if result.error:
+        print_wrapped_value("    ERROR:              ", result.error)
+
+
+def print_dual_scan_summary(
+    results: Sequence[CandidateResult],
+    total_candidates: int,
+    elapsed_sec: float,
+    early_stopped: bool,
+    top: int,
+) -> None:
+    """Print a concise dual-bank scan summary."""
+    ranked = sorted(results, key=result_sort_key, reverse=True)
+    best = ranked[0] if ranked else None
+    tied = top_tied_results(results)
+    print()
+    print_report_title("DUAL BANK SUMMARY")
+    print(f"  RUN TIME:             {format_duration(elapsed_sec)}")
+    print(f"  PAIRS TESTED:         {len(results)}/{total_candidates}")
+    print(f"  ENDED EARLY:          {'YES' if early_stopped else 'NO'}")
+    print(f"  FINDING:              {confidence_summary(best, len(tied))}")
+    if best is None:
+        return
+    print()
+    print(border_line(REPORT_WIDTH))
+    if len(tied) > 1:
+        print(bordered_text("MULTIPLE TOP INPUT/OUTPUT PAIRS", REPORT_WIDTH))
+        print(border_line(REPORT_WIDTH))
+        for rank, result in enumerate(ranked_dual_top_results(tied, top), start=1):
+            print_wrapped_value(f"    {rank}. ", dual_result_settings(result).label())
+        print(border_line(REPORT_WIDTH))
+        return
+    if is_recommendable_result(best):
+        print(bordered_text("RECOMMENDED DUAL-BANK SETTING", REPORT_WIDTH))
+    else:
+        print(bordered_text("BEST OBSERVED DUAL-BANK RESULT", REPORT_WIDTH))
+    print(border_line(REPORT_WIDTH))
+    print_dual_result_details(best)
+    print(border_line(REPORT_WIDTH))
+
+
+def dual_candidate_table_lines(
+    results: Sequence[CandidateResult],
+    top: int,
+    title: str,
+) -> list[str]:
+    """Return compact dual-bank ranked result table lines."""
+    ranked = ranked_dual_top_results(results, top)
+    lines = [
+        title,
+        border_line(REPORT_WIDTH),
+        "RK SCORE  IN BAUD MODE  OUT BAUD MODE  SENT   READ  CLR  EXCT LINE RESULT",
+        border_line(REPORT_WIDTH),
+    ]
+    for rank, result in enumerate(ranked, start=1):
+        settings = dual_result_settings(result)
+        indicator = result_indicator(result.score, result.status, result.error)
+        lines.append(
+            f"{rank:>2} "
+            f"{result.score:>5.1f} "
+            f"{settings.input_settings.baud:>7} "
+            f"{settings.input_settings.data_bits}{settings.input_settings.parity_code()}"
+            f"{settings.input_settings.stop_bits:<4} "
+            f"{settings.output_settings.baud:>8} "
+            f"{settings.output_settings.data_bits}{settings.output_settings.parity_code()}"
+            f"{settings.output_settings.stop_bits:<5} "
+            f"{result.bytes_sent:>6} "
+            f"{result.bytes_received:>6} "
+            f"{result.bytes_drained_before:>4} "
+            f"{result.metrics.exact_byte_match_ratio:>4.2f} "
+            f"{result.metrics.line_integrity_ratio:>4.2f} "
+            f"{indicator}"
+        )
+    lines.append(border_line(REPORT_WIDTH))
+    if not ranked:
+        lines.append("NO NON-ZERO RESULTS.")
+    return lines
+
+
+def dual_text_summary_lines(results: Sequence[CandidateResult]) -> list[str]:
+    """Return summary and interpretation lines for a dual-bank report section."""
+    ranked = sorted(results, key=result_sort_key, reverse=True)
+    best = ranked[0] if ranked else None
+    tied = top_tied_results(results)
+    lines = [
+        f"SETTINGS TESTED: {len(results)}",
+        f"RESULT COUNTS:   {result_count_summary(results)}",
+        f"FINDING:         {confidence_summary(best, len(tied))}",
+    ]
+    if best is not None:
+        lines.append(f"BEST PAIR:       {dual_result_settings(best).label()}")
+        lines.append(
+            f"BEST SCORE:      {best.score:.2f} "
+            f"SENT/READ={best.bytes_sent}/{best.bytes_received}"
+        )
+    if len(tied) > 1:
+        lines.append(f"AMBIGUOUS:       {len(tied)} INPUT/OUTPUT PAIRS TIED.")
+    elif is_recommendable_result(best):
+        lines.append("ACTION:          RECORD THIS AS THE LIKELY BANK PAIR.")
+    elif has_any_signal(results):
+        lines.append("ACTION:          PARTIAL RESULT ONLY; REPEAT OR CHECK WIRING.")
+    else:
+        lines.append("ACTION:          NO WORKING INPUT/OUTPUT PAIR FOUND.")
+    return lines
+
+
+def write_dual_bank_text_report(
+    path: Path,
+    metadata: dict[str, Any],
+    phase0: DualBaudLivenessReport,
+    results: Sequence[CandidateResult],
+    validation_results: Sequence[CandidateResult] | None = None,
+) -> None:
+    """Append a compact dual-bank scan report entry."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    validation_results = [] if validation_results is None else list(validation_results)
+    created = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    switch_note = str(metadata.get("switch_note") or "").strip()
+    selected_pairs = ", ".join(
+        f"IN {input_baud}/OUT {output_baud}"
+        for input_baud, output_baud in phase0.selected_pairs
+    )
+    lines = [
+        "",
+        border_line(REPORT_WIDTH),
+        bordered_text("SERIAL PROBE DUAL-BANK REPORT", REPORT_WIDTH),
+        border_line(REPORT_WIDTH),
+        f"APPENDED:        {created}",
+        f"STARTED UTC:     {metadata.get('started_at', '')}",
+        f"COM PATH:        {metadata.get('in_port')} -> BUFFER -> {metadata.get('out_port')}",
+        f"SWITCH NOTE:     {switch_note if switch_note else '(NOT ENTERED)'}",
+        "SCAN MODEL:      DUAL BANK INPUT/OUTPUT SETTINGS",
+        f"PHASE 0 PAIRS:   {len(phase0.alive_pairs)}/{len(phase0.tested_pairs)} ALIVE",
+        f"PHASE 1 PAIRS:   {selected_pairs if selected_pairs else '(NONE)'}",
+        "",
+        "DUAL-BANK SUMMARY:",
+        *dual_text_summary_lines(results),
+        "",
+        *dual_candidate_table_lines(results, int(metadata.get("top", 15)), "DUAL-BANK TOP RESULTS"),
+    ]
+    if validation_results:
+        lines.extend(
+            [
+                "",
+                "DUAL-BANK VALIDATION:",
+                *dual_text_summary_lines(validation_results),
+                "",
+                *dual_candidate_table_lines(
+                    validation_results,
+                    min(int(metadata.get("top", 15)), len(validation_results)),
+                    "DUAL-BANK VALIDATION RESULTS",
+                ),
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "INTERPRETATION NOTES:",
+            "  DUAL-BANK MODE DOES NOT ASSUME SW1 AND SW2 USE THE SAME SETTING.",
+            "  INPUT VALUES ARE FOR THE PC TRANSMIT PORT INTO THE BUFFER.",
+            "  OUTPUT VALUES ARE FOR THE PC RECEIVE PORT FROM THE BUFFER.",
+            "  FLOW CONTROL SHOULD BE VALIDATED AFTER THE FRAME PAIR IS KNOWN.",
+            border_line(REPORT_WIDTH),
+        ]
+    )
+    with path.open("a", encoding="utf-8") as report_file:
+        report_file.write("\n".join(lines) + "\n")
+
+
+def dual_scan_candidate_count(pairs: Sequence[tuple[int, int]]) -> int:
+    """Return total dual-bank frame candidates for selected baud pairs."""
+    frame_count = len(DATA_BITS) * len(PARITIES) * len(STOP_BITS)
+    return len(pairs) * frame_count * frame_count
+
+
 def run_exploratory_scan(
     serial_module: Any,
     options: ScanOptions,
@@ -3772,6 +4595,14 @@ def prompt_phase0_only_sweep() -> bool:
     )
 
 
+def prompt_same_bank_settings() -> bool:
+    """Ask whether both buffer switch banks should be treated as identical."""
+    return prompt_yes_no_question(
+        "Assume both buffer switch banks use the same serial setting?",
+        True,
+    )
+
+
 def print_menu_help() -> None:
     """Print short help for the interactive CLI."""
     print_paged_lines(
@@ -3793,6 +4624,7 @@ def print_menu_help() -> None:
             "",
             "OPERATOR NOTES:",
             "  START SCAN:      FIRST ASKS WHETHER TO RUN ONLY PHASE 0.",
+            "  BANKS:           SAME BANK MODE IS OLD BEHAVIOR; DUAL BANK TESTS PAIRS.",
             "  SCAN TYPE:       FULL OR QUICK AT SCAN START; BLANK=FULL.",
             "  FULL MODE:       MOST RELIABLE FOR SWITCH MAPPING; QUICK MODE ASKS.",
             "  QUICK MODE:      RUNS DISCOVERY AND MAY NARROW PHASE 2.",
@@ -3805,6 +4637,7 @@ def print_menu_help() -> None:
             "  TURBO:           FASTER DISCOVERY TIMING.",
             "  QUICK BAUD FOCUS: QUICK-ONLY SPEED-UP; FULL DOES NOT NEED IT.",
             "  ASK ON MATCH:    PAUSE AFTER PASS; ASK CONTINUE.",
+            "  FLOW VALIDATE:   AFTER BEST FRAME, TEST NONE/XON/RTS/DSR BEHAVIOR.",
             "  CLEAR OUTPUT:    DISCARD OLD BUFFER DATA FIRST.",
             "  MAX CLEAR:       DEFAULT 32768 BYTES.",
             "  TOP ROWS:        BEST RESULTS SHOWN AT END.",
@@ -3916,6 +4749,16 @@ def print_configuration(options: ScanOptions) -> None:
             ),
         )
     )
+    lines.extend(
+        setting_lines(
+            "FLOW VALIDATE:",
+            (
+                "OFF"
+                if not options.auto_validate_flow_control
+                else f"ON, SIZE={options.flow_validate_size_bytes} BYTES"
+            ),
+        )
+    )
     lines.extend(setting_lines("READ WAIT:", f"{options.read_timeout:.2f}S"))
     lines.extend(setting_lines("OPEN PAUSE:", f"{options.settle_ms} MS"))
     lines.extend(
@@ -3974,8 +4817,13 @@ def configure_payload(options: ScanOptions) -> ScanOptions:
         "AUTO VALIDATE TOP MATCHES AFTER SCAN",
         options.auto_validate_top_matches,
     )
+    auto_flow_validate = prompt_yes_no(
+        "AUTO VALIDATE FLOW CONTROL AFTER SCAN",
+        options.auto_validate_flow_control,
+    )
     validate_size_1 = options.validate_size_1_bytes
     validate_size_2 = options.validate_size_2_tie_bytes
+    flow_validate_size = options.flow_validate_size_bytes
     if auto_validate:
         validate_size_1 = prompt_int(
             "VALIDATE SIZE 1 BYTES",
@@ -3990,6 +4838,12 @@ def configure_payload(options: ScanOptions) -> ScanOptions:
         if 0 < validate_size_2 < minimum_payload_size():
             print(f"VALUE {validate_size_2} TOO SMALL. USING {minimum_payload_size()}.")
             validate_size_2 = minimum_payload_size()
+    if auto_flow_validate:
+        flow_validate_size = prompt_int(
+            "FLOW VALIDATE SIZE BYTES",
+            options.flow_validate_size_bytes,
+            minimum=minimum_payload_size(),
+        )
     return dataclasses.replace(
         options,
         payload_bytes=payload_bytes,
@@ -3998,6 +4852,8 @@ def configure_payload(options: ScanOptions) -> ScanOptions:
         auto_validate_top_matches=auto_validate,
         validate_size_1_bytes=validate_size_1,
         validate_size_2_tie_bytes=validate_size_2,
+        auto_validate_flow_control=auto_flow_validate,
+        flow_validate_size_bytes=flow_validate_size,
     )
 
 
@@ -4355,6 +5211,43 @@ def read_until_quiet(
             )
             logger.debug("%s", error)
             break
+
+    return bytes(received), error, time.monotonic() - started
+
+
+def read_for_fixed_window(
+    out_serial: Any,
+    seconds: float,
+    progress_interval: float,
+    prefix: str,
+    logger: logging.Logger,
+) -> tuple[bytes, str | None, float]:
+    """Read any output that arrives during a fixed observation window."""
+    started = time.monotonic()
+    deadline = started + max(seconds, 0.1)
+    next_progress_at = started + max(progress_interval, 0.1)
+    received = bytearray()
+    error: str | None = None
+    console_progress(f"{prefix}: OBSERVE HELD OUTPUT FOR {seconds:.1f}S")
+    while time.monotonic() < deadline:
+        try:
+            waiting = getattr(out_serial, "in_waiting", 0)
+            read_size = min(max(int(waiting), 1), 4096)
+            chunk = out_serial.read(read_size)
+        except Exception as exc:  # pyserial raises driver-specific subclasses.
+            error = str(exc)
+            logger.debug("%s hold observation failed: %s", prefix, error)
+            break
+
+        if chunk:
+            received.extend(chunk)
+
+        now = time.monotonic()
+        if now >= next_progress_at:
+            console_progress(
+                f"{prefix}: HELD OUTPUT SEEN={len(received)} BYTES"
+            )
+            next_progress_at = now + max(progress_interval, 0.1)
 
     return bytes(received), error, time.monotonic() - started
 
@@ -4753,6 +5646,582 @@ def write_memory_text_report(
         report_file.write("\n".join(lines) + "\n")
 
 
+def flow_control_hold_byte_limit(payload_bytes: int) -> int:
+    """Return tolerated in-flight bytes while a flow-control hold is active."""
+    return max(16, min(256, payload_bytes // 100))
+
+
+def flow_validation_indicator(status: str, score: float, error: str | None) -> str:
+    """Return a compact indicator for a flow-control validation status."""
+    if error or status == "error":
+        return "ERROR"
+    if status == "validated":
+        return "PASS"
+    if status in {"transfer-good", "paused-partial-transfer"}:
+        return "GOOD"
+    if status == "transfer-partial":
+        return "PARTIAL"
+    if status == "no-pause":
+        return "FAIL"
+    if score >= 90.0:
+        return "GOOD"
+    if score >= 50.0:
+        return "PARTIAL"
+    return "FAIL"
+
+
+def flow_validation_result_from_candidate(
+    flow_control: str,
+    method: str,
+    result: CandidateResult,
+    payload: ProbePayload,
+) -> FlowControlValidationResult:
+    """Convert a normal transfer candidate result into a flow validation row."""
+    clean = (
+        result.score >= 99.0
+        and result.bytes_sent == payload.byte_count
+        and result.bytes_received == payload.byte_count
+        and result.metrics.missing_bytes == 0
+        and result.metrics.extra_bytes == 0
+    )
+    if result.error:
+        status = "error"
+        reason = result.error
+    elif result.bytes_sent < payload.byte_count:
+        status = "partial-write"
+        reason = "PAYLOAD WAS NOT FULLY SENT."
+    elif clean:
+        status = "validated"
+        reason = "CLEAN TRANSFER WITH THIS FLOW SETTING."
+    elif result.score >= 90.0:
+        status = "transfer-good"
+        reason = "TRANSFER WAS GOOD BUT NOT BYTE-PERFECT."
+    elif result.bytes_received > 0:
+        status = "transfer-partial"
+        reason = "TRANSFER PRODUCED ONLY A PARTIAL MATCH."
+    else:
+        status = "no-data"
+        reason = "NO OUTPUT WAS RECEIVED."
+    return FlowControlValidationResult(
+        flow_control=flow_control,
+        method=method,
+        settings=result.settings,
+        bytes_sent=result.bytes_sent,
+        bytes_received=result.bytes_received,
+        bytes_seen_while_held=0,
+        score=result.score,
+        indicator=flow_validation_indicator(status, result.score, result.error),
+        status=status,
+        reason=reason,
+        error=result.error,
+        elapsed_sec=result.elapsed_sec,
+        metrics=result.metrics,
+    )
+
+
+def apply_flow_control_hold(control_serial: Any, flow_control: str) -> None:
+    """Assert a receive-side hold for one flow-control mode."""
+    if flow_control == "xon/xoff":
+        control_serial.write(b"\x13")
+        control_serial.flush()
+        return
+    if flow_control == "rts/cts":
+        control_serial.rts = False
+        return
+    if flow_control == "dsr/dtr":
+        control_serial.dtr = False
+        return
+    raise ValueError(f"cannot hold flow control mode {flow_control}")
+
+
+def release_flow_control_hold(control_serial: Any, flow_control: str) -> None:
+    """Release a receive-side hold for one flow-control mode."""
+    if flow_control == "xon/xoff":
+        control_serial.write(b"\x11")
+        control_serial.flush()
+        return
+    if flow_control == "rts/cts":
+        control_serial.rts = True
+        return
+    if flow_control == "dsr/dtr":
+        control_serial.dtr = True
+        return
+    raise ValueError(f"cannot release flow control mode {flow_control}")
+
+
+def flow_validation_error_result(
+    flow_control: str,
+    method: str,
+    settings: SerialSettings,
+    payload: ProbePayload,
+    error: str,
+    elapsed_sec: float,
+) -> FlowControlValidationResult:
+    """Return an error row for flow-control validation."""
+    empty_score = score_received(payload.data, b"")
+    return FlowControlValidationResult(
+        flow_control=flow_control,
+        method=method,
+        settings=settings,
+        bytes_sent=0,
+        bytes_received=0,
+        bytes_seen_while_held=0,
+        score=0.0,
+        indicator="ERROR",
+        status="error",
+        reason=error,
+        error=error,
+        elapsed_sec=elapsed_sec,
+        metrics=empty_score.metrics,
+    )
+
+
+def run_flow_control_transfer_validation(
+    serial_module: Any,
+    index: int,
+    total: int,
+    settings: SerialSettings,
+    options: ScanOptions,
+    payload: ProbePayload,
+    logger: logging.Logger,
+) -> FlowControlValidationResult:
+    """Validate a flow mode with a clean large transfer."""
+    validation_options = dataclasses.replace(
+        options,
+        payload_bytes=payload.byte_count,
+        read_timeout=max(options.read_timeout, FLOW_VALIDATE_READ_TIMEOUT),
+        bursts=1,
+        turbo_discovery_enabled=False,
+        ask_on_top_match=False,
+        no_pre_drain=False,
+        pre_drain_timeout=max(options.pre_drain_timeout, 2.0),
+    )
+    result = run_candidate(
+        serial_module=serial_module,
+        index=index,
+        total=total,
+        settings=settings,
+        options=validation_options,
+        payload=payload,
+        logger=logger,
+        progress=console_progress,
+    )
+    return flow_validation_result_from_candidate(
+        settings.flow_control,
+        "large-transfer",
+        result,
+        payload,
+    )
+
+
+def run_flow_control_pause_validation(
+    serial_module: Any,
+    index: int,
+    total: int,
+    settings: SerialSettings,
+    options: ScanOptions,
+    payload: ProbePayload,
+    logger: logging.Logger,
+) -> FlowControlValidationResult:
+    """Validate an output-side pause/release handshake behavior."""
+    started = time.monotonic()
+    flow_control = settings.flow_control
+    method = {
+        "xon/xoff": "xoff-xon-pause",
+        "rts/cts": "rts-hold-release",
+        "dsr/dtr": "dtr-hold-release",
+    }[flow_control]
+    prefix = (
+        f"[FLOW {index:02d}/{total:02d} {settings.baud} "
+        f"{settings.data_bits}{settings.parity_code()}{settings.stop_bits} "
+        f"{flow_control.upper()}]"
+    )
+    control_settings = dataclasses.replace(settings, flow_control="none")
+    read_timeout = max(options.read_timeout, FLOW_VALIDATE_READ_TIMEOUT)
+    hold_applied = False
+    payload_bytes = payload.byte_count
+    empty_score = score_received(payload.data, b"")
+    try:
+        console_progress(border_line(PROGRESS_WIDTH))
+        console_progress(
+            bordered_text(
+                f"FLOW VALIDATION {index}/{total} {flow_control.upper()}",
+                PROGRESS_WIDTH,
+            )
+        )
+        console_progress(border_line(PROGRESS_WIDTH))
+        with open_serial_port(
+            serial_module,
+            options.out_port,
+            control_settings,
+            read_timeout,
+        ) as out_serial:
+            with open_serial_port(
+                serial_module,
+                options.in_port,
+                settings,
+                read_timeout,
+            ) as in_serial:
+                reset_serial_buffers(out_serial)
+                reset_serial_buffers(in_serial)
+                time.sleep(options.settle_ms / 1000.0)
+
+                drain = DrainResult(0, 0.0, True, "disabled", None)
+                if not options.no_pre_drain:
+                    drain = drain_output_until_quiet(
+                        out_serial=out_serial,
+                        quiet_seconds=options.pre_drain_quiet,
+                        max_seconds=max(options.pre_drain_timeout, 2.0),
+                        max_bytes=options.max_drain_bytes,
+                        progress_interval=options.progress_interval,
+                        progress=console_progress,
+                        prefix=prefix,
+                        logger=logger,
+                    )
+                    if not drain.quiet:
+                        error = (
+                            "OUTPUT DID NOT GO QUIET BEFORE FLOW VALIDATION "
+                            f"(REASON={drain.reason.upper()}, "
+                            f"CLEARED={drain.bytes_drained})"
+                        )
+                        if drain.error:
+                            error = f"{error}: {drain.error}"
+                        return FlowControlValidationResult(
+                            flow_control=flow_control,
+                            method=method,
+                            settings=settings,
+                            bytes_sent=0,
+                            bytes_received=0,
+                            bytes_seen_while_held=0,
+                            score=0.0,
+                            indicator="FAIL",
+                            status="stale-output",
+                            reason=error,
+                            error=error,
+                            elapsed_sec=time.monotonic() - started,
+                            metrics=empty_score.metrics,
+                        )
+
+                console_progress(f"{prefix}: ASSERT {flow_control.upper()} HOLD")
+                apply_flow_control_hold(out_serial, flow_control)
+                hold_applied = True
+                time.sleep(FLOW_VALIDATE_RELEASE_SETTLE_SECONDS)
+
+                bytes_sent, write_error, _write_elapsed = write_payload_only(
+                    in_serial=in_serial,
+                    settings=settings,
+                    payload=payload,
+                    progress_interval=options.progress_interval,
+                    prefix=prefix,
+                    logger=logger,
+                )
+                held_bytes, hold_error, _hold_elapsed = read_for_fixed_window(
+                    out_serial=out_serial,
+                    seconds=FLOW_VALIDATE_HOLD_SECONDS,
+                    progress_interval=options.progress_interval,
+                    prefix=prefix,
+                    logger=logger,
+                )
+                console_progress(f"{prefix}: RELEASE {flow_control.upper()} HOLD")
+                release_flow_control_hold(out_serial, flow_control)
+                hold_applied = False
+                time.sleep(FLOW_VALIDATE_RELEASE_SETTLE_SECONDS)
+
+                release_bytes, read_error, _read_elapsed = read_until_quiet(
+                    out_serial=out_serial,
+                    settings=settings,
+                    expected_bytes=payload_bytes,
+                    read_timeout=read_timeout,
+                    progress_interval=options.progress_interval,
+                    prefix=prefix,
+                    logger=logger,
+                )
+    except Exception as exc:
+        logger.exception("flow validation failed for %s", settings.label())
+        return flow_validation_error_result(
+            flow_control=flow_control,
+            method=method,
+            settings=settings,
+            payload=payload,
+            error=str(exc),
+            elapsed_sec=time.monotonic() - started,
+        )
+    finally:
+        if hold_applied:
+            try:
+                release_flow_control_hold(out_serial, flow_control)  # type: ignore[name-defined]
+            except Exception:
+                logger.debug("failed to release %s hold in cleanup", flow_control)
+
+    received_bytes = held_bytes + release_bytes
+    score = score_received(payload.data, received_bytes)
+    error = write_error or hold_error or read_error
+    hold_limit = flow_control_hold_byte_limit(payload_bytes)
+    pause_ok = len(held_bytes) <= hold_limit
+    clean = (
+        score.score >= 99.0
+        and bytes_sent == payload_bytes
+        and len(received_bytes) == payload_bytes
+        and score.metrics.missing_bytes == 0
+        and score.metrics.extra_bytes == 0
+    )
+    if error:
+        status = "error"
+        reason = error
+    elif bytes_sent < payload_bytes:
+        status = "partial-write"
+        reason = "PAYLOAD WAS NOT FULLY SENT."
+    elif not pause_ok:
+        status = "no-pause"
+        reason = (
+            f"OUTPUT DID NOT PAUSE; SAW {len(held_bytes)} BYTES "
+            f"WHILE HELD (LIMIT {hold_limit})."
+        )
+    elif clean:
+        status = "validated"
+        reason = "OUTPUT PAUSED DURING HOLD AND CLEANLY RESUMED."
+    elif not received_bytes:
+        status = "no-data"
+        reason = "NO OUTPUT WAS RECEIVED AFTER RELEASE."
+    elif score.score >= 90.0:
+        status = "paused-partial-transfer"
+        reason = "OUTPUT PAUSED, BUT RESUMED TRANSFER WAS NOT BYTE-PERFECT."
+    else:
+        status = "transfer-partial"
+        reason = "OUTPUT PAUSED, BUT RESUMED TRANSFER WAS A POOR MATCH."
+
+    return FlowControlValidationResult(
+        flow_control=flow_control,
+        method=method,
+        settings=settings,
+        bytes_sent=bytes_sent,
+        bytes_received=len(received_bytes),
+        bytes_seen_while_held=len(held_bytes),
+        score=score.score,
+        indicator=flow_validation_indicator(status, score.score, error),
+        status=status,
+        reason=reason,
+        error=error,
+        elapsed_sec=time.monotonic() - started,
+        metrics=score.metrics,
+    )
+
+
+def select_flow_validation_frame(
+    results: Sequence[CandidateResult],
+    validation_results: Sequence[CandidateResult],
+) -> SerialSettings | None:
+    """Return the best baud/data/parity/stop frame for flow validation."""
+    sources = [list(validation_results), list(results)]
+    for source in sources:
+        for result in sorted(source, key=result_sort_key, reverse=True):
+            if is_recommendable_result(result):
+                return SerialSettings(
+                    baud=result.settings.baud,
+                    data_bits=result.settings.data_bits,
+                    parity=result.settings.parity,
+                    stop_bits=result.settings.stop_bits,
+                    flow_control="none",
+                )
+    return None
+
+
+def flow_validation_settings_for_frame(frame: SerialSettings) -> list[SerialSettings]:
+    """Return all flow-control settings for one proven serial frame."""
+    return [
+        dataclasses.replace(frame, flow_control=flow_control)
+        for flow_control in FLOW_CONTROLS
+    ]
+
+
+def format_flow_validation_progress(
+    result: FlowControlValidationResult,
+    index: int,
+    total: int,
+) -> str:
+    """Return one console line for a flow-control validation result."""
+    return (
+        f"FLOW [{index:02d}/{total:02d}] {result.indicator:<7} "
+        f"{result.settings.label():32s} "
+        f"SENT={result.bytes_sent:6d} READ={result.bytes_received:6d} "
+        f"HELD={result.bytes_seen_while_held:5d} "
+        f"SCORE={result.score:6.2f} {result.reason}"
+    )
+
+
+def flow_control_validation_recommendation(
+    results: Sequence[FlowControlValidationResult],
+) -> str:
+    """Return a concise flow-control validation conclusion."""
+    proven = [result for result in results if result.status == "validated"]
+    proven_handshake = [
+        result for result in proven if result.flow_control != "none"
+    ]
+    if len(proven_handshake) == 1:
+        return f"PROVEN HANDSHAKE: {flow_control_name(proven_handshake[0].flow_control)}."
+    if len(proven_handshake) > 1:
+        flows = ", ".join(flow_control_name(result.flow_control) for result in proven_handshake)
+        return f"MULTIPLE HANDSHAKES VALIDATED: {flows}."
+    if any(result.flow_control == "none" for result in proven):
+        return "CLEAN TRANSFER WITHOUT HANDSHAKE; NO HANDSHAKE MODE PROVEN."
+    if results:
+        return "NO FLOW CONTROL MODE VALIDATED."
+    return "FLOW CONTROL VALIDATION WAS NOT RUN."
+
+
+def flow_validation_report_lines(
+    results: Sequence[FlowControlValidationResult],
+) -> list[str]:
+    """Return compact flow-control validation lines for the text report."""
+    lines = [
+        "FLOW CONTROL VALIDATION:",
+        f"FINDING:         {flow_control_validation_recommendation(results)}",
+        "",
+        "FLOW     RESULT  SCORE   SENT   READ  HELD METHOD             REASON",
+        border_line(REPORT_WIDTH),
+    ]
+    for result in results:
+        lines.append(
+            f"{result.flow_control.upper():<8} "
+            f"{result.indicator:<7} "
+            f"{result.score:>5.1f} "
+            f"{result.bytes_sent:>6} "
+            f"{result.bytes_received:>6} "
+            f"{result.bytes_seen_while_held:>5} "
+            f"{result.method:<18} "
+            f"{result.reason[:28]}"
+        )
+    lines.append(border_line(REPORT_WIDTH))
+    return lines
+
+
+def print_flow_control_validation_report(
+    frame: SerialSettings,
+    results: Sequence[FlowControlValidationResult],
+) -> None:
+    """Print the final flow-control validation report."""
+    print()
+    print_report_title("FLOW CONTROL VALIDATION RESULTS")
+    print(f"  FRAME SETTING:        {frame.baud} {frame.data_bits}{frame.parity_code()}{frame.stop_bits}")
+    print(f"  TEST BYTES:           {max((result.bytes_sent for result in results), default=0)}")
+    print_wrapped_value(
+        "  FINDING:              ",
+        flow_control_validation_recommendation(results),
+    )
+    print(border_line(REPORT_WIDTH))
+    print("FLOW     RESULT  SCORE   SENT   READ  HELD METHOD             REASON")
+    print(border_line(REPORT_WIDTH))
+    for result in results:
+        print(
+            f"{result.flow_control.upper():<8} "
+            f"{result.indicator:<7} "
+            f"{result.score:>5.1f} "
+            f"{result.bytes_sent:>6} "
+            f"{result.bytes_received:>6} "
+            f"{result.bytes_seen_while_held:>5} "
+            f"{result.method:<18} "
+            f"{result.reason[:28]}"
+        )
+    print(border_line(REPORT_WIDTH))
+
+
+def run_flow_control_validation(
+    serial_module: Any,
+    options: ScanOptions,
+    results: Sequence[CandidateResult],
+    validation_results: Sequence[CandidateResult],
+    logger: logging.Logger,
+) -> tuple[list[FlowControlValidationResult], str | None]:
+    """Run post-scan validation for all flow-control modes on the best frame."""
+    frame = select_flow_validation_frame(results, validation_results)
+    if frame is None:
+        print()
+        print_report_title("FLOW CONTROL VALIDATION")
+        print("SKIPPED: NO RECOMMENDABLE FRAME SETTING WAS FOUND.")
+        print(border_line(REPORT_WIDTH))
+        logger.info("flow control validation skipped: no recommendable frame")
+        return [], None
+
+    payload = generate_payload(options.flow_validate_size_bytes)
+    settings_list = flow_validation_settings_for_frame(frame)
+    print()
+    print_report_title("FLOW CONTROL VALIDATION")
+    print(f"FRAME: {frame.baud} {frame.data_bits}{frame.parity_code()}{frame.stop_bits}.")
+    print(f"TEST: {payload.byte_count} BYTES; HANDSHAKE MODES USE HOLD/RELEASE.")
+    print("DISCOVERY PAYLOAD STAYS NEUTRAL; THIS PHASE TESTS HANDSHAKE BEHAVIOR.")
+    print(border_line(REPORT_WIDTH))
+    logger.info(
+        "flow control validation started frame=%s payload=%s",
+        frame.label(),
+        payload.byte_count,
+    )
+
+    flow_results: list[FlowControlValidationResult] = []
+    for index, settings in enumerate(settings_list, start=1):
+        while True:
+            try:
+                if settings.flow_control == "none":
+                    result = run_flow_control_transfer_validation(
+                        serial_module=serial_module,
+                        index=index,
+                        total=len(settings_list),
+                        settings=settings,
+                        options=options,
+                        payload=payload,
+                        logger=logger,
+                    )
+                else:
+                    result = run_flow_control_pause_validation(
+                        serial_module=serial_module,
+                        index=index,
+                        total=len(settings_list),
+                        settings=settings,
+                        options=options,
+                        payload=payload,
+                        logger=logger,
+                    )
+            except KeyboardInterrupt:
+                action = prompt_operator_break_action("FLOW VALIDATION")
+                if action == "resume":
+                    logger.info(
+                        "operator resumed flow validation at %s/%s %s",
+                        index,
+                        len(settings_list),
+                        settings.label(),
+                    )
+                    continue
+                logger.info(
+                    "operator break during flow validation; action=%s completed=%s/%s",
+                    action,
+                    len(flow_results),
+                    len(settings_list),
+                )
+                print_flow_control_validation_report(frame, flow_results)
+                return flow_results, action
+            flow_results.append(result)
+            print(format_flow_validation_progress(result, index, len(settings_list)))
+            logger.info(
+                "flow validation %s: indicator=%s status=%s score=%.2f sent=%s read=%s held=%s reason=%s error=%s",
+                settings.flow_control,
+                result.indicator,
+                result.status,
+                result.score,
+                result.bytes_sent,
+                result.bytes_received,
+                result.bytes_seen_while_held,
+                result.reason,
+                result.error,
+            )
+            break
+
+    print_flow_control_validation_report(frame, flow_results)
+    logger.info(
+        "flow control validation completed: %s",
+        flow_control_validation_recommendation(flow_results),
+    )
+    return flow_results, None
+
+
 def run_memory_test(options: ScanOptions) -> None:
     """Prompt for and run a memory transfer test."""
     try:
@@ -4916,6 +6385,335 @@ def prompt_after_scan_action(title: str = "RUN COMPLETE") -> str:
         print("ENTER 1, 2, OR 0.")
 
 
+def run_dual_bank_validation(
+    serial_module: Any,
+    options: ScanOptions,
+    shortlist: Sequence[CandidateResult],
+    logger: logging.Logger,
+) -> tuple[list[CandidateResult], str | None]:
+    """Run a larger validation payload for top dual-bank candidates."""
+    if not shortlist:
+        return [], None
+    print()
+    print_report_title("DUAL BANK VALIDATION")
+    print(
+        f"SHORTLIST: {len(shortlist)} TOP-SCORE PAIR(S) "
+        f"AT {options.validate_size_1_bytes} BYTES."
+    )
+    print(border_line(REPORT_WIDTH))
+    validation_options = dataclasses.replace(
+        options,
+        turbo_discovery_enabled=False,
+        payload_bytes=options.validate_size_1_bytes,
+        bursts=1,
+        ask_on_top_match=False,
+    )
+    validation_payload = generate_payload(options.validate_size_1_bytes)
+    validation_results: list[CandidateResult] = []
+    index = 0
+    while index < len(shortlist):
+        candidate = shortlist[index]
+        settings = dual_result_settings(candidate)
+        display_index = index + 1
+        print(
+            f"DUAL VALIDATION: {validation_payload.byte_count} BYTES "
+            f"{display_index}/{len(shortlist)} {settings.label()}"
+        )
+        try:
+            result = run_dual_candidate(
+                serial_module=serial_module,
+                index=display_index,
+                total=len(shortlist),
+                settings=settings,
+                options=validation_options,
+                payload=validation_payload,
+                logger=logger,
+                progress=console_progress,
+            )
+        except KeyboardInterrupt:
+            action = prompt_operator_break_action("DUAL VALIDATION")
+            if action == "resume":
+                logger.info(
+                    "operator resumed dual validation at %s/%s %s",
+                    display_index,
+                    len(shortlist),
+                    settings.label(),
+                )
+                continue
+            logger.info(
+                "operator break during dual validation; action=%s completed=%s/%s",
+                action,
+                len(validation_results),
+                len(shortlist),
+            )
+            return validation_results, action
+        validation_results.append(result)
+        print(format_dual_progress(result), flush=True)
+        index += 1
+    print_dual_ranked_table(
+        validation_results,
+        min(options.top, len(validation_results)),
+        report_title="DUAL BANK VALIDATION REPORT",
+    )
+    return validation_results, None
+
+
+def run_dual_bank_scan(
+    serial_module: Any,
+    options: ScanOptions,
+    logger: logging.Logger,
+    phase0_only: bool = False,
+) -> int:
+    """Run a dual-bank scan where input and output settings may differ."""
+    if not phase0_only:
+        turbo_enabled = prompt_yes_no_question(
+            "Turbo discovery mode?",
+            options.turbo_discovery_enabled,
+        )
+        switch_note = prompt_text(
+            "Switch/jumper note for report",
+            options.switch_note,
+        )
+        options = dataclasses.replace(
+            options,
+            turbo_discovery_enabled=turbo_enabled,
+            switch_note=switch_note,
+        )
+    logger.info("dual-bank scan started phase0_only=%s", phase0_only)
+    logger.info("options: %s", options)
+
+    phase0_report = run_dual_phase0_baud_matrix(
+        serial_module=serial_module,
+        options=options,
+        logger=logger,
+    )
+    if phase0_only:
+        print()
+        print_report_title("DUAL PHASE 0 COMPLETE")
+        print("FULL DUAL-BANK SCAN WAS NOT RUN.")
+        print_wrapped_value("  DEBUG LOG:   ", options.log_file)
+        print(border_line(REPORT_WIDTH))
+        return 0
+
+    selected_pairs = phase0_report.selected_pairs
+    if not selected_pairs:
+        print()
+        print_report_title("DUAL BANK SCAN SKIPPED")
+        print("NO BAUD PAIRS WERE GOOD ENOUGH TO EXPAND INTO FRAME TESTING.")
+        print(border_line(REPORT_WIDTH))
+        return 1
+
+    candidates: list[DualSerialSettings] = []
+    for input_baud, output_baud in selected_pairs:
+        candidates.extend(dual_frame_candidates_for_pair(input_baud, output_baud))
+    payload = generate_payload(options.payload_bytes)
+    scan_started = time.monotonic()
+    started_at = dt.datetime.now(dt.timezone.utc).isoformat()
+
+    print()
+    print_report_title("DUAL BANK SCAN START")
+    print("MODEL: SW1/SW2 MAY CONTROL DIFFERENT BUFFER PORTS.")
+    print("INPUT SIDE:  PC TRANSMIT PORT INTO BUFFER.")
+    print("OUTPUT SIDE: PC RECEIVE PORT FROM BUFFER.")
+    print_wrapped_value(
+        "BAUD PAIRS: ",
+        ", ".join(
+            f"IN {input_baud}/OUT {output_baud}"
+            for input_baud, output_baud in selected_pairs
+        ),
+    )
+    print(f"SETTINGS: {len(candidates)} INPUT/OUTPUT FRAME PAIRS.")
+    print(
+        f"PORTS: {options.in_port} -> BUFFER -> {options.out_port}; "
+        f"TEST={payload.byte_count} BYTES X {options.bursts}"
+    )
+    print("FLOW CONTROL: NONE DURING DUAL FRAME DISCOVERY.")
+    if options.auto_validate_top_matches:
+        print(f"VALIDATION: ON; SIZE1={options.validate_size_1_bytes} BYTES.")
+    else:
+        print("VALIDATION: OFF.")
+    if options.auto_validate_flow_control:
+        print("FLOW VALIDATION: DEFERRED; DUAL MODE FIRST FINDS THE FRAME PAIR.")
+    print_progress_legend()
+    print(f"REPORT: {options.text_report} (APPEND)")
+    print(f"DEBUG LOG: {options.log_file}")
+    rough_total = 0.0
+    for candidate in candidates:
+        timing = effective_discovery_timing(
+            options,
+            candidate.input_settings,
+            options.payload_bytes,
+        )
+        rough_total += estimated_transmit_seconds(
+            candidate.input_settings,
+            options.payload_bytes,
+        ) * options.bursts
+        per_burst_wait = timing.read_timeout + (timing.settle_ms / 1000.0)
+        if not options.no_pre_drain:
+            per_burst_wait += timing.pre_drain_quiet
+        rough_total += per_burst_wait * options.bursts
+    print(
+        f"START EST.: {format_duration(rough_total)}; "
+        f"FINISH ABOUT {format_finish_clock(rough_total)}"
+    )
+
+    results: list[CandidateResult] = []
+    early_stopped = False
+    operator_break_action: str | None = None
+    operator_break_stage: str | None = None
+    index = 0
+    while index < len(candidates):
+        settings = candidates[index]
+        display_index = index + 1
+        try:
+            result = run_dual_candidate(
+                serial_module=serial_module,
+                index=display_index,
+                total=len(candidates),
+                settings=settings,
+                options=options,
+                payload=payload,
+                logger=logger,
+                progress=console_progress,
+            )
+        except KeyboardInterrupt:
+            action = prompt_operator_break_action("DUAL SCAN")
+            if action == "resume":
+                logger.info(
+                    "operator resumed dual scan at %s/%s %s",
+                    display_index,
+                    len(candidates),
+                    settings.label(),
+                )
+                continue
+            operator_break_action = action
+            operator_break_stage = "DUAL SCAN"
+            early_stopped = True
+            logger.info(
+                "operator break during dual scan; action=%s completed=%s/%s",
+                action,
+                len(results),
+                len(candidates),
+            )
+            break
+        results.append(result)
+        print(format_dual_progress(result), flush=True)
+        print(format_scan_eta(len(results), len(candidates), scan_started), flush=True)
+        if options.ask_on_top_match and is_top_match_result(result):
+            print()
+            print_report_title("DUAL TOP MATCH FOUND")
+            print_dual_result_details(result)
+            print("    CONTINUE TO LOOK FOR POSSIBLE TIES.")
+            print("    ENTER N TO END NOW AND WRITE REPORT.")
+            print(border_line(REPORT_WIDTH))
+            if not prompt_yes_no("CONTINUE DUAL SCAN", True):
+                early_stopped = True
+                operator_break_stage = "DUAL SCAN"
+                logger.info(
+                    "operator ended dual scan after top match: %s",
+                    settings.label(),
+                )
+                break
+        index += 1
+
+    elapsed_sec = time.monotonic() - scan_started
+    completed_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    metadata: dict[str, Any] = {
+        "tool": "serial_probe",
+        "mode": "dual-bank-scan",
+        "started_at": started_at,
+        "completed_at": completed_at,
+        "elapsed_sec": elapsed_sec,
+        "python": sys.version,
+        "platform": platform.platform(),
+        "in_port": options.in_port,
+        "out_port": options.out_port,
+        "switch_note": options.switch_note,
+        "top": options.top,
+        "options": dataclass_to_jsonable(options),
+        "phase0_dual_baud_liveness": dataclass_to_jsonable(phase0_report),
+        "completed_candidates": len(results),
+        "candidate_count": len(candidates),
+        "early_stopped": early_stopped,
+        "operator_break_action": operator_break_action,
+        "operator_break_stage": operator_break_stage,
+        "recommendation_status": scan_recommendation_status(results),
+    }
+    ranked_results = sorted(results, key=result_sort_key, reverse=True)
+    best_result = ranked_results[0] if ranked_results else None
+    tied_results = top_tied_results(results)
+    metadata["recommended_setting"] = (
+        dataclass_to_jsonable(best_result.settings)
+        if is_recommendable_result(best_result) and len(tied_results) <= 1
+        else None
+    )
+    metadata["tied_top_settings"] = [
+        dataclass_to_jsonable(result.settings) for result in tied_results
+    ]
+
+    print()
+    print_report_title("DUAL BANK RESULTS")
+    print("INPUT/OUTPUT FRAME PAIR RANKING AND SUMMARY.")
+    print_dual_ranked_table(results, options.top)
+    print_dual_scan_summary(
+        results=results,
+        total_candidates=len(candidates),
+        elapsed_sec=elapsed_sec,
+        early_stopped=early_stopped,
+        top=options.top,
+    )
+
+    validation_results: list[CandidateResult] = []
+    if (
+        options.auto_validate_top_matches
+        and results
+        and operator_break_action is None
+    ):
+        ranked = ranked_dual_top_results(results, options.top)
+        top_score = ranked[0].score if ranked else 0.0
+        shortlist = [
+            result for result in ranked if abs(result.score - top_score) <= 0.0001
+        ]
+        validation_results, validation_break_action = run_dual_bank_validation(
+            serial_module=serial_module,
+            options=options,
+            shortlist=shortlist,
+            logger=logger,
+        )
+        if validation_break_action is not None:
+            operator_break_action = validation_break_action
+            operator_break_stage = "DUAL VALIDATION"
+            metadata["operator_break_action"] = operator_break_action
+            metadata["operator_break_stage"] = operator_break_stage
+    if options.auto_validate_flow_control:
+        print()
+        print_report_title("DUAL FLOW CONTROL NOTE")
+        print("FLOW CONTROL IS NOT MIXED INTO DUAL FRAME DISCOVERY.")
+        print("AFTER THE FRAME PAIR IS KNOWN, USE MEMORY TEST OR A DEDICATED")
+        print("OUTPUT-SIDE HANDSHAKE TEST FOR THE RECOMMENDED PAIR.")
+        print(border_line(REPORT_WIDTH))
+
+    write_dual_bank_text_report(
+        options.text_report,
+        metadata,
+        phase0_report,
+        results,
+        validation_results=validation_results,
+    )
+    print()
+    print_report_title("REPORT FILES")
+    print_wrapped_value("  TEXT REPORT: ", f"{options.text_report} (APPENDED)")
+    print_wrapped_value("  DEBUG LOG:   ", options.log_file)
+    print(border_line(REPORT_WIDTH))
+    if operator_break_action == "menu":
+        raise ReturnToMainMenuAfterReport()
+    if operator_break_action == "quit":
+        raise QuitProgramAfterReport()
+    if operator_break_action is not None:
+        return OPERATOR_BREAK_EXIT_CODE
+    return 0
+
+
 def metadata_for_scan(
     options: ScanOptions,
     pyserial_version: str,
@@ -4956,13 +6754,28 @@ def metadata_for_scan(
 def run_scan(options: ScanOptions) -> int:
     """Run the serial probe scan and write reports."""
     phase0_only = prompt_phase0_only_sweep()
+    same_bank_settings = prompt_same_bank_settings()
     serial_module = import_or_install_pyserial()
     logger = setup_logging(options.log_file)
     pyserial_version = str(getattr(serial_module, "VERSION", "unknown"))
     logger.info("serial_probe started")
 
     if phase0_only:
-        return run_phase0_only_sweep(
+        if same_bank_settings:
+            return run_phase0_only_sweep(
+                serial_module=serial_module,
+                options=options,
+                logger=logger,
+            )
+        return run_dual_bank_scan(
+            serial_module=serial_module,
+            options=options,
+            logger=logger,
+            phase0_only=True,
+        )
+
+    if not same_bank_settings:
+        return run_dual_bank_scan(
             serial_module=serial_module,
             options=options,
             logger=logger,
@@ -5150,6 +6963,13 @@ def run_scan(options: ScanOptions) -> int:
         )
     else:
         print("STAGE 2 VALIDATION: OFF.")
+    if options.auto_validate_flow_control:
+        print(
+            "FLOW VALIDATION: ON; "
+            f"SIZE={options.flow_validate_size_bytes} BYTES AFTER BEST FRAME."
+        )
+    else:
+        print("FLOW VALIDATION: OFF.")
     print(f"EFFECTIVE TIMING: {effective_timing_range_label(options, candidates)}.")
     print(f"SCREEN UPDATE: {options.progress_interval:.1f}S WHILE SETTING RUNS.")
     print_progress_legend()
@@ -5464,16 +7284,42 @@ def run_scan(options: ScanOptions) -> int:
                 report_title="PHASE 2 FINAL REPORT",
             )
             validation_results = list(final_stage2_results)
+    flow_validation_results: list[FlowControlValidationResult] = []
+    if (
+        options.auto_validate_flow_control
+        and results
+        and operator_break_action is None
+    ):
+        flow_validation_results, flow_break_action = run_flow_control_validation(
+            serial_module=serial_module,
+            options=options,
+            results=results,
+            validation_results=validation_results,
+            logger=logger,
+        )
+        if flow_break_action is not None:
+            operator_break_action = flow_break_action
+            operator_break_stage = "FLOW VALIDATION"
+    metadata["flow_control_validation"] = {
+        "enabled": options.auto_validate_flow_control,
+        "ran": bool(flow_validation_results),
+        "payload_bytes": options.flow_validate_size_bytes,
+        "recommendation": flow_control_validation_recommendation(
+            flow_validation_results
+        ),
+        "results": dataclass_to_jsonable(flow_validation_results),
+    }
     if operator_break_action is not None:
         metadata["operator_break_action"] = operator_break_action
         metadata["operator_break_stage"] = operator_break_stage
-        if operator_break_stage == "VALIDATION":
+        if operator_break_stage in {"VALIDATION", "FLOW VALIDATION"}:
             metadata["early_stop_reason"] = f"operator-break-{operator_break_action}"
     write_text_report(
         options.text_report,
         metadata,
         results,
         validation_results=validation_results,
+        flow_validation_results=flow_validation_results,
     )
     print()
     print_report_title("REPORT FILES")
