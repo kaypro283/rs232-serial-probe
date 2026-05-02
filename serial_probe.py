@@ -78,7 +78,7 @@ PHASE0_MIN_LINE_INTEGRITY = 1.0
 PHASE0_MAX_EXTRA_BYTES = 16
 PHASE0_MAX_EXTRA_BYTES_RATIO = 0.25
 PHASE0_BASELINE_DATA_BITS = 8
-PHASE0_BASELINE_PARITY = "mark"
+PHASE0_BASELINE_PARITY = "none"
 PHASE0_BASELINE_STOP_BITS = 1
 PHASE0_BASELINE_FLOW_CONTROL = "none"
 DUAL_PHASE0_BAUD_PAIR_LIMIT = 6
@@ -2853,7 +2853,7 @@ def phase0_fixed_settings_label() -> str:
     """Return a compact description of fixed Phase 0 liveness settings."""
     return (
         f"{phase0_payload_bytes()} BYTES X {PHASE0_BURSTS}, "
-        "8M1 FLOW=NONE, "
+        "8N1 FLOW=NONE, "
         f"READ={PHASE0_READ_TIMEOUT:.2f}S, "
         f"PAUSE={PHASE0_SETTLE_MS}MS, "
         f"CLEAR={PHASE0_PRE_DRAIN_TIMEOUT:.2f}S/"
@@ -3309,7 +3309,7 @@ def print_phase0_start(
     """Print the Phase 0 liveness sweep start banner."""
     print()
     print_report_title("PHASE 0 BAUD LIVENESS SWEEP")
-    print("MODE: FIXED 8M1 FLOW=NONE; BAUD GATE FOR QUICK EXPLORATORY.")
+    print("MODE: FIXED 8N1 FLOW=NONE; BAUD GATE FOR QUICK EXPLORATORY.")
     print(
         f"PORTS: {options.in_port} -> {options.out_port}; "
         f"TEST={payload.byte_count} BYTES X {phase0_options.bursts}"
@@ -3620,7 +3620,7 @@ def run_phase0_baud_liveness(
     candidates: Sequence[SerialSettings],
     logger: logging.Logger,
 ) -> BaudLivenessReport:
-    """Run the fixed 8M1 baud liveness sweep used before quick mode."""
+    """Run the fixed 8N1 baud liveness sweep used before quick mode."""
     phase0_options = phase0_scan_options(options)
     phase0_payload = generate_phase0_payload(phase0_options.payload_bytes)
     baud_order, _ = group_candidates_by_baud(candidates)
@@ -3921,7 +3921,7 @@ def run_dual_phase0_baud_matrix(
         f"PORTS: IN {options.in_port} -> BUFFER -> OUT {options.out_port}; "
         f"TEST={phase0_payload.byte_count} BYTES X {phase0_options.bursts}"
     )
-    print("FIXED FRAME: 8M1 FLOW=NONE ON BOTH SIDES.")
+    print("FIXED FRAME: 8N1 FLOW=NONE ON BOTH SIDES.")
     print(f"BAUD PAIRS: {len(pairs)}.")
     print(border_line(REPORT_WIDTH))
     logger.info("dual phase 0 baud matrix started pairs=%s", len(pairs))
@@ -4633,7 +4633,7 @@ def print_menu_help() -> None:
             "  TEST SIZE:       BYTES SENT FOR EACH SETTING.",
             "  TEST COUNT:      NUMBER OF TRIES PER SETTING.",
             "  DISCOVERY:       QUICK=YES; FULL ASKS; FIXED INTERNAL SETTINGS.",
-            "  PHASE 0:         QUICK TESTS EACH BAUD AT 8M1 FLOW=NONE.",
+            "  PHASE 0:         QUICK TESTS EACH BAUD AT 8N1 FLOW=NONE.",
             "  TURBO:           FASTER DISCOVERY TIMING.",
             "  QUICK BAUD FOCUS: QUICK-ONLY SPEED-UP; FULL DOES NOT NEED IT.",
             "  ASK ON MATCH:    PAUSE AFTER PASS; ASK CONTINUE.",
