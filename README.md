@@ -25,7 +25,7 @@ Usage screen:
 python serial_probe.py --help
 ```
 
-The first screen is the command menu. Use `S CURRENT SETTINGS` to view ports, baud range, test message size, repeat count, timing, old-output clearing, Phase 0 liveness settings, report files, and available test workflows. `1 START SCAN` opens the discovery workflow menu. `8 MEMORY TEST 16K` runs the fixed-frame memory test.
+The first screen is the command menu. Use `S CURRENT SETTINGS` to view ports, baud range, test message size, repeat count, timing, old-output clearing, Phase 0 liveness settings, report files, and available test workflows. `1 START SCAN` opens the discovery workflow menu. `8 MEMORY TEST` runs the fixed-frame memory test.
 
 The terminal UI is written for an 80-column by 25-line early terminal style. Long operator screens pause with `PRESS ENTER FOR MORE, Q TO STOP:`. Screens use terse uppercase operator text and bright green text when the console supports ANSI color. PyCharm runs are treated as color-capable. Set `NO_COLOR=1` before running if you want plain console text.
 
@@ -43,9 +43,9 @@ After a scan finishes or is interrupted by the operator, the program stays in th
 
 During a running scan or validation pass, press `Ctrl+C` for the `OPERATOR BREAK` menu. The menu can resume the same test, end the test and write a partial report, return to the main menu after writing the report, or quit after writing the report.
 
-## 16K Memory Test
+## Memory Test
 
-Select `8 MEMORY TEST 16K` from the main menu to send a checked ASCII printer-style stream through the buffer and compare the output byte for byte.
+Select `8 MEMORY TEST` from the main menu to send a checked ASCII printer-style stream through the buffer and compare the output byte for byte.
 
 The memory test is deliberately separate from scan discovery:
 
@@ -54,21 +54,21 @@ The memory test is deliberately separate from scan discovery:
 - User-selected input baud and output baud from the supported baud table.
 - Append-only result block in the normal text report.
 - Result fields separate exact stream return, returned-data integrity, capacity behavior, and RAM suspicion.
-- In `FILL 16K` mode, dropped excess bytes can be a useful `BUFFER FULL OBSERVED` result rather than a generic failure.
+- In `FILL` mode, dropped excess bytes can be a useful `BUFFER FULL OBSERVED` result rather than a generic failure.
 
-The size menu has three modes:
+The memory test first asks for a target size. Presets cover 16K, 32K, 48K, and 64K, and the custom choice accepts a K-sized target. The size menu then uses that target:
 
 ```text
-1 16K IMAGE   SEND 16384 ASCII BYTES
-2 FILL 16K    SEND ENOUGH ASCII TO APPROACH 16K WHILE OUTPUT DRAINS
+1 64K IMAGE   SEND 65536 ASCII BYTES
+2 FILL 64K    SEND ENOUGH ASCII TO APPROACH 64K WHILE OUTPUT DRAINS
 3 CUSTOM      SEND OPERATOR BYTE COUNT
 ```
 
-`FILL 16K` is available only when input baud is faster than output baud. If input and output are the same speed, or output is faster, the buffer may pass data through without filling the 16K RAM. The program shows the estimated peak buffer use before it starts.
+`FILL` is available only when input baud is faster than output baud. If input and output are the same speed, or output is faster, the buffer may pass data through without filling RAM. The program shows the estimated peak buffer use before it starts.
 
 `CUSTOM` is useful after an overflow-like result: lower the payload and rerun to bracket the largest clean near-fill transfer without forcing another overflow-stress run.
 
-At low output baud rates this test can take a long time. A full 16K stream at `300` baud with `8E1` framing takes about ten minutes to drain, before any safety margin.
+At low output baud rates this test can take a long time. A full 64K stream at `300` baud with `8E1` framing takes more than 35 minutes to drain, before any safety margin.
 
 Interpretation is part of the memory-test report:
 
@@ -138,7 +138,7 @@ The default menu settings are tuned for a practical scan:
 - Output wait after send is `2.0` seconds by default.
 - `Ask on top match` is off by default. If enabled, a `PASS` result pauses the scan and asks whether to continue looking for possible ties.
 - `Auto validate top matches after scan` is on by default. It retests the top-score setting or settings with an 8K payload. The menu can turn this off or change the size.
-- Old-output clearing stops after `32768` bytes by default, which is enough for a 16K buffer plus margin.
+- Old-output clearing stops after `131072` bytes by default, which is enough for a 64K buffer plus margin.
 - No early stop.
 
 Three repeated tests are not required for the first scan. One test is enough to rank settings. If you want more certainty afterward, rerun with a larger test message or more tests around the suspected setting range.
@@ -236,4 +236,4 @@ Stale data:
 - Clear/reset the physical buffer.
 - Let it finish dumping old data.
 - Increase the old-output clearing time from the menu if you want the tool to wait longer before marking a setting `STALE`.
-- For a 16K buffer, the default max clear value of `32768` bytes should usually be enough. If more than that keeps arriving, the output is probably repeating, noisy, or not really stale buffer contents.
+- For a 64K buffer, the default max clear value of `131072` bytes should usually be enough. If more than that keeps arriving, the output is probably repeating, noisy, or not really stale buffer contents.

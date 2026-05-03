@@ -42,6 +42,7 @@ DATA_BITS: list[int] = [8, 7]
 PARITIES: list[str] = ["none", "even", "odd", "mark", "space"]
 STOP_BITS: list[int] = [1, 2]
 FLOW_CONTROLS: list[str] = ["none", "xon/xoff", "rts/cts", "dsr/dtr"]
+KIB_BYTES = 1024
 DEFAULT_BURSTS = 1
 DEFAULT_PAYLOAD_BYTES = 384
 DEFAULT_READ_TIMEOUT = 2.0
@@ -49,15 +50,18 @@ DEFAULT_SETTLE_MS = 50
 DEFAULT_PROGRESS_INTERVAL = 1.0
 DEFAULT_PRE_DRAIN_TIMEOUT = 0.5
 DEFAULT_PRE_DRAIN_QUIET = 0.1
-DEFAULT_MAX_DRAIN_BYTES = 32_768
+DEFAULT_MAX_DRAIN_BYTES = 128 * KIB_BYTES
 DEFAULT_EIGHT_BIT_PAYLOAD_BYTES = 512
 TURBO_DISCOVERY_ENABLED_DEFAULT = False
 BUFFER_PURGE_ENABLED = True
-BUFFER_PURGE_CAPACITY_BYTES = 16 * 1024
+BUFFER_PURGE_CAPACITY_BYTES = 64 * KIB_BYTES
 BUFFER_PURGE_QUIET_SECONDS = 1.5
 BUFFER_PURGE_PER_BAUD_MAX_SECONDS = 2.5
 BUFFER_PURGE_PROGRESS_INTERVAL = 1.0
 MEMORY_TEST_TARGET_BYTES = BUFFER_PURGE_CAPACITY_BYTES
+MEMORY_TEST_TARGET_KIB_PRESETS: tuple[int, ...] = (16, 32, 48, 64)
+MEMORY_TEST_MAX_TARGET_KIB = max(MEMORY_TEST_TARGET_KIB_PRESETS)
+MEMORY_TEST_MAX_PAYLOAD_FACTOR = 8
 MEMORY_TEST_READ_QUIET_SECONDS = 2.0
 MEMORY_TEST_PRE_DRAIN_TIMEOUT = 2.5
 MEMORY_TEST_MODE_IMAGE = "image"
@@ -438,7 +442,7 @@ class MenuSelection:
 
 @dataclass(frozen=True)
 class MemoryTestConfig:
-    """Operator-selected settings for the 16K memory test."""
+    """Operator-selected settings for one memory test."""
 
     in_port: str
     out_port: str
@@ -467,7 +471,7 @@ class MemoryTestResult:
 
 @dataclass(frozen=True)
 class MemoryTestDiagnosis:
-    """Operator-facing interpretation for one 16K memory-test result."""
+    """Operator-facing interpretation for one memory-test result."""
 
     code: str
     result: str
@@ -1574,6 +1578,21 @@ def format_duration(seconds: float) -> str:
     if minutes:
         return f"{minutes}M{secs:02d}S"
     return f"{secs}S"
+
+
+def byte_size_label(byte_count: int) -> str:
+    """Return a compact byte-count label for memory and purge screens."""
+    if byte_count > 0 and byte_count % KIB_BYTES == 0:
+        return f"{byte_count // KIB_BYTES}K"
+    return f"{byte_count} BYTES"
+
+
+def byte_size_detail(byte_count: int) -> str:
+    """Return a byte-count label with exact bytes when a K label is used."""
+    label = byte_size_label(byte_count)
+    if label.endswith("K"):
+        return f"{label} ({byte_count} BYTES)"
+    return label
 
 
 def format_finish_clock(remaining_seconds: float, now: dt.datetime | None = None) -> str:
@@ -3256,7 +3275,7 @@ def buffer_purge_banner(reason: str, settings_count: int) -> None:
     print_report_title("BUFFER PURGE")
     print_wrapped_value("  REASON:              ", reason)
     print("  DEVICE TYPE:          SERIAL FIFO/RAM PRINTER BUFFER")
-    print(f"  ASSUMED CAPACITY:     {BUFFER_PURGE_CAPACITY_BYTES} BYTES")
+    print(f"  ASSUMED CAPACITY:     {byte_size_detail(BUFFER_PURGE_CAPACITY_BYTES)}")
     print(f"  OUTPUT BAUD TRIES:    {settings_count}")
     print(
         "  METHOD:               READ BUFFER OUTPUT UNTIL QUIET "
@@ -3264,7 +3283,7 @@ def buffer_purge_banner(reason: str, settings_count: int) -> None:
     )
     print(
         "  NOTE:                 SHORT QUIET TIME DOES NOT PROVE "
-        "A FULL 16K BUFFER IS EMPTY."
+        "A FULL BUFFER IS EMPTY."
     )
     print(border_line(REPORT_WIDTH))
 
@@ -3351,16 +3370,24 @@ def run_known_baud_purge(
     settings: SerialSettings,
     max_seconds: float,
     reason: str,
+    capacity_bytes: int = BUFFER_PURGE_CAPACITY_BYTES,
 ) -> DrainResult:
     """Run an explicit known-baud purge using the operator-selected frame."""
-    base_estimate = estimated_buffer_drain_seconds(settings, safety_factor=1.0)
-    safe_estimate = estimated_buffer_drain_seconds(settings)
+    base_estimate = estimated_buffer_drain_seconds(
+        settings,
+        capacity_bytes,
+        safety_factor=1.0,
+    )
+    safe_estimate = estimated_buffer_drain_seconds(settings, capacity_bytes)
     print()
     print_report_title("KNOWN-BAUD PURGE")
     print_wrapped_value("  REASON:              ", reason)
     print(f"  OUTPUT PORT:          {options.out_port}")
     print(f"  SETTING:              {settings.label()}")
-    print(f"  16K DRAIN ESTIMATE:   {format_duration(base_estimate)} RAW")
+    print(
+        f"  {byte_size_label(capacity_bytes)} DRAIN ESTIMATE:   "
+        f"{format_duration(base_estimate)} RAW"
+    )
     print(f"  WITH SAFETY FACTOR:   {format_duration(safe_estimate)}")
     print(f"  THIS RUN LIMIT:       {format_duration(max_seconds)}")
     print("  NOTE:                 ONLY THIS EXPLICIT PURGE USES THE LONG LIMIT.")
@@ -3377,7 +3404,7 @@ def run_known_baud_purge(
                 out_serial=out_serial,
                 quiet_seconds=max(options.pre_drain_quiet, BUFFER_PURGE_QUIET_SECONDS),
                 max_seconds=max_seconds,
-                max_bytes=max(options.max_drain_bytes, BUFFER_PURGE_CAPACITY_BYTES * 2),
+                max_bytes=max(options.max_drain_bytes, capacity_bytes * 2),
                 progress_interval=options.progress_interval,
                 progress=console_progress,
                 prefix=f"[KNOWN PURGE {settings.label()}]",
@@ -4389,21 +4416,118 @@ def estimated_memory_test_peak_fill_bytes(
     return max(0, min(payload_bytes, int(round(peak))))
 
 
-def memory_test_mode_label(mode: str) -> str:
+def parse_memory_test_target_choice(choice: str) -> int | str | None:
+    """Return a target byte count, custom sentinel, menu sentinel, or None."""
+    choice = choice.lstrip("\ufeff").strip().lower()
+    if choice == "":
+        return MEMORY_TEST_TARGET_BYTES
+    if choice in {"0", "m", "menu", "main", "return"}:
+        return "menu"
+    if choice in {"c", "custom", "k", "kb", "kib"}:
+        return "custom"
+    for index, kib in enumerate(MEMORY_TEST_TARGET_KIB_PRESETS, start=1):
+        if choice in {str(index), str(kib), f"{kib}k", f"{kib}kb", f"{kib}kib"}:
+            return kib * KIB_BYTES
+    if choice == str(len(MEMORY_TEST_TARGET_KIB_PRESETS) + 1):
+        return "custom"
+    return None
+
+
+def prompt_memory_test_custom_target_bytes(default_bytes: int) -> int | None:
+    """Prompt for a custom memory-test target in K-sized blocks."""
+    default_kib = max(1, math.ceil(default_bytes / KIB_BYTES))
+    while prompt_loop_active():
+        try:
+            value = read_operator_input(
+                f"CUSTOM MEMORY TARGET K [{default_kib}] (0=MENU): "
+            ).strip()
+        except EOFError:
+            return None
+        value = value.lstrip("\ufeff").strip().lower()
+        if value in {"0", "m", "menu", "main", "return"}:
+            return None
+        if value == "":
+            target_kib = default_kib
+        else:
+            if value.endswith("kib"):
+                value = value[:-3]
+            elif value.endswith("kb"):
+                value = value[:-2]
+            elif value.endswith("k"):
+                value = value[:-1]
+            try:
+                target_kib = int(value)
+            except ValueError:
+                print("ENTER A WHOLE K VALUE, OR 0 FOR MENU.")
+                continue
+        if target_kib < 1:
+            print("ENTER AT LEAST 1K.")
+            continue
+        if target_kib > MEMORY_TEST_MAX_TARGET_KIB:
+            print(f"ENTER {MEMORY_TEST_MAX_TARGET_KIB}K OR LESS.")
+            continue
+        return target_kib * KIB_BYTES
+    return None
+
+
+def prompt_memory_test_target_bytes(default_bytes: int = MEMORY_TEST_TARGET_BYTES) -> int | None:
+    """Prompt for the memory-test target size."""
+    default_choice = str(
+        MEMORY_TEST_TARGET_KIB_PRESETS.index(default_bytes // KIB_BYTES) + 1
+        if default_bytes % KIB_BYTES == 0
+        and default_bytes // KIB_BYTES in MEMORY_TEST_TARGET_KIB_PRESETS
+        else len(MEMORY_TEST_TARGET_KIB_PRESETS) + 1
+    )
+    while prompt_loop_active():
+        print()
+        print_report_title("MEMORY TARGET")
+        print("  TARGET IS THE BUFFER FILL SIZE TO PROVE OR STRESS.")
+        for index, kib in enumerate(MEMORY_TEST_TARGET_KIB_PRESETS, start=1):
+            print(f"  {index} {kib}K")
+        print(f"  {len(MEMORY_TEST_TARGET_KIB_PRESETS) + 1} CUSTOM K")
+        print("  0 RETURN TO MAIN MENU")
+        print(border_line(REPORT_WIDTH))
+        try:
+            choice = read_operator_input(
+                f"ENTER SELECTION [{default_choice}]: "
+            )
+        except EOFError:
+            return None
+        target = parse_memory_test_target_choice(choice)
+        if target == "menu":
+            return None
+        if target == "custom":
+            return prompt_memory_test_custom_target_bytes(default_bytes)
+        if isinstance(target, int):
+            return target
+        print(
+            "ENTER 1-"
+            f"{len(MEMORY_TEST_TARGET_KIB_PRESETS) + 1}, A PRESET K VALUE, OR 0."
+        )
+    return None
+
+
+def memory_test_mode_label(mode: str, target_bytes: int = MEMORY_TEST_TARGET_BYTES) -> str:
     """Return compact operator-facing text for a memory-test mode."""
+    target_label = byte_size_label(target_bytes)
     if mode == MEMORY_TEST_MODE_FILL:
-        return "FILL 16K"
+        return f"FILL {target_label}"
     if mode == MEMORY_TEST_MODE_CUSTOM:
         return "CUSTOM SIZE"
-    return "16K IMAGE"
+    return f"{target_label} IMAGE"
 
 
 def parse_memory_test_mode_choice(choice: str, fill_available: bool) -> str | None:
     """Return a memory-test mode key for one operator menu choice."""
     choice = choice.lstrip("\ufeff").strip().lower()
+    target_aliases = {
+        f"{kib}{suffix}"
+        for kib in MEMORY_TEST_TARGET_KIB_PRESETS
+        for suffix in ("k", "kb", "kib")
+    }
     if choice == "":
         return MEMORY_TEST_MODE_FILL if fill_available else MEMORY_TEST_MODE_IMAGE
-    if choice in {"1", "i", "image", "16k"}:
+    if choice in {"1", "i", "image", *target_aliases}:
         return MEMORY_TEST_MODE_IMAGE
     if choice in {"2", "f", "fill", "stress"} and fill_available:
         return MEMORY_TEST_MODE_FILL
@@ -4452,14 +4576,19 @@ def prompt_supported_baud_or_menu(label: str, current: int) -> int | None:
     return None
 
 
-def prompt_memory_test_mode(input_baud: int, output_baud: int) -> str | None:
-    """Prompt for the 16K memory-test size mode."""
+def prompt_memory_test_mode(
+    input_baud: int,
+    output_baud: int,
+    target_bytes: int,
+) -> str | None:
+    """Prompt for the memory-test payload mode."""
     fill_available = input_baud > output_baud
-    fill_bytes = memory_test_fill_payload_bytes(input_baud, output_baud)
-    peak_16k = estimated_memory_test_peak_fill_bytes(
+    target_label = byte_size_label(target_bytes)
+    fill_bytes = memory_test_fill_payload_bytes(input_baud, output_baud, target_bytes)
+    peak_image = estimated_memory_test_peak_fill_bytes(
         input_baud,
         output_baud,
-        MEMORY_TEST_TARGET_BYTES,
+        target_bytes,
     )
     peak_fill = estimated_memory_test_peak_fill_bytes(
         input_baud,
@@ -4470,14 +4599,14 @@ def prompt_memory_test_mode(input_baud: int, output_baud: int) -> str | None:
     while prompt_loop_active():
         print()
         print_report_title("MEMORY TEST SIZE")
-        print(f"  1 16K IMAGE   SEND {MEMORY_TEST_TARGET_BYTES} ASCII BYTES")
-        print(f"                EST. PEAK BUFFER USE: {peak_16k} BYTES")
+        print(f"  1 {target_label} IMAGE   SEND {target_bytes} ASCII BYTES")
+        print(f"                EST. PEAK BUFFER USE: {peak_image} BYTES")
         if fill_available:
-            print(f"  2 FILL 16K    SEND {fill_bytes} ASCII BYTES")
+            print(f"  2 FILL {target_label}    SEND {fill_bytes} ASCII BYTES")
             print(f"                EST. PEAK BUFFER USE: {peak_fill} BYTES")
             print("                OVERFLOW STRESS; REPORT CLASSIFIES CLEAN DROP VS CORRUPTION")
         else:
-            print("  2 FILL 16K    NOT AVAILABLE; INPUT BAUD MUST BE FASTER")
+            print(f"  2 FILL {target_label}    NOT AVAILABLE; INPUT BAUD MUST BE FASTER")
         print("  3 CUSTOM      SEND OPERATOR BYTE COUNT")
         print("                USE TO BRACKET NEAR-FILL AFTER OVERFLOW DIAGNOSIS")
         print("  0 RETURN TO MAIN MENU")
@@ -4496,14 +4625,17 @@ def prompt_memory_test_mode(input_baud: int, output_baud: int) -> str | None:
         if fill_available:
             print("ENTER 1, 2, 3, OR 0.")
         else:
-            print("ENTER 1, 3, OR 0. FILL 16K NEEDS INPUT BAUD > OUTPUT BAUD.")
+            print(
+                f"ENTER 1, 3, OR 0. FILL {target_label} "
+                "NEEDS INPUT BAUD > OUTPUT BAUD."
+            )
     return None
 
 
-def prompt_memory_test_payload_bytes(default_bytes: int) -> int | None:
+def prompt_memory_test_payload_bytes(default_bytes: int, target_bytes: int) -> int | None:
     """Prompt for a custom memory-test byte count."""
     minimum = minimum_payload_size()
-    maximum = MEMORY_TEST_TARGET_BYTES * 8
+    maximum = target_bytes * MEMORY_TEST_MAX_PAYLOAD_FACTOR
     while prompt_loop_active():
         try:
             value = read_operator_input(
@@ -4560,36 +4692,44 @@ def prompt_run_memory_test() -> bool:
 
 
 def prompt_memory_test_config(options: ScanOptions) -> MemoryTestConfig | None:
-    """Prompt for one fixed-frame 16K memory test run."""
+    """Prompt for one fixed-frame memory test run."""
     default_input_baud, default_output_baud = default_memory_test_bauds(options)
     print()
-    print_report_title("MEMORY TEST 16K")
+    print_report_title("MEMORY TEST")
     print("FIXED FRAME: INPUT 8E1, OUTPUT 8E1, FLOW=NONE.")
     print("STREAM TYPE: PRINTABLE ASCII WITH CHECKSUMS.")
-    print(f"BUFFER TARGET: {MEMORY_TEST_TARGET_BYTES} BYTES.")
+    print(f"DEFAULT BUFFER TARGET: {byte_size_detail(MEMORY_TEST_TARGET_BYTES)}.")
+    print("TARGET CAN BE SELECTED IN K-SIZED STEPS.")
     print(f"VALID BAUDS: {supported_baud_label()}.")
     print("ENTER 0 AT BAUD OR SIZE PROMPT TO RETURN.")
     print(border_line(REPORT_WIDTH))
 
+    target_bytes = prompt_memory_test_target_bytes(MEMORY_TEST_TARGET_BYTES)
+    if target_bytes is None:
+        return None
     input_baud = prompt_supported_baud_or_menu("INPUT BAUD", default_input_baud)
     if input_baud is None:
         return None
     output_baud = prompt_supported_baud_or_menu("OUTPUT BAUD", default_output_baud)
     if output_baud is None:
         return None
-    mode = prompt_memory_test_mode(input_baud, output_baud)
+    mode = prompt_memory_test_mode(input_baud, output_baud, target_bytes)
     if mode is None:
         return None
 
     if mode == MEMORY_TEST_MODE_FILL:
-        payload_bytes = memory_test_fill_payload_bytes(input_baud, output_baud)
+        payload_bytes = memory_test_fill_payload_bytes(
+            input_baud,
+            output_baud,
+            target_bytes,
+        )
     elif mode == MEMORY_TEST_MODE_CUSTOM:
-        custom_payload = prompt_memory_test_payload_bytes(MEMORY_TEST_TARGET_BYTES)
+        custom_payload = prompt_memory_test_payload_bytes(target_bytes, target_bytes)
         if custom_payload is None:
             return None
         payload_bytes = custom_payload
     else:
-        payload_bytes = MEMORY_TEST_TARGET_BYTES
+        payload_bytes = target_bytes
     payload_bytes = max(payload_bytes, minimum_payload_size())
     switch_note = prompt_memory_test_note(options.switch_note)
     if switch_note is None:
@@ -4604,7 +4744,9 @@ def prompt_memory_test_config(options: ScanOptions) -> MemoryTestConfig | None:
         settings.output_settings,
         payload_bytes,
     )
-    transfer_estimate = max(send_estimate, receive_estimate) + MEMORY_TEST_READ_QUIET_SECONDS
+    transfer_estimate = (
+        max(send_estimate, receive_estimate) + MEMORY_TEST_READ_QUIET_SECONDS
+    )
     peak_estimate = estimated_memory_test_peak_fill_bytes(
         input_baud,
         output_baud,
@@ -4613,7 +4755,8 @@ def prompt_memory_test_config(options: ScanOptions) -> MemoryTestConfig | None:
 
     print()
     print_report_title("MEMORY TEST PLAN")
-    print(f"  MODE:                {memory_test_mode_label(mode)}")
+    print(f"  MODE:                {memory_test_mode_label(mode, target_bytes)}")
+    print(f"  TARGET:              {byte_size_detail(target_bytes)}")
     print(f"  PAYLOAD:             {payload_bytes} ASCII BYTES")
     print(f"  EST. PEAK BUFFER:    {peak_estimate} BYTES")
     print(f"  INPUT:               {input_baud} 8E1 NONE")
@@ -4622,8 +4765,11 @@ def prompt_memory_test_config(options: ScanOptions) -> MemoryTestConfig | None:
     print(f"  OUTPUT ESTIMATE:     {format_duration(receive_estimate)}")
     print(f"  TRANSFER ESTIMATE:   {format_duration(transfer_estimate)}")
     print(f"  FINISH ABOUT:        {format_finish_clock(transfer_estimate)}")
-    if peak_estimate < MEMORY_TEST_TARGET_BYTES:
-        print("  NOTE:                THIS BAUD PAIR MAY NOT FILL 16K.")
+    if peak_estimate < target_bytes:
+        print(
+            f"  NOTE:                THIS BAUD PAIR MAY NOT FILL "
+            f"{byte_size_label(target_bytes)}."
+        )
     if mode == MEMORY_TEST_MODE_FILL:
         print("  NOTE:                FILL MODE TRIES TO OVERFILL THE BUFFER.")
         print("                       IF START MATCHES BUT END IS MISSING,")
@@ -4642,7 +4788,7 @@ def prompt_memory_test_config(options: ScanOptions) -> MemoryTestConfig | None:
         output_baud=output_baud,
         mode=mode,
         payload_bytes=payload_bytes,
-        target_bytes=MEMORY_TEST_TARGET_BYTES,
+        target_bytes=target_bytes,
         switch_note=switch_note,
         run_id=run_id,
     )
@@ -4703,7 +4849,7 @@ def print_menu_help(paged: bool = True) -> None:
             "  5 TIMING/STALE:    READ WAITS AND OLD-OUTPUT CLEARING.",
             "  6 REPORT FILES:    TEXT REPORT AND DEBUG LOG PATHS.",
             "  7 RESET REPORTS:   RESTORE DEFAULT REPORT FILE NAMES.",
-            "  8 MEMORY TEST:     16K ASCII STREAM, 8E1, NO FLOW.",
+            "  8 MEMORY TEST:     SELECT 16K..64K ASCII STREAM, 8E1, NO FLOW.",
             "  S CURRENT SETTINGS: SHOW ACTIVE SETUP.",
             "  ? HELP:            THIS SCREEN.",
             "  0 QUIT:            END PROGRAM.",
@@ -4770,7 +4916,12 @@ def print_configuration(options: ScanOptions) -> None:
         range_error = str(exc)
     lines: list[str] = ["", *banner_lines(), "CURRENT SETTINGS"]
     lines.extend(setting_lines("START SCAN:", "DISCOVERY / BANK 2 KNOWN-BAUD / PHASE 0"))
-    lines.extend(setting_lines("MEMORY TEST:", "MAIN MENU 8; 16K ASCII; FIXED 8E1 FLOW=NONE"))
+    lines.extend(
+        setting_lines(
+            "MEMORY TEST:",
+            "MAIN MENU 8; SELECT 16K..64K ASCII; FIXED 8E1 FLOW=NONE",
+        )
+    )
     lines.extend(setting_lines("PORTS:", f"{options.in_port} -> {options.out_port}"))
     lines.extend(
         setting_lines("BAUD RANGE:", f"{options.min_baud}..{options.max_baud}")
@@ -7585,6 +7736,7 @@ def memory_test_diagnosis(result: MemoryTestResult) -> MemoryTestDiagnosis:
     content_ratio = memory_test_content_integrity_ratio(candidate, payload)
     completeness_ratio = memory_test_completeness_ratio(candidate, payload)
     clean_prefix = content_ratio >= 0.98 and metrics.printable_ascii_ratio >= 0.98
+    target_label = byte_size_label(result.config.target_bytes)
     post_write_near_target = (
         delivered_after_write_done >= int(result.config.target_bytes * 0.90)
     )
@@ -7707,7 +7859,7 @@ def memory_test_diagnosis(result: MemoryTestResult) -> MemoryTestDiagnosis:
         return diagnosis(
             "probable-overflow-clean",
             "BUFFER FULL OBSERVED",
-            "ABOUT 16K RETURNED AFTER WRITE; EXCESS BYTES DROPPED.",
+            f"ABOUT {target_label} RETURNED AFTER WRITE; EXCESS BYTES DROPPED.",
             "NO - OVERFILL TEST",
             "PASS FOR RETURNED BYTES",
             "FULL / OVERFLOW",
@@ -7760,7 +7912,7 @@ def memory_test_diagnosis(result: MemoryTestResult) -> MemoryTestDiagnosis:
 
 
 def write_memory_test_text_report(path: Path, result: MemoryTestResult) -> None:
-    """Append one 16K memory-test block to the text report."""
+    """Append one memory-test block to the text report."""
     candidate = result.candidate
     payload = result.payload
     metrics = candidate.metrics
@@ -7772,6 +7924,10 @@ def write_memory_test_text_report(path: Path, result: MemoryTestResult) -> None:
         result.config.output_baud,
         result.config.payload_bytes,
     )
+    mode_label = memory_test_mode_label(
+        result.config.mode,
+        result.config.target_bytes,
+    )
     lines = [
         border_line(REPORT_WIDTH),
         bordered_text("SERIAL PROBE MEMORY TEST", REPORT_WIDTH),
@@ -7779,7 +7935,7 @@ def write_memory_test_text_report(path: Path, result: MemoryTestResult) -> None:
         f"STARTED UTC:     {result.started_at}",
         f"COMPLETED UTC:   {result.completed_at}",
         f"RUN ID:          {result.config.run_id}",
-        f"MODE:            {memory_test_mode_label(result.config.mode)}",
+        f"MODE:            {mode_label}",
         f"RESULT:          {diagnosis.result}",
         f"FINDING:         {diagnosis.finding}",
         f"EXACT STREAM:    {diagnosis.exact_stream}",
@@ -7790,7 +7946,7 @@ def write_memory_test_text_report(path: Path, result: MemoryTestResult) -> None:
         f"INPUT SETTING:   {settings.input_settings.label()}",
         f"OUTPUT SETTING:  {settings.output_settings.label()}",
         f"DIP NOTE:        {result.config.switch_note or '(NOT ENTERED)'}",
-        f"BUFFER TARGET:   {result.config.target_bytes} BYTES",
+        f"BUFFER TARGET:   {byte_size_detail(result.config.target_bytes)}",
         f"PAYLOAD:         {payload.byte_count} ASCII BYTES",
         f"EST. PEAK FILL:  {peak_estimate} BYTES",
         f"SENT:            {candidate.bytes_sent} BYTES",
@@ -7830,6 +7986,10 @@ def print_memory_test_report(result: MemoryTestResult, report_path: Path) -> Non
         result.config.output_baud,
         result.config.payload_bytes,
     )
+    mode_label = memory_test_mode_label(
+        result.config.mode,
+        result.config.target_bytes,
+    )
     print()
     print_report_title("MEMORY TEST RESULT")
     print(f"  RESULT:              {diagnosis.result}")
@@ -7838,7 +7998,8 @@ def print_memory_test_report(result: MemoryTestResult, report_path: Path) -> Non
     print(f"  DATA CHECK:          {diagnosis.data_check}")
     print(f"  CAPACITY CHECK:      {diagnosis.capacity_check}")
     print(f"  RAM CHECK:           {diagnosis.ram_check}")
-    print(f"  MODE:                {memory_test_mode_label(result.config.mode)}")
+    print(f"  MODE:                {mode_label}")
+    print(f"  TARGET:              {byte_size_detail(result.config.target_bytes)}")
     print(f"  PAYLOAD:             {payload.byte_count} ASCII BYTES")
     print(f"  EST. PEAK BUFFER:    {peak_estimate} BYTES")
     print(f"  INPUT:               {result.settings.input_settings.label()}")
@@ -7860,7 +8021,7 @@ def print_memory_test_report(result: MemoryTestResult, report_path: Path) -> Non
 
 
 def run_memory_test(options: ScanOptions) -> int:
-    """Run the fixed 8E1/no-flow 16K memory test from the main menu."""
+    """Run the fixed 8E1/no-flow memory test from the main menu."""
     validate_options(options)
     config = prompt_memory_test_config(options)
     if config is None:
@@ -7903,7 +8064,11 @@ def run_memory_test(options: ScanOptions) -> int:
     print()
     print_report_title("MEMORY TEST START")
     print("FIXED FRAME: INPUT 8E1, OUTPUT 8E1, FLOW=NONE.")
-    print(f"MODE: {memory_test_mode_label(config.mode)}; PAYLOAD={payload.byte_count} BYTES.")
+    print(
+        f"MODE: {memory_test_mode_label(config.mode, config.target_bytes)}; "
+        f"TARGET={byte_size_label(config.target_bytes)}; "
+        f"PAYLOAD={payload.byte_count} BYTES."
+    )
     print(f"PORTS: {options.in_port} -> BUFFER -> {options.out_port}.")
     print(f"INPUT: {settings.input_settings.label()}.")
     print(f"OUTPUT: {settings.output_settings.label()}.")
@@ -7917,7 +8082,7 @@ def run_memory_test(options: ScanOptions) -> int:
     started = time.monotonic()
     started_at = dt.datetime.now(dt.timezone.utc).isoformat()
     purge_max_seconds = max(
-        estimated_buffer_drain_seconds(settings.output_settings),
+        estimated_buffer_drain_seconds(settings.output_settings, config.target_bytes),
         MEMORY_TEST_PRE_DRAIN_TIMEOUT,
     )
     purge = run_known_baud_purge(
@@ -7927,6 +8092,7 @@ def run_memory_test(options: ScanOptions) -> int:
         settings=settings.output_settings,
         max_seconds=purge_max_seconds,
         reason="CLEAR OUTPUT BEFORE MEMORY TEST.",
+        capacity_bytes=config.target_bytes,
     )
     if not purge.quiet:
         print()
@@ -7983,7 +8149,7 @@ def print_commands() -> None:
     menu_line("  1  START SCAN", "  2  SET COM PORTS")
     menu_line("  3  SET BAUD RANGE", "  4  SCAN / VALIDATE SETUP")
     menu_line("  5  TIMING / STALE DATA", "  6  SET REPORT FILES")
-    menu_line("  7  RESET REPORT FILES", "  8  MEMORY TEST 16K")
+    menu_line("  7  RESET REPORT FILES", "  8  MEMORY TEST")
     menu_line("  S  CURRENT SETTINGS", "  ?  HELP")
     menu_line("  0  QUIT")
     print(border_line(SCREEN_WIDTH))
@@ -8772,13 +8938,13 @@ def run_self_tests() -> int:
     ), "4800 baud should stay at the normal pre-drain baseline"
     assert_approx(
         estimated_buffer_drain_seconds(frame_1200, safety_factor=1.0),
-        (16 * 1024 * 10) / 1200,
+        (BUFFER_PURGE_CAPACITY_BYTES * 10) / 1200,
         0.5,
         "1200 baud drain estimate",
     )
     assert_approx(
         estimated_buffer_drain_seconds(frame_300, safety_factor=1.0),
-        (16 * 1024 * 10) / 300,
+        (BUFFER_PURGE_CAPACITY_BYTES * 10) / 300,
         0.5,
         "300 baud drain estimate",
     )
@@ -8883,13 +9049,28 @@ def run_self_tests() -> int:
     ), "same-baud memory fill should not inflate payload"
     assert (
         memory_test_fill_payload_bytes(38400, 19200) == MEMORY_TEST_TARGET_BYTES * 2
-    ), "2:1 baud memory fill should send 32K"
+    ), "2:1 baud memory fill should send double target"
     fill_payload = memory_test_fill_payload_bytes(38400, 9600)
-    assert fill_payload > MEMORY_TEST_TARGET_BYTES, "fill mode should exceed 16K when output drains"
+    assert (
+        fill_payload > MEMORY_TEST_TARGET_BYTES
+    ), "fill mode should exceed target when output drains"
     assert (
         estimated_memory_test_peak_fill_bytes(38400, 9600, fill_payload)
         >= MEMORY_TEST_TARGET_BYTES - 1
-    ), "fill mode should estimate a near-16K peak"
+    ), "fill mode should estimate a near-target peak"
+    assert byte_size_label(MEMORY_TEST_TARGET_BYTES) == "64K", "default target label changed"
+    assert (
+        parse_memory_test_target_choice("") == MEMORY_TEST_TARGET_BYTES
+    ), "blank memory target should default to 64K"
+    assert (
+        parse_memory_test_target_choice("1") == 16 * KIB_BYTES
+    ), "first memory target preset should be 16K"
+    assert (
+        parse_memory_test_target_choice("64k") == 64 * KIB_BYTES
+    ), "64K memory target alias was not accepted"
+    assert (
+        parse_memory_test_target_choice("5") == "custom"
+    ), "memory target custom menu choice was not accepted"
     assert (
         parse_memory_test_mode_choice("", True) == MEMORY_TEST_MODE_FILL
     ), "blank memory mode should default to fill when available"
@@ -8925,7 +9106,8 @@ def run_self_tests() -> int:
     assert (
         "MISSING" in memory_test_reason(missing_memory, memory_payload)
     ), "missing memory-test byte reason was not clear"
-    overflow_payload = generate_payload(MEMORY_TEST_TARGET_BYTES * 2, nonce_a)
+    overflow_target = 16 * KIB_BYTES
+    overflow_payload = generate_payload(overflow_target * 2, nonce_a)
     overflow_received = overflow_payload.data[:26945]
     overflow_score = score_received(overflow_payload.data, overflow_received)
     overflow_trial = TrialResult(
@@ -8963,7 +9145,7 @@ def run_self_tests() -> int:
             output_baud=9600,
             mode=MEMORY_TEST_MODE_FILL,
             payload_bytes=overflow_payload.byte_count,
-            target_bytes=MEMORY_TEST_TARGET_BYTES,
+            target_bytes=overflow_target,
             switch_note="",
             run_id=nonce_a.run_id,
         ),
@@ -8982,6 +9164,7 @@ def run_self_tests() -> int:
     assert (
         overflow_diagnosis.result == "BUFFER FULL OBSERVED"
     ), "probable overflow should not present as a generic fail"
+    assert "16K" in overflow_diagnosis.finding, "overflow finding should name target size"
     assert (
         overflow_diagnosis.ram_check == "NO ERROR SEEN"
     ), "clean overflow should not imply bad RAM"

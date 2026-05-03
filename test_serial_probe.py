@@ -86,3 +86,31 @@ def test_import_pyserial_missing_reports_install_command_without_install(
         "INSTALL PYSERIAL WITH: PYTHON -M PIP INSTALL PYSERIAL"
         in capsys.readouterr().out
     )
+
+
+def test_memory_target_presets_and_64k_defaults() -> None:
+    assert serial_probe.BUFFER_PURGE_CAPACITY_BYTES == 64 * serial_probe.KIB_BYTES
+    assert (
+        serial_probe.DEFAULT_MAX_DRAIN_BYTES
+        >= serial_probe.BUFFER_PURGE_CAPACITY_BYTES * 2
+    )
+    assert serial_probe.MEMORY_TEST_MAX_TARGET_KIB == 64
+    assert serial_probe.parse_memory_test_target_choice("") == 64 * serial_probe.KIB_BYTES
+    assert serial_probe.parse_memory_test_target_choice("1") == 16 * serial_probe.KIB_BYTES
+    assert serial_probe.parse_memory_test_target_choice("64k") == 64 * serial_probe.KIB_BYTES
+    assert serial_probe.parse_memory_test_target_choice("5") == "custom"
+    assert (
+        serial_probe.memory_test_mode_label(
+            serial_probe.MEMORY_TEST_MODE_FILL,
+            32 * serial_probe.KIB_BYTES,
+        )
+        == "FILL 32K"
+    )
+    assert (
+        serial_probe.memory_test_fill_payload_bytes(
+            38400,
+            19200,
+            64 * serial_probe.KIB_BYTES,
+        )
+        == 128 * serial_probe.KIB_BYTES
+    )
