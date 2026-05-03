@@ -56,6 +56,11 @@ BUFFER_PURGE_CAPACITY_BYTES = 16 * 1024
 BUFFER_PURGE_QUIET_SECONDS = 1.5
 BUFFER_PURGE_PER_BAUD_MAX_SECONDS = 2.5
 BUFFER_PURGE_PROGRESS_INTERVAL = 1.0
+MEMORY_TEST_TARGET_BYTES = BUFFER_PURGE_CAPACITY_BYTES
+MEMORY_TEST_READ_QUIET_SECONDS = 2.0
+MEMORY_TEST_PRE_DRAIN_TIMEOUT = 2.5
+MEMORY_TEST_MODE_IMAGE = "image"
+MEMORY_TEST_MODE_FILL = "fill"
 FLOW_VALIDATE_PAYLOAD_BYTES = 1024
 FLOW_VALIDATE_READ_TIMEOUT = 2.0
 FLOW_VALIDATE_HOLD_SECONDS = 1.0
@@ -74,6 +79,10 @@ TURBO_READ_TIMEOUT_LOW_BAUD = 0.70
 TURBO_READ_TIMEOUT_VERY_LOW_BAUD = 1.00
 TURBO_COMPLETION_QUIET = 0.05
 DEFAULT_COMPLETION_QUIET = 0.10
+LOW_BAUD_THRESHOLD = 4800
+LOW_BAUD_PRE_DRAIN_QUIET_MAX = 0.75
+LOW_BAUD_PRE_DRAIN_QUIET_RATIO = 0.25
+LOW_BAUD_PRE_DRAIN_MULTIPLIER = 1.25
 PHASE0_PAYLOAD_BYTES = 128
 PHASE0_READ_TIMEOUT = 1.0
 PHASE0_SETTLE_MS = 10
@@ -86,6 +95,11 @@ PHASE0_MIN_ALIVE_SCORE = 90.0
 PHASE0_MIN_LINE_INTEGRITY = 1.0
 PHASE0_MAX_EXTRA_BYTES = 16
 PHASE0_MAX_EXTRA_BYTES_RATIO = 0.25
+PHASE0_LOW_BAUD_THRESHOLD = LOW_BAUD_THRESHOLD
+PHASE0_LOW_BAUD_READ_TIMEOUT_MAX = 6.0
+PHASE0_LOW_BAUD_PRE_DRAIN_QUIET_MAX = 1.5
+PHASE0_LOW_BAUD_READ_MULTIPLIER = 1.25
+PHASE0_LOW_BAUD_PRE_DRAIN_MULTIPLIER = 2.5
 PHASE0_BASELINE_DATA_BITS = 8
 PHASE0_BASELINE_PARITY = "even"
 PHASE0_BASELINE_STOP_BITS = 1
@@ -400,6 +414,43 @@ class ScanOptions:
     auto_validate_flow_control: bool
     flow_validate_size_bytes: int
     run_id: str = ""
+
+
+@dataclass(frozen=True)
+class MenuSelection:
+    """The main-menu action selected by the operator."""
+
+    action: str
+    options: ScanOptions
+
+
+@dataclass(frozen=True)
+class MemoryTestConfig:
+    """Operator-selected settings for the 16K memory test."""
+
+    in_port: str
+    out_port: str
+    input_baud: int
+    output_baud: int
+    mode: str
+    payload_bytes: int
+    target_bytes: int
+    switch_note: str
+    run_id: str
+
+
+@dataclass(frozen=True)
+class MemoryTestResult:
+    """Result block for one fixed 8E1 no-flow memory test."""
+
+    config: MemoryTestConfig
+    settings: DualSerialSettings
+    payload: ProbePayload
+    purge: DrainResult
+    candidate: CandidateResult
+    started_at: str
+    completed_at: str
+    elapsed_sec: float
 
 
 @dataclass(frozen=True)
@@ -1606,13 +1657,16 @@ def effective_discovery_timing(
 ) -> EffectiveTiming:
     """Return phase-1 timing for one setting after turbo/adaptive policy."""
     if not options.turbo_discovery_enabled:
-        return EffectiveTiming(
+        timing = EffectiveTiming(
             read_timeout=options.read_timeout,
             settle_ms=options.settle_ms,
             pre_drain_quiet=options.pre_drain_quiet,
             pre_drain_timeout=options.pre_drain_timeout,
             completion_quiet=min(options.read_timeout, DEFAULT_COMPLETION_QUIET),
         )
+        if phase0_low_baud_timing_applies(options, settings, payload_bytes):
+            return phase0_low_baud_timing(timing, settings, payload_bytes)
+        return low_baud_pre_drain_timing(timing, settings, payload_bytes)
 
     payload_margin = min(0.25, estimated_transmit_seconds(settings, payload_bytes) * 0.02)
     read_timeout = turbo_read_timeout_for_baud(settings) + payload_margin
@@ -1623,6 +1677,106 @@ def effective_discovery_timing(
         pre_drain_quiet=min(options.pre_drain_quiet, TURBO_PRE_DRAIN_QUIET),
         pre_drain_timeout=min(options.pre_drain_timeout, TURBO_PRE_DRAIN_TIMEOUT),
         completion_quiet=min(read_timeout, TURBO_COMPLETION_QUIET),
+    )
+
+
+def low_baud_pre_drain_values(
+    settings: SerialSettings | DualSerialSettings,
+    payload_bytes: int,
+    pre_drain_timeout: float,
+    pre_drain_quiet: float,
+) -> tuple[float, float]:
+    """Return pre-drain timeout/quiet values sized for slow output bauds."""
+    receive_settings = receive_side_settings(settings)
+    if receive_settings.baud >= LOW_BAUD_THRESHOLD:
+        return pre_drain_timeout, pre_drain_quiet
+
+    receive_seconds = estimated_receive_seconds(settings, payload_bytes)
+    quiet_floor = min(
+        LOW_BAUD_PRE_DRAIN_QUIET_MAX,
+        max(DEFAULT_PRE_DRAIN_QUIET, receive_seconds * LOW_BAUD_PRE_DRAIN_QUIET_RATIO),
+    )
+    pre_drain_quiet = max(pre_drain_quiet, quiet_floor)
+    pre_drain_timeout = max(
+        pre_drain_timeout,
+        receive_seconds * LOW_BAUD_PRE_DRAIN_MULTIPLIER + pre_drain_quiet,
+    )
+    return pre_drain_timeout, pre_drain_quiet
+
+
+def low_baud_pre_drain_timing(
+    timing: EffectiveTiming,
+    settings: SerialSettings | DualSerialSettings,
+    payload_bytes: int,
+) -> EffectiveTiming:
+    """Return timing with slow-output cleanup room while keeping read policy."""
+    pre_drain_timeout, pre_drain_quiet = low_baud_pre_drain_values(
+        settings,
+        payload_bytes,
+        timing.pre_drain_timeout,
+        timing.pre_drain_quiet,
+    )
+    if (
+        pre_drain_timeout == timing.pre_drain_timeout
+        and pre_drain_quiet == timing.pre_drain_quiet
+    ):
+        return timing
+    return EffectiveTiming(
+        read_timeout=timing.read_timeout,
+        settle_ms=timing.settle_ms,
+        pre_drain_quiet=pre_drain_quiet,
+        pre_drain_timeout=pre_drain_timeout,
+        completion_quiet=timing.completion_quiet,
+    )
+
+
+def phase0_low_baud_timing_applies(
+    options: ScanOptions,
+    settings: SerialSettings,
+    payload_bytes: int,
+) -> bool:
+    """Return True when compact Phase 0 needs low-baud cleanup timing."""
+    return (
+        settings.baud < PHASE0_LOW_BAUD_THRESHOLD
+        and payload_bytes == phase0_payload_bytes()
+        and options.bursts == PHASE0_BURSTS
+        and options.settle_ms == PHASE0_SETTLE_MS
+        and abs(options.read_timeout - PHASE0_READ_TIMEOUT) < 0.001
+        and abs(options.pre_drain_quiet - PHASE0_PRE_DRAIN_QUIET) < 0.001
+    )
+
+
+def phase0_low_baud_timing(
+    timing: EffectiveTiming,
+    settings: SerialSettings,
+    payload_bytes: int,
+) -> EffectiveTiming:
+    """Return Phase 0 timing with enough room for slow output-side draining."""
+    receive_seconds = estimated_receive_seconds(settings, payload_bytes)
+    read_timeout = max(
+        timing.read_timeout,
+        min(
+            PHASE0_LOW_BAUD_READ_TIMEOUT_MAX,
+            receive_seconds * PHASE0_LOW_BAUD_READ_MULTIPLIER,
+        ),
+    )
+    pre_drain_quiet = max(
+        timing.pre_drain_quiet,
+        min(
+            PHASE0_LOW_BAUD_PRE_DRAIN_QUIET_MAX,
+            receive_seconds / 2.0,
+        ),
+    )
+    pre_drain_timeout = max(
+        timing.pre_drain_timeout,
+        receive_seconds * PHASE0_LOW_BAUD_PRE_DRAIN_MULTIPLIER + pre_drain_quiet,
+    )
+    return EffectiveTiming(
+        read_timeout=read_timeout,
+        settle_ms=timing.settle_ms,
+        pre_drain_quiet=pre_drain_quiet,
+        pre_drain_timeout=pre_drain_timeout,
+        completion_quiet=timing.completion_quiet,
     )
 
 
@@ -1688,7 +1842,7 @@ def print_progress_legend() -> None:
     print("  RECEIVED=N            BYTES READ FROM OUTPUT PORT.")
     print("  CLEARED=N             OLD OUTPUT REMOVED BEFORE SEND.")
     print("  QUIET=S/T             OUTPUT QUIET TIME AND LIMIT.")
-    print("  PASS GOOD PART FAIL STALE ERROR  QUICK RESULT.")
+    print("  PASS GOOD PART FAIL STALE ERROR  RESULT INDICATOR.")
     print("  SCORE                 0-100 MATCH CONFIDENCE.")
     print("  SCAN TIME             ELAPSED, LEFT, FINISH TIME.")
     print("  CTRL+C                OPERATOR BREAK MENU.")
@@ -1771,7 +1925,7 @@ def payload_for_trial(
     switch_hash: str | None,
 ) -> ProbePayload:
     """Return a nonce-bearing payload for the current candidate/trial."""
-    if template.nonce is not None:
+    if template.nonce is not None or template.payload_mode == PAYLOAD_MODE_PHASE0:
         return template
     nonce = ProbeNonce(
         run_id=sanitize_nonce_value(run_id or make_run_id()),
@@ -1965,6 +2119,7 @@ def execute_burst(
         write_error = str(exc)
         logger.debug("burst %s write failed: %s", burst_index, write_error)
     finally:
+        last_data_time = time.monotonic()
         writer_done.set()
     write_elapsed = time.monotonic() - write_started
 
@@ -2962,10 +3117,9 @@ def phase0_end_marker(nonce: ProbeNonce | None) -> bytes:
 
 def phase0_minimum_payload_size(nonce: ProbeNonce | None = None) -> int:
     """Return the smallest structural payload usable by Phase 0."""
-    size_nonce = representative_nonce() if nonce is None else nonce
-    start = phase0_start_marker(size_nonce)
-    end = phase0_end_marker(size_nonce)
-    return len(start) + len(make_probe_line(1, "LIVE", "", size_nonce)) + len(end)
+    start = phase0_start_marker(nonce)
+    end = phase0_end_marker(nonce)
+    return len(start) + len(make_probe_line(1, "LIVE", "", nonce)) + len(end)
 
 
 def phase0_payload_bytes() -> int:
@@ -3009,9 +3163,9 @@ def phase0_fixed_settings_label() -> str:
     return (
         f"{phase0_payload_bytes()} BYTES X {PHASE0_BURSTS}, "
         "8E1 FLOW=NONE, "
-        f"READ={PHASE0_READ_TIMEOUT:.2f}S, "
+        f"READ>={PHASE0_READ_TIMEOUT:.2f}S, "
         f"PAUSE={PHASE0_SETTLE_MS}MS, "
-        f"CLEAR={PHASE0_PRE_DRAIN_TIMEOUT:.2f}S/"
+        f"CLEAR>={PHASE0_PRE_DRAIN_TIMEOUT:.2f}S/"
         f"{PHASE0_PRE_DRAIN_QUIET:.2f}S"
     )
 
@@ -4135,6 +4289,252 @@ def prompt_yes_no_question(question: str, current: bool) -> bool:
         print("ENTER Y OR N.")
 
 
+def memory_test_settings(input_baud: int, output_baud: int) -> DualSerialSettings:
+    """Return fixed 8E1/no-flow settings for the memory test."""
+    validate_supported_baud(input_baud)
+    validate_supported_baud(output_baud)
+    return DualSerialSettings(
+        input_settings=SerialSettings(input_baud, 8, "even", 1, "none"),
+        output_settings=SerialSettings(output_baud, 8, "even", 1, "none"),
+    )
+
+
+def memory_test_fill_payload_bytes(
+    input_baud: int,
+    output_baud: int,
+    target_bytes: int = MEMORY_TEST_TARGET_BYTES,
+) -> int:
+    """Return bytes needed to approach target occupancy while output drains."""
+    settings = memory_test_settings(input_baud, output_baud)
+    input_rate = input_baud / serial_frame_bits(settings.input_settings)
+    output_rate = output_baud / serial_frame_bits(settings.output_settings)
+    if input_rate <= output_rate:
+        return target_bytes
+    fill_fraction = 1.0 - (output_rate / input_rate)
+    return max(target_bytes, math.ceil(target_bytes / fill_fraction))
+
+
+def estimated_memory_test_peak_fill_bytes(
+    input_baud: int,
+    output_baud: int,
+    payload_bytes: int,
+) -> int:
+    """Estimate peak buffered bytes during a continuous memory-test stream."""
+    settings = memory_test_settings(input_baud, output_baud)
+    send_seconds = estimated_transmit_seconds(settings.input_settings, payload_bytes)
+    output_rate = output_baud / serial_frame_bits(settings.output_settings)
+    drained_during_send = send_seconds * output_rate
+    peak = payload_bytes - drained_during_send
+    return max(0, min(payload_bytes, int(round(peak))))
+
+
+def memory_test_mode_label(mode: str) -> str:
+    """Return compact operator-facing text for a memory-test mode."""
+    if mode == MEMORY_TEST_MODE_FILL:
+        return "FILL 16K"
+    return "16K IMAGE"
+
+
+def parse_memory_test_mode_choice(choice: str, fill_available: bool) -> str | None:
+    """Return a memory-test mode key for one operator menu choice."""
+    choice = choice.lstrip("\ufeff").strip().lower()
+    if choice == "":
+        return MEMORY_TEST_MODE_FILL if fill_available else MEMORY_TEST_MODE_IMAGE
+    if choice in {"1", "i", "image", "16k"}:
+        return MEMORY_TEST_MODE_IMAGE
+    if choice in {"2", "f", "fill", "stress"} and fill_available:
+        return MEMORY_TEST_MODE_FILL
+    if choice in {"0", "m", "menu", "main", "return"}:
+        return "menu"
+    return None
+
+
+def default_memory_test_bauds(options: ScanOptions) -> tuple[int, int]:
+    """Return default input/output bauds for the memory test prompts."""
+    try:
+        bauds = available_bauds(options.min_baud, options.max_baud)
+    except ValueError:
+        bauds = BAUD_RATES
+    return max(bauds), min(bauds)
+
+
+def prompt_supported_baud_or_menu(label: str, current: int) -> int | None:
+    """Prompt for a supported baud value, allowing return to main menu."""
+    while True:
+        try:
+            value = read_operator_input(
+                f"{label.upper()} [{current}] (0=MENU): "
+            ).strip()
+        except EOFError:
+            return None
+        value = value.lstrip("\ufeff").strip().lower()
+        if value in {"0", "m", "menu", "main", "return"}:
+            return None
+        if value == "":
+            baud = current
+        else:
+            try:
+                baud = int(value)
+            except ValueError:
+                print("ENTER A WHOLE NUMBER, OR 0 FOR MENU.")
+                continue
+        try:
+            validate_supported_baud(baud)
+        except ValueError as exc:
+            print(exc)
+            continue
+        return baud
+
+
+def prompt_memory_test_mode(input_baud: int, output_baud: int) -> str | None:
+    """Prompt for the 16K memory-test size mode."""
+    fill_available = input_baud > output_baud
+    fill_bytes = memory_test_fill_payload_bytes(input_baud, output_baud)
+    peak_16k = estimated_memory_test_peak_fill_bytes(
+        input_baud,
+        output_baud,
+        MEMORY_TEST_TARGET_BYTES,
+    )
+    peak_fill = estimated_memory_test_peak_fill_bytes(
+        input_baud,
+        output_baud,
+        fill_bytes,
+    )
+    default_choice = "2" if fill_available else "1"
+    while True:
+        print()
+        print_report_title("MEMORY TEST SIZE")
+        print(f"  1 16K IMAGE   SEND {MEMORY_TEST_TARGET_BYTES} ASCII BYTES")
+        print(f"                EST. PEAK BUFFER USE: {peak_16k} BYTES")
+        if fill_available:
+            print(f"  2 FILL 16K    SEND {fill_bytes} ASCII BYTES")
+            print(f"                EST. PEAK BUFFER USE: {peak_fill} BYTES")
+        else:
+            print("  2 FILL 16K    NOT AVAILABLE; INPUT BAUD MUST BE FASTER")
+        print("  0 RETURN TO MAIN MENU")
+        print(border_line(REPORT_WIDTH))
+        try:
+            choice = read_operator_input(
+                f"ENTER SELECTION [{default_choice}]: "
+            )
+        except EOFError:
+            return None
+        mode = parse_memory_test_mode_choice(choice, fill_available)
+        if mode == "menu":
+            return None
+        if mode is not None:
+            return mode
+        if fill_available:
+            print("ENTER 1, 2, OR 0.")
+        else:
+            print("ENTER 1 OR 0. FILL 16K NEEDS INPUT BAUD > OUTPUT BAUD.")
+
+
+def prompt_memory_test_note(current: str) -> str | None:
+    """Prompt for the memory-test report note, canceling on EOF."""
+    try:
+        value = read_operator_input(
+            f"DIP SETTING NOTE FOR REPORT [{current}]: "
+        ).strip()
+    except EOFError:
+        return None
+    return current if value == "" else value
+
+
+def prompt_run_memory_test() -> bool:
+    """Ask for final memory-test confirmation, canceling on EOF."""
+    while True:
+        try:
+            value = read_operator_input("RUN MEMORY TEST [Y]: ").strip().lower()
+        except EOFError:
+            return False
+        if value == "":
+            return True
+        if value in {"y", "yes"}:
+            return True
+        if value in {"n", "no", "0", "m", "menu", "main"}:
+            return False
+        print("ENTER Y OR N.")
+
+
+def prompt_memory_test_config(options: ScanOptions) -> MemoryTestConfig | None:
+    """Prompt for one fixed-frame 16K memory test run."""
+    default_input_baud, default_output_baud = default_memory_test_bauds(options)
+    print()
+    print_report_title("MEMORY TEST 16K")
+    print("FIXED FRAME: INPUT 8E1, OUTPUT 8E1, FLOW=NONE.")
+    print("STREAM TYPE: CHECKSUMMED PRINTABLE ASCII.")
+    print(f"BUFFER TARGET: {MEMORY_TEST_TARGET_BYTES} BYTES.")
+    print(f"VALID BAUDS: {supported_baud_label()}.")
+    print("ENTER 0 AT BAUD OR SIZE PROMPT TO RETURN.")
+    print(border_line(REPORT_WIDTH))
+
+    input_baud = prompt_supported_baud_or_menu("INPUT BAUD", default_input_baud)
+    if input_baud is None:
+        return None
+    output_baud = prompt_supported_baud_or_menu("OUTPUT BAUD", default_output_baud)
+    if output_baud is None:
+        return None
+    mode = prompt_memory_test_mode(input_baud, output_baud)
+    if mode is None:
+        return None
+
+    payload_bytes = (
+        memory_test_fill_payload_bytes(input_baud, output_baud)
+        if mode == MEMORY_TEST_MODE_FILL
+        else MEMORY_TEST_TARGET_BYTES
+    )
+    payload_bytes = max(payload_bytes, minimum_payload_size())
+    switch_note = prompt_memory_test_note(options.switch_note)
+    if switch_note is None:
+        return None
+    run_id = make_run_id("M")
+    settings = memory_test_settings(input_baud, output_baud)
+    send_estimate = estimated_transmit_seconds(
+        settings.input_settings,
+        payload_bytes,
+    )
+    receive_estimate = estimated_receive_seconds(
+        settings.output_settings,
+        payload_bytes,
+    )
+    transfer_estimate = max(send_estimate, receive_estimate) + MEMORY_TEST_READ_QUIET_SECONDS
+    peak_estimate = estimated_memory_test_peak_fill_bytes(
+        input_baud,
+        output_baud,
+        payload_bytes,
+    )
+
+    print()
+    print_report_title("MEMORY TEST PLAN")
+    print(f"  MODE:                {memory_test_mode_label(mode)}")
+    print(f"  PAYLOAD:             {payload_bytes} ASCII BYTES")
+    print(f"  EST. PEAK BUFFER:    {peak_estimate} BYTES")
+    print(f"  INPUT:               {input_baud} 8E1 NONE")
+    print(f"  OUTPUT:              {output_baud} 8E1 NONE")
+    print(f"  SEND ESTIMATE:       {format_duration(send_estimate)}")
+    print(f"  OUTPUT ESTIMATE:     {format_duration(receive_estimate)}")
+    print(f"  TRANSFER ESTIMATE:   {format_duration(transfer_estimate)}")
+    print(f"  FINISH ABOUT:        {format_finish_clock(transfer_estimate)}")
+    if peak_estimate < MEMORY_TEST_TARGET_BYTES:
+        print("  NOTE:                THIS BAUD PAIR MAY NOT FILL 16K.")
+    print(border_line(REPORT_WIDTH))
+    if not prompt_run_memory_test():
+        return None
+
+    return MemoryTestConfig(
+        in_port=options.in_port,
+        out_port=options.out_port,
+        input_baud=input_baud,
+        output_baud=output_baud,
+        mode=mode,
+        payload_bytes=payload_bytes,
+        target_bytes=MEMORY_TEST_TARGET_BYTES,
+        switch_note=switch_note,
+        run_id=run_id,
+    )
+
+
 def parse_start_scan_workflow_choice(choice: str) -> str | None:
     """Return a start-scan workflow key for one operator choice."""
     choice = choice.lstrip("\ufeff").strip().lower()
@@ -4189,6 +4589,7 @@ def print_menu_help(paged: bool = True) -> None:
             "  5 TIMING/STALE:    READ WAITS AND OLD-OUTPUT CLEARING.",
             "  6 REPORT FILES:    TEXT REPORT AND DEBUG LOG PATHS.",
             "  7 RESET REPORTS:   RESTORE DEFAULT REPORT FILE NAMES.",
+            "  8 MEMORY TEST:     16K ASCII STREAM, 8E1, NO FLOW.",
             "  S CURRENT SETTINGS: SHOW ACTIVE SETUP.",
             "  ? HELP:            THIS SCREEN.",
             "  0 QUIT:            END PROGRAM.",
@@ -4208,11 +4609,12 @@ def print_menu_help(paged: bool = True) -> None:
             "  START 1 SETUP:     OPTION 4 ITEMS 1-6 CAN AFFECT DISCOVERY.",
             "  START 2 SETUP:     OPTION 4 ITEMS 1, 6, AND 7 CAN AFFECT BANK 2.",
             "  START 3 SETUP:     OPTION 4 DOES NOT AFFECT PHASE 0 ONLY.",
+            "  MEMORY TEST:       MAIN MENU 8; FIXED 8E1, NO FLOW, ASCII CHECK.",
             "  STALE DATA:        OLD BUFFER OUTPUT IS CLEARED BEFORE TESTS.",
             "  NONCES:            EACH TEST PAYLOAD HAS RUN/CANDIDATE/TRIAL IDS.",
             "  8-BIT TEST:        SEPARATE HIGH-BIT CHALLENGE; ASCII IS NOT ENOUGH.",
-            "  BREAK:             CTRL+C ASKS RESUME, REPORT, MENU, OR QUIT.",
-            "  AFTER SCAN:        RUN AGAIN, MAIN MENU, OR QUIT.",
+            "  SCAN BREAK:        CTRL+C ASKS RESUME, REPORT, MENU, OR QUIT.",
+            "  AFTER RUN:         RUN AGAIN, MAIN MENU, OR QUIT.",
         ],
         page_lines=HELP_BODY_LINES if paged else 0,
         pause_at_end=paged,
@@ -4254,6 +4656,7 @@ def print_configuration(options: ScanOptions) -> None:
         range_error = str(exc)
     lines: list[str] = ["", *banner_lines(), "CURRENT SETTINGS"]
     lines.extend(setting_lines("START SCAN:", "DISCOVERY / BANK 2 KNOWN-BAUD / PHASE 0"))
+    lines.extend(setting_lines("MEMORY TEST:", "MAIN MENU 8; 16K ASCII; FIXED 8E1 FLOW=NONE"))
     lines.extend(setting_lines("PORTS:", f"{options.in_port} -> {options.out_port}"))
     lines.extend(
         setting_lines("BAUD RANGE:", f"{options.min_baud}..{options.max_baud}")
@@ -5006,6 +5409,12 @@ def run_flow_control_pause_validation(
     read_timeout = max(options.read_timeout, FLOW_VALIDATE_READ_TIMEOUT)
     hold_applied = False
     payload_bytes = payload.byte_count
+    pre_drain_timeout, pre_drain_quiet = low_baud_pre_drain_values(
+        settings,
+        payload_bytes,
+        max(options.pre_drain_timeout, 2.0),
+        options.pre_drain_quiet,
+    )
     empty_score = score_received(payload.data, b"")
     try:
         console_progress(border_line(PROGRESS_WIDTH))
@@ -5036,8 +5445,8 @@ def run_flow_control_pause_validation(
                 if not options.no_pre_drain:
                     drain = drain_output_until_quiet(
                         out_serial=out_serial,
-                        quiet_seconds=options.pre_drain_quiet,
-                        max_seconds=max(options.pre_drain_timeout, 2.0),
+                        quiet_seconds=pre_drain_quiet,
+                        max_seconds=pre_drain_timeout,
                         max_bytes=options.max_drain_bytes,
                         progress_interval=options.progress_interval,
                         progress=console_progress,
@@ -5979,6 +6388,13 @@ def run_bank2_behavior_probe(
     receive_settings = receive_side_settings(settings)
     read_timeout = max(options.read_timeout, 0.5)
     quiet_seconds = observe_seconds if name == "TIMEOUT_FF" else read_timeout
+    payload_receive_seconds = estimated_receive_seconds(settings, len(payload))
+    pre_drain_timeout, pre_drain_quiet = low_baud_pre_drain_values(
+        settings,
+        len(payload),
+        max(options.pre_drain_timeout, payload_receive_seconds + options.pre_drain_quiet),
+        options.pre_drain_quiet,
+    )
     prefix = f"[B2 RAW {index:02d}/{total:02d} {name} {settings.label()}]"
     received = b""
     bytes_sent = 0
@@ -6011,12 +6427,8 @@ def run_bank2_behavior_probe(
                 if not options.no_pre_drain:
                     drain = drain_output_until_quiet(
                         out_serial=out_serial,
-                        quiet_seconds=options.pre_drain_quiet,
-                        max_seconds=max(
-                            options.pre_drain_timeout,
-                            estimated_receive_seconds(settings, len(payload))
-                            + options.pre_drain_quiet,
-                        ),
+                        quiet_seconds=pre_drain_quiet,
+                        max_seconds=pre_drain_timeout,
                         max_bytes=options.max_drain_bytes,
                         progress_interval=options.progress_interval,
                         progress=console_progress,
@@ -6310,6 +6722,13 @@ def run_bank2_etx_ack_probe(
         switch_note_hash(options.switch_note),
     )
     ack_payload = b"\x06"
+    pre_drain_bytes = max(options.payload_bytes, len(payload), len(ack_payload))
+    pre_drain_timeout, pre_drain_quiet = low_baud_pre_drain_values(
+        settings,
+        pre_drain_bytes,
+        max(options.pre_drain_timeout, 0.5),
+        options.pre_drain_quiet,
+    )
     prefix = f"[B2 ETX/ACK {settings.label()}]"
     forward_received = b""
     reverse_received = b""
@@ -6346,8 +6765,8 @@ def run_bank2_etx_ack_probe(
                 if not options.no_pre_drain:
                     drain = drain_output_until_quiet(
                         out_serial=out_serial,
-                        quiet_seconds=options.pre_drain_quiet,
-                        max_seconds=max(options.pre_drain_timeout, 0.5),
+                        quiet_seconds=pre_drain_quiet,
+                        max_seconds=pre_drain_timeout,
                         max_bytes=options.max_drain_bytes,
                         progress_interval=options.progress_interval,
                         progress=console_progress,
@@ -6970,6 +7389,225 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
     print_bank2_report(result, bank_options.text_report)
 
 
+def memory_test_passed(candidate: CandidateResult, payload: ProbePayload) -> bool:
+    """Return True only when the memory-test output exactly matches input."""
+    return (
+        candidate.error is None
+        and candidate.status == "exact"
+        and candidate.score >= PERFECT_SCORE
+        and candidate.bytes_sent == payload.byte_count
+        and candidate.bytes_received == payload.byte_count
+        and candidate.metrics.exact_byte_match_ratio >= 1.0
+        and candidate.metrics.missing_bytes == 0
+        and candidate.metrics.extra_bytes == 0
+    )
+
+
+def memory_test_reason(candidate: CandidateResult, payload: ProbePayload) -> str:
+    """Return one concise result reason for the memory test."""
+    if memory_test_passed(candidate, payload):
+        return "EXACT ASCII STREAM RETURNED."
+    if candidate.error:
+        return f"SERIAL ERROR: {candidate.error}"
+    if candidate.bytes_sent < payload.byte_count:
+        return "PAYLOAD WAS NOT FULLY SENT."
+    if candidate.bytes_received == 0:
+        return "NO OUTPUT WAS RECEIVED."
+    if candidate.metrics.missing_bytes:
+        return f"{candidate.metrics.missing_bytes} OUTPUT BYTE(S) MISSING."
+    if candidate.metrics.extra_bytes:
+        return f"{candidate.metrics.extra_bytes} EXTRA OUTPUT BYTE(S) RECEIVED."
+    return "OUTPUT CONTENT DID NOT EXACTLY MATCH INPUT."
+
+
+def memory_test_status_text(candidate: CandidateResult, payload: ProbePayload) -> str:
+    """Return PASS or FAIL for a memory-test result."""
+    return "PASS" if memory_test_passed(candidate, payload) else "FAIL"
+
+
+def write_memory_test_text_report(path: Path, result: MemoryTestResult) -> None:
+    """Append one 16K memory-test block to the text report."""
+    candidate = result.candidate
+    payload = result.payload
+    metrics = candidate.metrics
+    settings = result.settings
+    trial = candidate.trials[0] if candidate.trials else None
+    peak_estimate = estimated_memory_test_peak_fill_bytes(
+        result.config.input_baud,
+        result.config.output_baud,
+        result.config.payload_bytes,
+    )
+    lines = [
+        border_line(REPORT_WIDTH),
+        bordered_text("SERIAL PROBE MEMORY TEST", REPORT_WIDTH),
+        border_line(REPORT_WIDTH),
+        f"STARTED UTC:     {result.started_at}",
+        f"COMPLETED UTC:   {result.completed_at}",
+        f"RUN ID:          {result.config.run_id}",
+        f"MODE:            {memory_test_mode_label(result.config.mode)}",
+        f"STATUS:          {memory_test_status_text(candidate, payload)}",
+        f"REASON:          {memory_test_reason(candidate, payload)}",
+        f"COM PATH:        {result.config.in_port} -> BUFFER -> {result.config.out_port}",
+        f"INPUT SETTING:   {settings.input_settings.label()}",
+        f"OUTPUT SETTING:  {settings.output_settings.label()}",
+        f"DIP NOTE:        {result.config.switch_note or '(NOT ENTERED)'}",
+        f"BUFFER TARGET:   {result.config.target_bytes} BYTES",
+        f"PAYLOAD:         {payload.byte_count} ASCII BYTES",
+        f"EST. PEAK FILL:  {peak_estimate} BYTES",
+        f"SENT:            {candidate.bytes_sent} BYTES",
+        f"RECEIVED:        {candidate.bytes_received} BYTES",
+        f"SCORE:           {candidate.score:.2f}",
+        f"EXACT RATIO:     {metrics.exact_byte_match_ratio:.3f}",
+        f"LINE CHECKS:     {metrics.valid_probe_line_count}/{payload.line_count}",
+        f"MISSING/EXTRA:   {metrics.missing_bytes}/{metrics.extra_bytes}",
+        f"PURGE:           {result.purge.bytes_drained} BYTES, {result.purge.reason.upper()}",
+        f"ELAPSED:         {format_duration(result.elapsed_sec)}",
+    ]
+    if trial:
+        lines.extend(
+            [
+                f"PREVIEW ASCII:   {trial.received_preview_ascii}",
+                f"PREVIEW HEX:     {trial.received_preview_hex}",
+            ]
+        )
+    lines.append(border_line(REPORT_WIDTH))
+    with path.open("a", encoding="utf-8") as report_file:
+        report_file.write("\n".join(lines) + "\n")
+
+
+def print_memory_test_report(result: MemoryTestResult, report_path: Path) -> None:
+    """Print the terminal summary for a memory test."""
+    candidate = result.candidate
+    payload = result.payload
+    metrics = candidate.metrics
+    peak_estimate = estimated_memory_test_peak_fill_bytes(
+        result.config.input_baud,
+        result.config.output_baud,
+        result.config.payload_bytes,
+    )
+    print()
+    print_report_title("MEMORY TEST RESULT")
+    print(f"  STATUS:              {memory_test_status_text(candidate, payload)}")
+    print_wrapped_value("  REASON:              ", memory_test_reason(candidate, payload))
+    print(f"  MODE:                {memory_test_mode_label(result.config.mode)}")
+    print(f"  PAYLOAD:             {payload.byte_count} ASCII BYTES")
+    print(f"  EST. PEAK BUFFER:    {peak_estimate} BYTES")
+    print(f"  INPUT:               {result.settings.input_settings.label()}")
+    print(f"  OUTPUT:              {result.settings.output_settings.label()}")
+    print(f"  SENT/RECEIVED:       {candidate.bytes_sent}/{candidate.bytes_received}")
+    print(f"  SCORE:               {candidate.score:.2f}")
+    print(f"  EXACT BYTE RATIO:    {metrics.exact_byte_match_ratio:.3f}")
+    print(f"  LINE CHECKS:         {metrics.valid_probe_line_count}/{payload.line_count}")
+    print(f"  MISSING/EXTRA:       {metrics.missing_bytes}/{metrics.extra_bytes}")
+    print(f"  PURGE:               {result.purge.bytes_drained} BYTES, {result.purge.reason.upper()}")
+    print(f"  RUN TIME:            {format_duration(result.elapsed_sec)}")
+    print_wrapped_value("  TEXT REPORT:         ", f"{report_path} (APPENDED)")
+    print(border_line(REPORT_WIDTH))
+
+
+def run_memory_test(options: ScanOptions) -> int:
+    """Run the fixed 8E1/no-flow 16K memory test from the main menu."""
+    validate_options(options)
+    config = prompt_memory_test_config(options)
+    if config is None:
+        raise ReturnToMainMenu()
+
+    logger = setup_logging(options.log_file)
+    serial_module = import_or_install_pyserial()
+    settings = memory_test_settings(config.input_baud, config.output_baud)
+    nonce = ProbeNonce(
+        run_id=config.run_id,
+        candidate_id="MEMORY",
+        trial_id="T01",
+        switch_note_hash=switch_note_hash(config.switch_note),
+    )
+    payload = generate_probe_payload(
+        config.payload_bytes,
+        PAYLOAD_MODE_ASCII,
+        nonce,
+    )
+    memory_options = dataclasses.replace(
+        options,
+        switch_note=config.switch_note,
+        payload_bytes=payload.byte_count,
+        read_timeout=max(options.read_timeout, MEMORY_TEST_READ_QUIET_SECONDS),
+        bursts=1,
+        no_pre_drain=False,
+        pre_drain_timeout=max(options.pre_drain_timeout, MEMORY_TEST_PRE_DRAIN_TIMEOUT),
+        pre_drain_quiet=max(options.pre_drain_quiet, BUFFER_PURGE_QUIET_SECONDS),
+        max_drain_bytes=max(options.max_drain_bytes, payload.byte_count + config.target_bytes),
+        turbo_discovery_enabled=False,
+        ask_on_top_match=False,
+        auto_validate_top_matches=False,
+        run_id=config.run_id,
+    )
+    transfer_estimate = max(
+        estimated_transmit_seconds(settings.input_settings, payload.byte_count),
+        estimated_receive_seconds(settings.output_settings, payload.byte_count),
+    ) + MEMORY_TEST_READ_QUIET_SECONDS
+
+    print()
+    print_report_title("MEMORY TEST START")
+    print("FIXED FRAME: INPUT 8E1, OUTPUT 8E1, FLOW=NONE.")
+    print(f"MODE: {memory_test_mode_label(config.mode)}; PAYLOAD={payload.byte_count} BYTES.")
+    print(f"PORTS: {options.in_port} -> BUFFER -> {options.out_port}.")
+    print(f"INPUT: {settings.input_settings.label()}.")
+    print(f"OUTPUT: {settings.output_settings.label()}.")
+    print(f"ESTIMATE: {format_duration(transfer_estimate)}; FINISH ABOUT {format_finish_clock(transfer_estimate)}.")
+    print("RESULT REQUIRES EXACT BYTE-FOR-BYTE ASCII MATCH.")
+    print_progress_legend()
+    print(border_line(REPORT_WIDTH))
+
+    started = time.monotonic()
+    started_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    purge_max_seconds = max(
+        estimated_buffer_drain_seconds(settings.output_settings),
+        MEMORY_TEST_PRE_DRAIN_TIMEOUT,
+    )
+    purge = run_known_baud_purge(
+        serial_module=serial_module,
+        options=memory_options,
+        logger=logger,
+        settings=settings.output_settings,
+        max_seconds=purge_max_seconds,
+        reason="CLEAR OUTPUT BEFORE MEMORY TEST.",
+    )
+    if not purge.quiet:
+        print()
+        print_report_title("MEMORY TEST PURGE WARNING")
+        print("OUTPUT DID NOT REPORT QUIET BEFORE THE TEST.")
+        print("RESULT MAY BE MARKED STALE OR FAIL.")
+        if purge.error:
+            print_wrapped_value("  DETAIL: ", purge.error)
+        print(border_line(REPORT_WIDTH))
+
+    candidate = run_dual_candidate(
+        serial_module=serial_module,
+        index=1,
+        total=1,
+        settings=settings,
+        options=memory_options,
+        payload=payload,
+        logger=logger,
+        progress=console_progress,
+    )
+    elapsed = time.monotonic() - started
+    completed_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    result = MemoryTestResult(
+        config=config,
+        settings=settings,
+        payload=payload,
+        purge=purge,
+        candidate=candidate,
+        started_at=started_at,
+        completed_at=completed_at,
+        elapsed_sec=elapsed,
+    )
+    write_memory_test_text_report(options.text_report, result)
+    print_memory_test_report(result, options.text_report)
+    return 0 if memory_test_passed(candidate, payload) else 1
+
+
 def print_commands() -> None:
     """Print the main command menu."""
     def menu_line(left: str = "", right: str = "") -> None:
@@ -6987,19 +7625,20 @@ def print_commands() -> None:
     menu_line("  1  START SCAN", "  2  SET COM PORTS")
     menu_line("  3  SET BAUD RANGE", "  4  SCAN / VALIDATE SETUP")
     menu_line("  5  TIMING / STALE DATA", "  6  SET REPORT FILES")
-    menu_line("  7  RESET REPORT FILES", "  S  CURRENT SETTINGS")
-    menu_line("  ?  HELP", "  0  QUIT")
+    menu_line("  7  RESET REPORT FILES", "  8  MEMORY TEST 16K")
+    menu_line("  S  CURRENT SETTINGS", "  ?  HELP")
+    menu_line("  0  QUIT")
     print(border_line(SCREEN_WIDTH))
 
 
-def interactive_menu(options: ScanOptions | None = None) -> ScanOptions | None:
+def interactive_menu(options: ScanOptions | None = None) -> MenuSelection | None:
     """Show the command-line style configuration menu."""
     if options is None:
         options = default_scan_options()
     while True:
         print_commands()
         try:
-            choice = read_operator_input("COMMAND (1-7,S,?,0): ").lstrip("\ufeff").strip().lower()
+            choice = read_operator_input("COMMAND (1-8,S,?,0): ").lstrip("\ufeff").strip().lower()
         except EOFError:
             return None
 
@@ -7009,7 +7648,7 @@ def interactive_menu(options: ScanOptions | None = None) -> ScanOptions | None:
             except ValueError as exc:
                 print(f"SETTINGS ERROR: {exc}")
                 continue
-            return options
+            return MenuSelection("scan", options)
         if choice == "2":
             options = configure_ports(options)
         elif choice == "3":
@@ -7027,6 +7666,13 @@ def interactive_menu(options: ScanOptions | None = None) -> ScanOptions | None:
                 text_report=default_text_report,
                 log_file=default_log,
             )
+        elif choice == "8":
+            try:
+                validate_options(options)
+            except ValueError as exc:
+                print(f"SETTINGS ERROR: {exc}")
+                continue
+            return MenuSelection("memory", options)
         elif choice in {"s", "c", "settings", "current"}:
             print_configuration(options)
         elif choice in {"h", "help", "?"}:
@@ -7034,16 +7680,19 @@ def interactive_menu(options: ScanOptions | None = None) -> ScanOptions | None:
         elif choice in {"0", "q", "quit", "exit"}:
             return None
         else:
-            print("ENTER 1-7, S, ?, OR 0.")
+            print("ENTER 1-8, S, ?, OR 0.")
 
 
-def prompt_after_scan_action(title: str = "RUN COMPLETE") -> str:
+def prompt_after_scan_action(
+    title: str = "RUN COMPLETE",
+    run_again_label: str = "START SCAN AGAIN",
+) -> str:
     """Ask what to do after a scan or sweep finishes or stops."""
     print()
     print(border_line(REPORT_WIDTH))
     print(bordered_text(title, REPORT_WIDTH))
     print(border_line(REPORT_WIDTH))
-    print("  1 START SCAN AGAIN")
+    print(f"  1 {run_again_label}")
     print("  2 RETURN TO MAIN MENU")
     print("  0 QUIT")
     print(border_line(REPORT_WIDTH))
@@ -7672,8 +8321,71 @@ def run_self_tests() -> int:
         masked_score.metrics.high_bit_stripped_count > 0
     ), "masked high-bit stripped bytes were not counted"
 
+    phase0_template = generate_phase0_payload()
+    assert (
+        phase0_payload_bytes() == PHASE0_PAYLOAD_BYTES
+    ), "Phase 0 liveness payload must stay compact"
+    assert (
+        phase0_template.byte_count == PHASE0_PAYLOAD_BYTES
+    ), "Phase 0 template size changed"
+    phase0_trial = payload_for_trial(
+        template=phase0_template,
+        settings=dual_phase0_settings(1200, 1200),
+        candidate_index=1,
+        burst_index=1,
+        run_id="DTEST",
+        switch_hash=None,
+    )
+    assert phase0_trial is phase0_template, "Phase 0 trial should not be nonced"
+    assert b"RUN=" not in phase0_trial.data, "Phase 0 payload should remain compact"
+    phase0_score = score_received(phase0_trial.data, phase0_trial.data)
+    assert phase0_score.score == 100.0, "Phase 0 exact payload did not score 100"
+    phase0_options = phase0_scan_options(default_scan_options())
+    phase0_1200_timing = effective_discovery_timing(
+        phase0_options,
+        phase0_baseline_settings(1200),
+        phase0_payload_bytes(),
+    )
+    assert (
+        phase0_1200_timing.read_timeout > PHASE0_READ_TIMEOUT
+    ), "Phase 0 1200 baud read timeout was not expanded"
+    assert (
+        phase0_1200_timing.pre_drain_timeout > PHASE0_PRE_DRAIN_TIMEOUT
+    ), "Phase 0 1200 baud pre-drain timeout was not expanded"
+    phase0_4800_timing = effective_discovery_timing(
+        phase0_options,
+        phase0_baseline_settings(4800),
+        phase0_payload_bytes(),
+    )
+    assert (
+        phase0_4800_timing.read_timeout == PHASE0_READ_TIMEOUT
+    ), "Phase 0 4800 baud timing should stay at the fast baseline"
+
     frame_1200 = SerialSettings(1200, 8, "none", 1, "none")
     frame_300 = SerialSettings(300, 8, "none", 1, "none")
+    default_options = default_scan_options()
+    default_1200_timing = effective_discovery_timing(
+        default_options,
+        frame_1200,
+        DEFAULT_PAYLOAD_BYTES,
+    )
+    assert (
+        default_1200_timing.read_timeout == DEFAULT_READ_TIMEOUT
+    ), "general low-baud timing should not change normal read quiet"
+    assert (
+        default_1200_timing.pre_drain_quiet > DEFAULT_PRE_DRAIN_QUIET
+    ), "general 1200 baud pre-drain quiet was not expanded"
+    assert (
+        default_1200_timing.pre_drain_timeout > DEFAULT_PRE_DRAIN_TIMEOUT
+    ), "general 1200 baud pre-drain timeout was not expanded"
+    default_4800_timing = effective_discovery_timing(
+        default_options,
+        SerialSettings(4800, 8, "none", 1, "none"),
+        DEFAULT_PAYLOAD_BYTES,
+    )
+    assert (
+        default_4800_timing.pre_drain_timeout == DEFAULT_PRE_DRAIN_TIMEOUT
+    ), "4800 baud should stay at the normal pre-drain baseline"
     assert_approx(
         estimated_buffer_drain_seconds(frame_1200, safety_factor=1.0),
         (16 * 1024 * 10) / 1200,
@@ -7766,6 +8478,66 @@ def run_self_tests() -> int:
     validate_supported_baud(9600)
     expect_value_error(lambda: validate_supported_baud(2400), "unsupported 2400 baud accepted")
     expect_value_error(lambda: validate_supported_baud(12345), "unsupported baud accepted")
+    memory_settings = memory_test_settings(38400, 9600)
+    assert memory_settings.input_settings == SerialSettings(
+        38400,
+        8,
+        "even",
+        1,
+        "none",
+    ), "memory-test input frame must be fixed 8E1 no-flow"
+    assert memory_settings.output_settings == SerialSettings(
+        9600,
+        8,
+        "even",
+        1,
+        "none",
+    ), "memory-test output frame must be fixed 8E1 no-flow"
+    assert (
+        memory_test_fill_payload_bytes(38400, 38400) == MEMORY_TEST_TARGET_BYTES
+    ), "same-baud memory fill should not inflate payload"
+    assert (
+        memory_test_fill_payload_bytes(38400, 19200) == MEMORY_TEST_TARGET_BYTES * 2
+    ), "2:1 baud memory fill should send 32K"
+    fill_payload = memory_test_fill_payload_bytes(38400, 9600)
+    assert fill_payload > MEMORY_TEST_TARGET_BYTES, "fill mode should exceed 16K when output drains"
+    assert (
+        estimated_memory_test_peak_fill_bytes(38400, 9600, fill_payload)
+        >= MEMORY_TEST_TARGET_BYTES - 1
+    ), "fill mode should estimate a near-16K peak"
+    assert (
+        parse_memory_test_mode_choice("", True) == MEMORY_TEST_MODE_FILL
+    ), "blank memory mode should default to fill when available"
+    assert (
+        parse_memory_test_mode_choice("", False) == MEMORY_TEST_MODE_IMAGE
+    ), "blank memory mode should default to image when fill is unavailable"
+    assert (
+        parse_memory_test_mode_choice("2", False) is None
+    ), "fill mode should be invalid when input baud is not faster"
+    memory_payload = generate_payload(MEMORY_TEST_TARGET_BYTES, nonce_a)
+    memory_candidate = fake_clean_candidate_result(memory_settings, memory_payload)
+    assert memory_test_passed(
+        memory_candidate,
+        memory_payload,
+    ), "exact memory-test candidate did not pass"
+    missing_memory = dataclasses.replace(
+        memory_candidate,
+        bytes_received=memory_payload.byte_count - 1,
+        score=99.0,
+        status="partial",
+        metrics=dataclasses.replace(
+            memory_candidate.metrics,
+            exact_byte_match_ratio=0.999,
+            missing_bytes=1,
+        ),
+    )
+    assert not memory_test_passed(
+        missing_memory,
+        memory_payload,
+    ), "missing memory-test byte incorrectly passed"
+    assert (
+        "MISSING" in memory_test_reason(missing_memory, memory_payload)
+    ), "missing memory-test byte reason was not clear"
     validate_report_path(Path("serial_probe_report.txt"))
     expect_value_error(lambda: validate_report_path(Path(".")), "directory report path accepted")
     expect_value_error(
@@ -7993,21 +8765,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     scan_started = False
     while True:
         try:
-            selected_options = interactive_menu(options)
+            selection = interactive_menu(options)
         except ReturnToMainMenuAfterReport:
             last_status = OPERATOR_BREAK_EXIT_CODE
             continue
         except QuitProgramAfterReport:
             return OPERATOR_BREAK_EXIT_CODE
-        if selected_options is None:
+        if selection is None:
             print("PROGRAM ENDED." if scan_started else "NO SCAN STARTED.")
             return last_status
-        options = selected_options
+        options = selection.options
+        run_again_label = (
+            "RUN MEMORY TEST AGAIN"
+            if selection.action == "memory"
+            else "START SCAN AGAIN"
+        )
         while True:
             try:
-                last_status = run_scan(options)
+                if selection.action == "memory":
+                    last_status = run_memory_test(options)
+                else:
+                    last_status = run_scan(options)
                 scan_started = True
-                action = prompt_after_scan_action()
+                action = prompt_after_scan_action(
+                    run_again_label=run_again_label,
+                )
             except ReturnToMainMenu:
                 break
             except ReturnToMainMenuAfterReport:
@@ -8021,7 +8803,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print("INTERRUPTED BY OPERATOR.")
                 scan_started = True
                 last_status = OPERATOR_BREAK_EXIT_CODE
-                action = prompt_after_scan_action("TEST INTERRUPTED")
+                action = prompt_after_scan_action(
+                    "TEST INTERRUPTED",
+                    run_again_label=run_again_label,
+                )
             if action == "rerun":
                 continue
             if action == "menu":

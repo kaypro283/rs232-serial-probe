@@ -25,7 +25,7 @@ Usage screen:
 python serial_probe.py --help
 ```
 
-The first screen is the command menu. Use `S CURRENT SETTINGS` to view ports, baud range, number of settings to test, test message size, repeat count, timing, old-output clearing, Phase 0 liveness settings, report files, and estimated scan time. It also shows that scan type is asked at scan start and that blank means `FULL`. The normal full scan tests every selected combination unless you explicitly choose quick exploratory narrowing.
+The first screen is the command menu. Use `S CURRENT SETTINGS` to view ports, baud range, test message size, repeat count, timing, old-output clearing, Phase 0 liveness settings, report files, and available test workflows. `1 START SCAN` opens the discovery workflow menu. `8 MEMORY TEST 16K` runs the fixed-frame memory test.
 
 The terminal UI is written for an 80-column by 25-line early terminal style. Long operator screens pause with `PRESS ENTER FOR MORE, Q TO STOP:`. Screens use terse uppercase operator text and bright green text when the console supports ANSI color. PyCharm runs are treated as color-capable. Set `NO_COLOR=1` before running if you want plain console text.
 
@@ -43,95 +43,63 @@ After a scan finishes or is interrupted by the operator, the program stays in th
 
 During a running scan or validation pass, press `Ctrl+C` for the `OPERATOR BREAK` menu. The menu can resume the same test, end the test and write a partial report, return to the main menu after writing the report, or quit after writing the report.
 
-## Scan Type
+## 16K Memory Test
 
-When a scan starts, the tool asks:
+Select `8 MEMORY TEST 16K` from the main menu to send a checked ASCII printer-style stream through the buffer and compare the output byte for byte.
 
-```text
-SCAN TYPE: FULL OR QUICK [FULL]:
-```
+The memory test is deliberately separate from scan discovery:
 
-Accepted answers are `F`, `FULL`, `M`, `MANUAL`, `Q`, and `QUICK`. Old `A` and `AUTO` inputs are still accepted as aliases for `QUICK`. Press Enter for `FULL`.
+- Fixed frame: `8E1`.
+- Flow control: `none`.
+- User-selected input baud and output baud from the supported baud table.
+- Append-only result block in the normal text report.
+- Exact match required for `PASS`; missing, extra, changed, stale, or no output bytes fail the test.
 
-`FULL` is the default and is the safest mode for switch mapping. It asks whether to run quick exploratory mode, and pressing Enter answers `N`, so the normal path is a complete scan over every selected setting.
-
-`QUICK` runs Phase 0 baud liveness, then quick exploratory mode, and accepts phase-2 full analysis from the quick findings without asking the two follow-up yes/no questions:
-
-```text
-QUICK SCAN: EXPLORATORY=YES PHASE2=YES
-```
-
-`MANUAL` is accepted as an alias for `FULL`.
-
-## Quick Exploratory Mode
-
-In `FULL` mode, the tool asks:
+The size menu has two modes:
 
 ```text
-RUN QUICK EXPLORATORY MODE FIRST? (Y/N) [N]:
+1 16K IMAGE   SEND 16384 ASCII BYTES
+2 FILL 16K    SEND ENOUGH ASCII TO APPROACH 16K WHILE OUTPUT DRAINS
 ```
 
-Answer `N` or press Enter to run the normal full scan over every selected setting.
+`FILL 16K` is available only when input baud is faster than output baud. If input and output are the same speed, or output is faster, the buffer may pass data through without filling the 16K RAM. The program shows the estimated peak buffer use before it starts.
 
-Answer `Y` to run the quick pipeline first. The pipeline starts with Phase 0, then runs the normal quick exploratory pass against the bauds Phase 0 marked alive. The quick pass uses fixed internal settings:
+At low output baud rates this test can take a long time. A full 16K stream at `300` baud with `8E1` framing takes about ten minutes to drain, before any safety margin.
 
-- `160` byte probe payload, or the generator minimum if that is ever larger.
-- `1` test per setting.
-- `0.4` second output quiet wait after sending.
-- `20` ms port-open pause.
-- Old-output clearing on, with `0.1` seconds quiet, `0.5` seconds limit, and `32768` max clear bytes.
+## Start Scan Workflow
 
-These exploratory payload, timing, repeat, and old-output clearing settings are not configurable from the menu. Menu settings for test size, timing, repeat count, and clearing apply to the full scan only.
-
-After the quick pass, the tool prints a concise ranked summary with top observed candidates, confidence notes, stale/no-data/error counts, and whether the findings are strong enough to form a shortlist. If the findings are usable, it asks:
+Select `1 START SCAN` from the main menu to choose one of the scan workflows:
 
 ```text
-USE THESE FINDINGS TO NARROW FULL ANALYSIS? (Y/N) [N]:
+1 AUTOMATED DISCOVERY
+2 BANK 2 SWITCH-STATE TEST USING KNOWN BAUD
+3 PHASE 0 BAUD LIVENESS ONLY
+4 RETURN TO MAIN MENU
 ```
 
-Answer `Y` to run the full scan only against the exploratory shortlist. Only the candidate list is narrowed; the full scan still uses the normal menu-configured payload, timing, repeat count, report settings, and validation settings. To avoid dropping meaningful flow-control differences, the shortlist keeps all flow-control modes for each promising baud/data/parity/stop-bit frame found by the quick pass.
+`AUTOMATED DISCOVERY` starts with Phase 0 baud liveness, then runs staged input/output frame sweeps and a full matrix fallback only when needed. It can validate the top match afterward, depending on `4 SCAN / VALIDATE SETUP`.
 
-Answer `N` or press Enter to ignore the quick findings and run the normal full scan over every selected setting.
+`BANK 2 SWITCH-STATE TEST USING KNOWN BAUD` is for a switch bank or buffer mode where you already know the input and output baud. It runs targeted ASCII, 8-bit, raw job behavior, ETX/ACK, and flow validation checks.
 
-If quick exploratory mode finds no usable signal, produces only low-confidence results, or is dominated by stale/no-data/error outcomes, the tool does not offer narrowing and falls back to the normal full scan automatically.
+`PHASE 0 BAUD LIVENESS ONLY` only tests whether selected input/output baud pairs show a basic signal. It does not use the scan/validate message-size settings.
 
 ## Phase 0 Baud Liveness Sweep
 
-When quick exploratory mode runs, the tool first tests each selected baud once using fixed baseline settings:
+Phase 0 tests selected baud pairs using fixed baseline settings:
 
-- `8` data bits, mark parity, `1` stop bit.
+- `8` data bits, even parity, `1` stop bit.
 - Flow control off.
 - Compact structural liveness payload.
-- `0.25` second output quiet wait after sending.
-- `10` ms port-open pause.
-- Old-output clearing on, with `0.05` seconds quiet, `0.25` seconds limit, and `32768` max clear bytes.
+- Fixed internal count and timing.
+- Old-output clearing on.
 
-Phase 0 is a boolean gate, not a ranking. A baud is marked `ALIVE` only when the received bytes contain a valid checksummed probe line, at least one expected probe marker, a score of `90.0` or higher, no serial error, no stale output, and only limited extra bytes. Random noise or old backlog bytes are not enough.
+Phase 0 is a boolean gate, not a ranking. A baud pair is marked `ALIVE` only when the received bytes contain valid checked probe structure, no serial error, no stale output, and only limited extra bytes.
 
-If one or more bauds are alive, quick exploratory tests only candidates at those bauds. If zero bauds are alive, the tool prints an explicit fallback and quick exploratory uses all selected bauds, preserving the older behavior. The full scan still tests all selected settings unless the normal quick shortlist is accepted for phase 2.
-
-Prompt-path checks:
-
-```text
-Scan type FULL, quick prompt N:
-  Skip quick mode. Full scan runs all selected settings.
-
-Scan type FULL, quick prompt Y, phase-2 prompt N:
-  Quick summary is shown. Full scan still runs all selected settings.
-
-Scan type FULL, quick prompt Y, phase-2 prompt Y:
-  Quick summary is shown. Full scan runs the narrowed candidate list using full-scan settings.
-
-Scan type QUICK:
-  Phase 0 and quick mode run. Phase 2 uses quick findings if they are usable; otherwise full scan runs all selected settings.
-
-Scan type FULL, quick prompt Y, no usable quick findings:
-  Quick summary explains the fallback. Full scan runs all selected settings.
-```
+If no baud pair is alive, the program explains the condition. For narrow baud ranges it can offer a same-baud frame fallback so the operator is not silently returned to the main menu.
 
 ## How Many Combinations?
 
-With the default printer-buffer baud range, the scan tests:
+With the default printer-buffer baud range, the complete same-frame matrix is:
 
 ```text
 6 baud rates x 2 data-bit choices x 5 parity choices x 2 stop-bit choices x 4 flow-control choices = 480 combinations
@@ -143,7 +111,7 @@ The default baud list is:
 300, 1200, 4800, 9600, 19200, 38400
 ```
 
-The scan tries the fastest selected baud rate first, then works downward. With the default range, it starts at `38400` and ends at `300`. A normal full scan still tests every data-bit, parity, stop-bit, and flow-control combination. Quick exploratory may test fewer combinations when Phase 0 finds a smaller alive baud set.
+The scan tries the fastest selected baud rate first, then works downward. With the default range, it starts at `38400` and ends at `300`. Automated discovery starts with Phase 0 and staged frame sweeps; it runs the larger full matrix only when the staged checks do not find a strong pair.
 
 ## Speed
 
@@ -151,7 +119,7 @@ The default menu settings are tuned for a practical scan:
 
 - `384` bytes per setting.
 - `1` test per setting.
-- Every selected serial setting is tested in a normal full scan. QUICK may shorten the exploratory pass with Phase 0 and may shorten the phase-2 candidate list only when confidence gates pass.
+- Automated discovery uses Phase 0 and staged frame sweeps before any full matrix fallback.
 - Output wait after send is `2.0` seconds by default.
 - `Ask on top match` is off by default. If enabled, a `PASS` result pauses the scan and asks whether to continue looking for possible ties.
 - `Auto validate top matches after scan` is on by default. It retests the top-score setting or settings with an 8K payload. The menu can turn this off or change the size.
@@ -225,7 +193,7 @@ It also writes:
 
 The report paths are configured from the menu.
 
-Each scan appends a compact run block with the switch/jumper note, selected scan type, phase summary, top results, validation results when run, and interpretation notes.
+Each scan appends a compact run block with the switch/jumper note, selected workflow, phase summary, top results, validation results when run, and interpretation notes.
 
 ## Safety Notes
 
