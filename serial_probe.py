@@ -15,6 +15,7 @@ import ctypes
 import dataclasses
 import datetime as dt
 import logging
+import math
 import os
 import platform
 import re
@@ -1152,8 +1153,23 @@ def normalize_port_name(port: str) -> str:
     return normalized
 
 
+def validate_port_name(port: str) -> None:
+    """Raise if a port name is not a plain Windows COM port."""
+    normalized = normalize_port_name(port)
+    if not normalized:
+        raise ValueError("PORT NAME CANNOT BE BLANK")
+    match = re.fullmatch(r"COM([1-9][0-9]*)", normalized)
+    if not match:
+        raise ValueError("ENTER A WINDOWS COM PORT SUCH AS COM1 OR COM5")
+    port_number = int(match.group(1))
+    if port_number > 256:
+        raise ValueError("COM PORT NUMBER MUST BE 1 THROUGH 256")
+
+
 def ensure_distinct_ports(in_port: str, out_port: str) -> None:
     """Raise if the input and output ports resolve to the same port name."""
+    validate_port_name(in_port)
+    validate_port_name(out_port)
     if normalize_port_name(in_port) == normalize_port_name(out_port):
         raise ValueError("INPUT AND OUTPUT PORTS MUST NOT BE THE SAME")
 
@@ -1390,15 +1406,20 @@ def print_paged_lines(
         print(line)
         if index >= len(all_lines) or index % page_lines != 0:
             continue
-        try:
-            choice = input("PRESS ENTER FOR MORE, Q TO STOP: ")
-        except EOFError:
-            print()
-            for rest in all_lines[index:]:
-                print(rest)
-            return
-        if choice.lstrip("\ufeff").strip().lower() in {"q", "quit", "0"}:
-            return
+        while True:
+            try:
+                choice = read_operator_input("PRESS ENTER FOR MORE, Q TO STOP: ")
+            except EOFError:
+                print()
+                for rest in all_lines[index:]:
+                    print(rest)
+                return
+            choice = choice.lstrip("\ufeff").strip().lower()
+            if choice == "":
+                break
+            if choice in {"q", "quit", "0"}:
+                return
+            print("PRESS ENTER OR Q.")
         print()
 
 
@@ -2877,6 +2898,8 @@ def ensure_run_id(options: ScanOptions, prefix: str = "R") -> ScanOptions:
 def validate_options(options: ScanOptions) -> None:
     """Validate scan options before launching hardware I/O."""
     ensure_distinct_ports(options.in_port, options.out_port)
+    validate_supported_baud(options.min_baud)
+    validate_supported_baud(options.max_baud)
     if options.payload_bytes < minimum_payload_size():
         raise ValueError(f"TEST MESSAGE SIZE MUST BE AT LEAST {minimum_payload_size()} BYTES")
     if options.read_timeout <= 0:
@@ -2893,6 +2916,8 @@ def validate_options(options: ScanOptions) -> None:
         raise ValueError("CLEAR OUTPUT TIME CANNOT BE NEGATIVE")
     if options.pre_drain_quiet <= 0:
         raise ValueError("QUIET TIME MUST BE POSITIVE")
+    if not options.no_pre_drain and options.pre_drain_timeout < options.pre_drain_quiet:
+        raise ValueError("CLEAR OUTPUT TIME MUST BE >= QUIET TIME")
     if options.max_drain_bytes <= 0:
         raise ValueError("MAX CLEAR BYTES MUST BE POSITIVE")
     if options.validate_size_1_bytes < minimum_payload_size():
@@ -2906,6 +2931,8 @@ def validate_options(options: ScanOptions) -> None:
         raise ValueError(f"VALIDATE SIZE 2 MUST BE 0 OR AT LEAST {minimum_payload_size()} BYTES")
     if options.flow_validate_size_bytes < minimum_payload_size():
         raise ValueError(f"FLOW VALIDATE SIZE MUST BE AT LEAST {minimum_payload_size()} BYTES")
+    validate_report_path(options.text_report)
+    validate_report_path(options.log_file)
     available_bauds(options.min_baud, options.max_baud)
 
 
@@ -3941,20 +3968,54 @@ def dual_scan_candidate_count(pairs: Sequence[tuple[int, int]]) -> int:
     return len(pairs) * frame_count * frame_count
 
 
+def supported_baud_label() -> str:
+    """Return the configured baud table as one operator-facing list."""
+    return ", ".join(str(baud) for baud in BAUD_RATES)
+
+
+def validate_supported_baud(baud: int) -> None:
+    """Raise if baud is not one of the program baud rates."""
+    if baud not in BAUD_RATES:
+        raise ValueError("ENTER ONE OF: " + supported_baud_label())
+
+
+def validate_report_path(path: Path) -> None:
+    """Raise if a report/log path cannot be used as an append target."""
+    text = str(path).strip()
+    if not text:
+        raise ValueError("PATH CANNOT BE BLANK")
+    if any(ord(char) < 32 for char in text):
+        raise ValueError("PATH CONTAINS A CONTROL CHARACTER")
+    drive = path.drive
+    remainder = text[len(drive) :] if drive else text
+    if any(char in remainder for char in '<>"|?*') or ":" in remainder:
+        raise ValueError("PATH CONTAINS A CHARACTER DOS/WINDOWS CANNOT USE")
+    if path.exists() and path.is_dir():
+        raise ValueError("PATH NAMES A DIRECTORY, NOT A FILE")
+    parent = path.parent if str(path.parent) else Path(".")
+    if not parent.exists():
+        raise ValueError("PATH DIRECTORY DOES NOT EXIST")
+
+
 def prompt_text(label: str, current: str) -> str:
     """Prompt for a string value, preserving current on blank input."""
     try:
-        value = input(f"{label.upper()} [{current}]: ").strip()
+        value = read_operator_input(f"{label.upper()} [{current}]: ").strip()
     except EOFError:
         return current
     return current if value == "" else value
 
 
-def prompt_int(label: str, current: int, minimum: int | None = None) -> int:
+def prompt_int(
+    label: str,
+    current: int,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
     """Prompt for an integer value, preserving current on blank input."""
     while True:
         try:
-            value = input(f"{label.upper()} [{current}]: ").strip()
+            value = read_operator_input(f"{label.upper()} [{current}]: ").strip()
         except EOFError:
             return current
         if value == "":
@@ -3967,14 +4028,38 @@ def prompt_int(label: str, current: int, minimum: int | None = None) -> int:
         if minimum is not None and parsed < minimum:
             print(f"ENTER A VALUE >= {minimum}.")
             continue
+        if maximum is not None and parsed > maximum:
+            print(f"ENTER A VALUE <= {maximum}.")
+            continue
         return parsed
+
+
+def prompt_supported_baud(label: str, current: int) -> int:
+    """Prompt for one baud value from the program baud table."""
+    while True:
+        baud = prompt_int(label, current, minimum=1)
+        try:
+            validate_supported_baud(baud)
+        except ValueError as exc:
+            print(exc)
+            continue
+        return baud
+
+
+def prompt_int_zero_or_min(label: str, current: int, minimum: int) -> int:
+    """Prompt for an integer that may be zero or at least minimum."""
+    while True:
+        value = prompt_int(label, current, minimum=0)
+        if value == 0 or value >= minimum:
+            return value
+        print(f"ENTER 0 OR A VALUE >= {minimum}.")
 
 
 def prompt_float(label: str, current: float, minimum: float | None = None) -> float:
     """Prompt for a float value, preserving current on blank input."""
     while True:
         try:
-            value = input(f"{label.upper()} [{current}]: ").strip()
+            value = read_operator_input(f"{label.upper()} [{current}]: ").strip()
         except EOFError:
             return current
         if value == "":
@@ -3983,6 +4068,9 @@ def prompt_float(label: str, current: float, minimum: float | None = None) -> fl
             parsed = float(value)
         except ValueError:
             print("ENTER A NUMBER.")
+            continue
+        if not math.isfinite(parsed):
+            print("ENTER A FINITE NUMBER.")
             continue
         if minimum is not None and parsed < minimum:
             print(f"ENTER A VALUE >= {minimum}.")
@@ -3993,10 +4081,34 @@ def prompt_float(label: str, current: float, minimum: float | None = None) -> fl
 def prompt_path(label: str, current: Path) -> Path:
     """Prompt for a filesystem path, preserving current on blank input."""
     try:
-        value = input(f"{label.upper()} [{current}]: ").strip()
+        value = read_operator_input(f"{label.upper()} [{current}]: ").strip()
     except EOFError:
         return current
     return current if value == "" else Path(value)
+
+
+def prompt_report_path(label: str, current: Path) -> Path:
+    """Prompt for an appendable report/log path."""
+    while True:
+        path = prompt_path(label, current)
+        try:
+            validate_report_path(path)
+        except ValueError as exc:
+            print(f"PATH ERROR: {exc}")
+            continue
+        return path
+
+
+def prompt_port(label: str, current: str) -> str:
+    """Prompt for a validated Windows COM port name."""
+    while True:
+        port = prompt_text(label, current)
+        try:
+            validate_port_name(port)
+        except ValueError as exc:
+            print(f"PORT ERROR: {exc}")
+            continue
+        return normalize_port_name(port)
 
 
 def prompt_yes_no(label: str, current: bool) -> bool:
@@ -4256,11 +4368,32 @@ def print_configuration(options: ScanOptions) -> None:
 def configure_baud_range(options: ScanOptions) -> ScanOptions:
     """Prompt for the baud range."""
     print("AVAILABLE BAUD RATES:")
-    print(", ".join(str(baud) for baud in BAUD_RATES))
+    print(supported_baud_label())
     print("SCAN ORDER: FASTEST SELECTED BAUD FIRST.")
-    min_baud = prompt_int("MINIMUM BAUD", options.min_baud)
-    max_baud = prompt_int("MAXIMUM BAUD", options.max_baud)
-    return dataclasses.replace(options, min_baud=min_baud, max_baud=max_baud)
+    while True:
+        min_baud = prompt_supported_baud("MINIMUM BAUD", options.min_baud)
+        max_baud = prompt_supported_baud("MAXIMUM BAUD", options.max_baud)
+        try:
+            available_bauds(min_baud, max_baud)
+        except ValueError as exc:
+            print(f"BAUD RANGE ERROR: {exc}")
+            print("RE-ENTER BAUD RANGE.")
+            continue
+        return dataclasses.replace(options, min_baud=min_baud, max_baud=max_baud)
+
+
+def configure_ports(options: ScanOptions) -> ScanOptions:
+    """Prompt for validated input/output COM ports."""
+    while True:
+        in_port = prompt_port("INPUT/TRANSMIT PORT", options.in_port)
+        out_port = prompt_port("OUTPUT/READ PORT", options.out_port)
+        try:
+            ensure_distinct_ports(in_port, out_port)
+        except ValueError as exc:
+            print(f"PORT ERROR: {exc}")
+            print("RE-ENTER COM PORTS.")
+            continue
+        return dataclasses.replace(options, in_port=in_port, out_port=out_port)
 
 
 def configure_payload(options: ScanOptions) -> ScanOptions:
@@ -4294,14 +4427,11 @@ def configure_payload(options: ScanOptions) -> ScanOptions:
             options.validate_size_1_bytes,
             minimum=minimum_payload_size(),
         )
-        validate_size_2 = prompt_int(
+        validate_size_2 = prompt_int_zero_or_min(
             "VALIDATE SIZE 2 ON TIE (0=OFF)",
             options.validate_size_2_tie_bytes,
-            minimum=0,
+            minimum_payload_size(),
         )
-        if 0 < validate_size_2 < minimum_payload_size():
-            print(f"VALUE {validate_size_2} TOO SMALL. USING {minimum_payload_size()}.")
-            validate_size_2 = minimum_payload_size()
     if auto_flow_validate:
         flow_validate_size = prompt_int(
             "FLOW VALIDATE SIZE BYTES",
@@ -4323,62 +4453,67 @@ def configure_payload(options: ScanOptions) -> ScanOptions:
 
 def configure_timing(options: ScanOptions) -> ScanOptions:
     """Prompt for timing settings."""
-    print("TIMING AND STALE DATA")
-    print("TURBO APPLIES ONLY TO SCAN DISCOVERY.")
-    print("VALIDATION USES CONSERVATIVE TIMING.")
-    turbo_enabled = prompt_yes_no(
-        "TURBO DISCOVERY MODE",
-        options.turbo_discovery_enabled,
-    )
-    pre_drain_enabled = prompt_yes_no(
-        "REJECT STALE OUTPUT BEFORE EACH TEST",
-        not options.no_pre_drain,
-    )
-    read_timeout = prompt_float(
-        "OUTPUT WAIT AFTER SEND, SECONDS",
-        options.read_timeout,
-        0.1,
-    )
-    settle_ms = prompt_int("PAUSE AFTER OPENING PORTS, MS", options.settle_ms, 0)
-    pre_drain_quiet = prompt_float(
-        "QUIET TIME BEFORE SEND, SECONDS",
-        options.pre_drain_quiet,
-        0.05,
-    )
-    pre_drain_timeout = prompt_float(
-        "MAX TIME CLEARING OLD OUTPUT, SECONDS",
-        options.pre_drain_timeout,
-        0.0,
-    )
-    max_drain_bytes = prompt_int(
-        "MAX OLD BYTES TO CLEAR BEFORE STALE",
-        options.max_drain_bytes,
-        1,
-    )
-    progress_interval = prompt_float(
-        "SCREEN UPDATE INTERVAL, SECONDS",
-        options.progress_interval,
-        0.1,
-    )
-    return dataclasses.replace(
-        options,
-        turbo_discovery_enabled=turbo_enabled,
-        no_pre_drain=not pre_drain_enabled,
-        read_timeout=read_timeout,
-        settle_ms=settle_ms,
-        pre_drain_quiet=pre_drain_quiet,
-        pre_drain_timeout=pre_drain_timeout,
-        max_drain_bytes=max_drain_bytes,
-        progress_interval=progress_interval,
-    )
+    while True:
+        print("TIMING AND STALE DATA")
+        print("TURBO APPLIES ONLY TO SCAN DISCOVERY.")
+        print("VALIDATION USES CONSERVATIVE TIMING.")
+        turbo_enabled = prompt_yes_no(
+            "TURBO DISCOVERY MODE",
+            options.turbo_discovery_enabled,
+        )
+        pre_drain_enabled = prompt_yes_no(
+            "REJECT STALE OUTPUT BEFORE EACH TEST",
+            not options.no_pre_drain,
+        )
+        read_timeout = prompt_float(
+            "OUTPUT WAIT AFTER SEND, SECONDS",
+            options.read_timeout,
+            0.1,
+        )
+        settle_ms = prompt_int("PAUSE AFTER OPENING PORTS, MS", options.settle_ms, 0)
+        pre_drain_quiet = prompt_float(
+            "QUIET TIME BEFORE SEND, SECONDS",
+            options.pre_drain_quiet,
+            0.05,
+        )
+        pre_drain_timeout = prompt_float(
+            "MAX TIME CLEARING OLD OUTPUT, SECONDS",
+            options.pre_drain_timeout,
+            0.0,
+        )
+        if pre_drain_enabled and pre_drain_timeout < pre_drain_quiet:
+            print("TIMING ERROR: MAX TIME CLEARING OLD OUTPUT MUST BE >= QUIET TIME.")
+            print("RE-ENTER TIMING VALUES.")
+            continue
+        max_drain_bytes = prompt_int(
+            "MAX OLD BYTES TO CLEAR BEFORE STALE",
+            options.max_drain_bytes,
+            1,
+        )
+        progress_interval = prompt_float(
+            "SCREEN UPDATE INTERVAL, SECONDS",
+            options.progress_interval,
+            0.1,
+        )
+        return dataclasses.replace(
+            options,
+            turbo_discovery_enabled=turbo_enabled,
+            no_pre_drain=not pre_drain_enabled,
+            read_timeout=read_timeout,
+            settle_ms=settle_ms,
+            pre_drain_quiet=pre_drain_quiet,
+            pre_drain_timeout=pre_drain_timeout,
+            max_drain_bytes=max_drain_bytes,
+            progress_interval=progress_interval,
+        )
 
 
 def configure_reports(options: ScanOptions) -> ScanOptions:
     """Prompt for result and report settings."""
     top = prompt_int("NUMBER OF TOP ROWS TO SHOW", options.top, 1)
-    text_report = prompt_path("APPEND TEXT REPORT FILE", options.text_report)
+    text_report = prompt_report_path("APPEND TEXT REPORT FILE", options.text_report)
     switch_note = prompt_text("DEFAULT DIP SETTING NOTE", options.switch_note)
-    log_file = prompt_path("LOG FILE", options.log_file)
+    log_file = prompt_report_path("LOG FILE", options.log_file)
     return dataclasses.replace(
         options,
         top=top,
@@ -6528,8 +6663,10 @@ def print_bank2_report(
 
 def prompt_bank2_known_baud(default: int) -> tuple[int, int]:
     """Prompt for known input/output baud values."""
-    input_baud = prompt_int("KNOWN INPUT BAUD", default, 1)
-    output_baud = prompt_int("KNOWN OUTPUT BAUD (BLANK=SAME)", input_baud, 1)
+    print("AVAILABLE BAUD RATES:")
+    print(supported_baud_label())
+    input_baud = prompt_supported_baud("KNOWN INPUT BAUD", default)
+    output_baud = prompt_supported_baud("KNOWN OUTPUT BAUD (BLANK=SAME)", input_baud)
     return input_baud, output_baud
 
 
@@ -6789,11 +6926,7 @@ def interactive_menu(options: ScanOptions | None = None) -> ScanOptions | None:
                 continue
             return options
         if choice == "2":
-            options = dataclasses.replace(
-                options,
-                in_port=prompt_text("Input/transmit port", options.in_port),
-                out_port=prompt_text("Output/read port", options.out_port),
-            )
+            options = configure_ports(options)
         elif choice == "3":
             options = configure_baud_range(options)
         elif choice == "4":
@@ -7418,6 +7551,14 @@ def fake_clean_candidate_result(
 def run_self_tests() -> int:
     """Run pure-Python self-tests that do not require serial hardware."""
     print("RUNNING SERIAL PROBE SELF-TESTS")
+
+    def expect_value_error(func: Callable[[], object], label: str) -> None:
+        try:
+            func()
+        except ValueError:
+            return
+        raise AssertionError(label)
+
     nonce_a = ProbeNonce("RUNTEST", "CAND_A", "TRIAL_1", "NOTE0001")
     nonce_b = ProbeNonce("RUNTEST", "CAND_B", "TRIAL_1", "NOTE0001")
     payload_a = generate_payload(512, nonce_a)
@@ -7527,6 +7668,30 @@ def run_self_tests() -> int:
     assert (
         frame_or_pair_label(dual_settings) == "IN 8N1 -> OUT 7E2"
     ), "dual frame label did not include both sides"
+
+    validate_port_name("COM1")
+    validate_port_name(r"\\.\COM10")
+    expect_value_error(lambda: validate_port_name(""), "blank COM port accepted")
+    expect_value_error(lambda: validate_port_name("COM0"), "COM0 accepted")
+    expect_value_error(lambda: validate_port_name("LPT1"), "non-COM port accepted")
+    expect_value_error(lambda: validate_port_name("COM999"), "out-of-range COM port accepted")
+    ensure_distinct_ports("COM1", "COM5")
+    expect_value_error(
+        lambda: ensure_distinct_ports("COM1", r"\\.\COM1"),
+        "same COM port accepted",
+    )
+    validate_supported_baud(9600)
+    expect_value_error(lambda: validate_supported_baud(12345), "unsupported baud accepted")
+    validate_report_path(Path("serial_probe_report.txt"))
+    expect_value_error(lambda: validate_report_path(Path(".")), "directory report path accepted")
+    expect_value_error(
+        lambda: validate_report_path(Path("BAD:NAME.TXT")),
+        "invalid report path character accepted",
+    )
+    expect_value_error(
+        lambda: validate_report_path(Path("__missing_report_dir__") / "report.txt"),
+        "missing report directory accepted",
+    )
 
     assert parse_start_scan_workflow_choice("") == "discovery", "blank workflow must default to discovery"
     assert parse_start_scan_workflow_choice("1") == "discovery", "workflow 1 parse failed"
