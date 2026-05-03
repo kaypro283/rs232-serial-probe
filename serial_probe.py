@@ -20,6 +20,7 @@ import os
 import platform
 import re
 import statistics
+import string
 import subprocess
 import sys
 import threading
@@ -131,6 +132,13 @@ PAYLOAD_MODE_ASCII = "ascii"
 PAYLOAD_MODE_EIGHT_BIT = "eight_bit"
 PAYLOAD_MODE_PHASE0 = "phase0"
 STALE_STATUSES = {"stale-output", "wrong-nonce", "mixed-nonce"}
+SERIAL_IO_ERRORS: tuple[type[Exception], ...] = (
+    AttributeError,
+    OSError,
+    RuntimeError,
+    TypeError,
+    ValueError,
+)
 
 
 def flow_control_code(flow_control: str) -> str:
@@ -305,7 +313,7 @@ class ScoreMetrics:
 
 @dataclass(frozen=True)
 class ParsedProbeLine:
-    """One structurally valid checksummed probe line from received bytes."""
+    """One structurally valid checksum-protected probe line from received bytes."""
 
     line_number: int
     checksum: int
@@ -641,7 +649,7 @@ def switch_note_hash(switch_note: str | None) -> str | None:
 
 
 def candidate_nonce_id(
-    settings: SerialSettings | DualSerialSettings,
+    _settings: SerialSettings | DualSerialSettings,
     candidate_index: int,
 ) -> str:
     """Return a candidate id that is unique within the current run."""
@@ -676,7 +684,7 @@ def make_probe_line(
     data: str,
     nonce: ProbeNonce | None = None,
 ) -> bytes:
-    """Build one checksummed ASCII line for the probe payload."""
+    """Build one checksum-protected ASCII line for the probe payload."""
     block_number = (line_number - 1) % 32
     nonce_text = nonce_field_text(nonce)
     left = (
@@ -690,10 +698,10 @@ def make_probe_line(
 def repeated_ascii_pattern(line_number: int, length: int) -> str:
     """Return a deterministic printable ASCII pattern of exactly length chars."""
     alphabet = (
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        "abcdefghijklmnopqrstuvwxyz"
-        "0123456789"
-        " .,:;!?/+*-_=#@[](){}<>"
+        string.ascii_uppercase
+        + string.ascii_lowercase
+        + string.digits
+        + " .,:;!?/+*-_=#@[](){}<>"
     )
     offset = line_number % len(alphabet)
     rotated = alphabet[offset:] + alphabet[:offset]
@@ -744,7 +752,7 @@ def generate_payload(
 ) -> ProbePayload:
     """Generate an ASCII-only probe payload of exactly payload_bytes bytes.
 
-    The payload contains fixed-width start/end markers and checksummed line
+    The payload contains fixed-width start/end markers and checksum-bearing line
     records. Supplying a nonce makes the payload candidate/trial specific.
     """
     min_size = minimum_payload_size(nonce)
@@ -857,7 +865,7 @@ def expected_nonce_from_payload(expected: bytes) -> ProbeNonce | None:
 
 
 def line_nonce_from_left(left: bytes) -> ProbeNonce | None:
-    """Extract nonce fields from the checksummed part of a probe line."""
+    """Extract nonce fields from the checksum-covered part of a probe line."""
     text = left.decode("ascii", "ignore")
     run = re.search(r"\bRUN=([^ \r\n]+)", text)
     cand = re.search(r"\bCAND=([^ \r\n]+)", text)
@@ -888,7 +896,7 @@ def nonce_matches(observed: ProbeNonce | None, expected: ProbeNonce | None) -> b
 
 
 def parse_probe_lines(data: bytes) -> list[ParsedProbeLine]:
-    """Return structurally valid checksummed probe lines found in bytes."""
+    """Return structurally valid checksum-protected probe lines found in bytes."""
     valid: list[ParsedProbeLine] = []
     for raw_line in data.splitlines():
         if not raw_line.startswith(b"LINE ") or b" HASH=" not in raw_line:
@@ -1282,6 +1290,7 @@ def import_or_install_pyserial() -> Any:
         raise SystemExit(2)
 
 
+# noinspection SpellCheckingInspection
 def serial_constants(serial_module: Any, settings: SerialSettings) -> dict[str, Any]:
     """Map plain settings values to pyserial constants and flow flags."""
     bytesize = {
@@ -1392,7 +1401,7 @@ def modem_line_snapshot(serial_port: Any) -> dict[str, bool]:
     for name in ("cts", "dsr", "cd", "ri", "rts", "dtr"):
         try:
             snapshot[name] = bool(getattr(serial_port, name))
-        except Exception:
+        except SERIAL_IO_ERRORS:
             snapshot[name] = False
     return snapshot
 
@@ -1438,14 +1447,17 @@ def enable_terminal_style() -> None:
     if os.name == "nt":
         try:
             kernel32 = ctypes.windll.kernel32
-            handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+            get_std_handle = getattr(kernel32, "GetStdHandle")
+            get_console_mode = getattr(kernel32, "GetConsoleMode")
+            set_console_mode = getattr(kernel32, "SetConsoleMode")
+            handle = get_std_handle(STD_OUTPUT_HANDLE)
             mode = ctypes.c_uint32()
-            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-                kernel32.SetConsoleMode(
+            if get_console_mode(handle, ctypes.byref(mode)):
+                set_console_mode(
                     handle,
                     mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING,
                 )
-        except Exception:
+        except SERIAL_IO_ERRORS:
             pass
     print(ANSI_GREEN, end="")
     atexit.register(lambda: print(ANSI_RESET, end=""))
@@ -1458,12 +1470,12 @@ def print_banner() -> None:
 
 
 def border_line(width: int = SCREEN_WIDTH) -> str:
-    """Return an asterisk border line."""
+    """Return a line made of asterisks."""
     return "*" * width
 
 
 def bordered_text(text: str, width: int = SCREEN_WIDTH) -> str:
-    """Return one centered text line inside an asterisk border."""
+    """Return one centered text line inside asterisks."""
     inner_width = max(width - 4, 1)
     cleaned = text[:inner_width]
     return f"* {cleaned.center(inner_width)} *"
@@ -1525,6 +1537,11 @@ def read_operator_input(prompt: str) -> str:
         return input(prompt)
     except UnicodeDecodeError:
         return ""
+
+
+def prompt_loop_active() -> bool:
+    """Return whether an interactive prompt should keep accepting input."""
+    return not sys.is_finalizing()
 
 
 def wrapped_value_lines(
@@ -1949,7 +1966,7 @@ def drain_output_until_quiet(
                     f"QUIET={silence:.1f}/{quiet_seconds:.1f}S"
                 )
                 next_progress_at = now + max(progress_interval, 0.1)
-    except Exception as exc:  # pyserial raises driver-specific subclasses.
+    except SERIAL_IO_ERRORS as exc:
         logger.debug("pre-drain failed: %s", exc)
         elapsed = time.monotonic() - started
         return DrainResult(bytes_drained, elapsed, False, "error", str(exc))
@@ -2092,30 +2109,31 @@ def execute_burst(
             )
 
     def reader() -> None:
+        """Read output bytes until the writer is done and the line is quiet."""
         nonlocal last_data_time
         while not stop_event.is_set():
             try:
                 waiting = getattr(out_serial, "in_waiting", 0)
                 read_size = min(max(int(waiting), 1), 4096)
-                chunk = out_serial.read(read_size)
-            except Exception as exc:  # pyserial raises driver-specific subclasses.
-                reader_errors.append(str(exc))
+                read_chunk = out_serial.read(read_size)
+            except SERIAL_IO_ERRORS as reader_exc:
+                reader_errors.append(str(reader_exc))
                 stop_event.set()
                 break
 
-            now = time.monotonic()
-            if chunk:
+            reader_now = time.monotonic()
+            if read_chunk:
                 with received_lock:
-                    received.extend(chunk)
-                last_data_time = now
+                    received.extend(read_chunk)
+                last_data_time = reader_now
                 continue
 
             if writer_done.is_set():
                 with received_lock:
-                    snapshot = bytes(received)
-                complete = receive_completion_detected(snapshot, expected)
-                quiet_target = completion_quiet if complete else read_timeout
-                if (now - last_data_time) >= quiet_target:
+                    received_snapshot = bytes(received)
+                is_complete = receive_completion_detected(received_snapshot, expected)
+                active_quiet_target = completion_quiet if is_complete else read_timeout
+                if (reader_now - last_data_time) >= active_quiet_target:
                     stop_event.set()
                     break
 
@@ -2124,7 +2142,7 @@ def execute_burst(
 
     bytes_sent = 0
     write_error: str | None = None
-    bytes_received_at_write_done = 0
+    bytes_received_at_write_done: int
     write_started = time.monotonic()
     if progress:
         estimated = estimated_transmit_seconds(settings, len(expected))
@@ -2135,10 +2153,10 @@ def execute_burst(
     try:
         next_progress_at = time.monotonic() + progress_interval
         while bytes_sent < len(expected):
-            chunk = expected[bytes_sent : bytes_sent + chunk_size]
-            written = in_serial.write(chunk)
+            write_chunk = expected[bytes_sent : bytes_sent + chunk_size]
+            written = in_serial.write(write_chunk)
             if written is None:
-                written = len(chunk)
+                written = len(write_chunk)
             if written <= 0:
                 raise RuntimeError("serial write returned zero bytes")
             bytes_sent += int(written)
@@ -2155,7 +2173,7 @@ def execute_burst(
         if progress:
             progress(f"{prefix}: FLUSH OUTPUT BYTES")
         in_serial.flush()
-    except Exception as exc:  # pyserial raises driver-specific subclasses.
+    except SERIAL_IO_ERRORS as exc:
         write_error = str(exc)
         logger.debug("burst %s write failed: %s", burst_index, write_error)
     finally:
@@ -2493,7 +2511,7 @@ def run_candidate(
                         trial.status,
                         trial.error,
                     )
-    except Exception as exc:
+    except SERIAL_IO_ERRORS as exc:
         elapsed = time.monotonic() - started
         logger.exception("candidate %s failed before trials", index)
         if progress:
@@ -2664,7 +2682,7 @@ def run_dual_candidate(
                         trial.status,
                         trial.error,
                     )
-    except Exception as exc:
+    except SERIAL_IO_ERRORS as exc:
         elapsed = time.monotonic() - started
         logger.exception("dual candidate %s failed before trials", index)
         if progress:
@@ -3018,7 +3036,7 @@ def prompt_operator_break_action(target: str = "SCAN") -> str:
     print("  3 RETURN TO MAIN MENU AFTER REPORT")
     print("  0 QUIT AFTER REPORT")
     print(border_line(REPORT_WIDTH))
-    while True:
+    while prompt_loop_active():
         try:
             choice = read_operator_input("ENTER SELECTION [1]: ").lstrip("\ufeff").strip().lower()
         except EOFError:
@@ -3034,6 +3052,7 @@ def prompt_operator_break_action(target: str = "SCAN") -> str:
         if choice in {"0", "q", "quit", "exit"}:
             return "quit"
         print("ENTER 1, 2, 3, OR 0.")
+    return "resume"
 
 
 def parity_name(parity: str) -> str:
@@ -3295,7 +3314,7 @@ def purge_buffer_output(
                     prefix=prefix,
                     logger=logger,
                 )
-        except Exception as exc:
+        except SERIAL_IO_ERRORS as exc:
             error = str(exc)
             logger.info("buffer purge failed opening %s: %s", setting.label(), error)
             errors.append(error)
@@ -3372,7 +3391,7 @@ def run_known_baud_purge(
                 prefix=f"[KNOWN PURGE {settings.label()}]",
                 logger=logger,
             )
-    except Exception as exc:
+    except SERIAL_IO_ERRORS as exc:
         result = DrainResult(0, time.monotonic() - started, False, "error", str(exc))
     print()
     print_report_title("KNOWN-BAUD PURGE COMPLETE")
@@ -4209,7 +4228,7 @@ def prompt_int(
     maximum: int | None = None,
 ) -> int:
     """Prompt for an integer value, preserving current on blank input."""
-    while True:
+    while prompt_loop_active():
         try:
             value = read_operator_input(f"{label.upper()} [{current}]: ").strip()
         except EOFError:
@@ -4228,11 +4247,12 @@ def prompt_int(
             print(f"ENTER A VALUE <= {maximum}.")
             continue
         return parsed
+    return current
 
 
 def prompt_supported_baud(label: str, current: int) -> int:
     """Prompt for one baud value from the program baud table."""
-    while True:
+    while prompt_loop_active():
         baud = prompt_int(label, current, minimum=1)
         try:
             validate_supported_baud(baud)
@@ -4240,11 +4260,12 @@ def prompt_supported_baud(label: str, current: int) -> int:
             print(exc)
             continue
         return baud
+    return current
 
 
 def prompt_float(label: str, current: float, minimum: float | None = None) -> float:
     """Prompt for a float value, preserving current on blank input."""
-    while True:
+    while prompt_loop_active():
         try:
             value = read_operator_input(f"{label.upper()} [{current}]: ").strip()
         except EOFError:
@@ -4263,6 +4284,7 @@ def prompt_float(label: str, current: float, minimum: float | None = None) -> fl
             print(f"ENTER A VALUE >= {minimum}.")
             continue
         return parsed
+    return current
 
 
 def prompt_path(label: str, current: Path) -> Path:
@@ -4276,7 +4298,7 @@ def prompt_path(label: str, current: Path) -> Path:
 
 def prompt_report_path(label: str, current: Path) -> Path:
     """Prompt for an appendable report/log path."""
-    while True:
+    while prompt_loop_active():
         path = prompt_path(label, current)
         try:
             validate_report_path(path)
@@ -4284,11 +4306,12 @@ def prompt_report_path(label: str, current: Path) -> Path:
             print(f"PATH ERROR: {exc}")
             continue
         return path
+    return current
 
 
 def prompt_port(label: str, current: str) -> str:
     """Prompt for a validated Windows COM port name."""
-    while True:
+    while prompt_loop_active():
         port = prompt_text(label, current)
         try:
             validate_port_name(port)
@@ -4296,12 +4319,13 @@ def prompt_port(label: str, current: str) -> str:
             print(f"PORT ERROR: {exc}")
             continue
         return normalize_port_name(port)
+    return normalize_port_name(current)
 
 
 def prompt_yes_no(label: str, current: bool) -> bool:
     """Prompt for a yes/no value, preserving current on blank input."""
     default = "Y" if current else "N"
-    while True:
+    while prompt_loop_active():
         try:
             value = read_operator_input(f"{label.upper()} [{default}]: ").strip().lower()
         except EOFError:
@@ -4313,12 +4337,13 @@ def prompt_yes_no(label: str, current: bool) -> bool:
         if value in {"n", "no"}:
             return False
         print("ENTER Y OR N.")
+    return current
 
 
 def prompt_yes_no_question(question: str, current: bool) -> bool:
     """Prompt for a yes/no answer using a full question string."""
     default = "Y" if current else "N"
-    while True:
+    while prompt_loop_active():
         try:
             value = read_operator_input(f"{question.upper()} (Y/N) [{default}]: ").strip().lower()
         except EOFError:
@@ -4330,6 +4355,7 @@ def prompt_yes_no_question(question: str, current: bool) -> bool:
         if value in {"n", "no"}:
             return False
         print("ENTER Y OR N.")
+    return current
 
 
 def memory_test_settings(input_baud: int, output_baud: int) -> DualSerialSettings:
@@ -4407,7 +4433,7 @@ def default_memory_test_bauds(options: ScanOptions) -> tuple[int, int]:
 
 def prompt_supported_baud_or_menu(label: str, current: int) -> int | None:
     """Prompt for a supported baud value, allowing return to main menu."""
-    while True:
+    while prompt_loop_active():
         try:
             value = read_operator_input(
                 f"{label.upper()} [{current}] (0=MENU): "
@@ -4431,6 +4457,7 @@ def prompt_supported_baud_or_menu(label: str, current: int) -> int | None:
             print(exc)
             continue
         return baud
+    return None
 
 
 def prompt_memory_test_mode(input_baud: int, output_baud: int) -> str | None:
@@ -4448,7 +4475,7 @@ def prompt_memory_test_mode(input_baud: int, output_baud: int) -> str | None:
         fill_bytes,
     )
     default_choice = "2" if fill_available else "1"
-    while True:
+    while prompt_loop_active():
         print()
         print_report_title("MEMORY TEST SIZE")
         print(f"  1 16K IMAGE   SEND {MEMORY_TEST_TARGET_BYTES} ASCII BYTES")
@@ -4478,13 +4505,14 @@ def prompt_memory_test_mode(input_baud: int, output_baud: int) -> str | None:
             print("ENTER 1, 2, 3, OR 0.")
         else:
             print("ENTER 1, 3, OR 0. FILL 16K NEEDS INPUT BAUD > OUTPUT BAUD.")
+    return None
 
 
 def prompt_memory_test_payload_bytes(default_bytes: int) -> int | None:
     """Prompt for a custom memory-test byte count."""
     minimum = minimum_payload_size()
     maximum = MEMORY_TEST_TARGET_BYTES * 8
-    while True:
+    while prompt_loop_active():
         try:
             value = read_operator_input(
                 f"CUSTOM PAYLOAD BYTES [{default_bytes}] (0=MENU): "
@@ -4508,6 +4536,7 @@ def prompt_memory_test_payload_bytes(default_bytes: int) -> int | None:
             print(f"ENTER {maximum} BYTES OR LESS.")
             continue
         return payload_bytes
+    return None
 
 
 def prompt_memory_test_note(current: str) -> str | None:
@@ -4523,7 +4552,7 @@ def prompt_memory_test_note(current: str) -> str | None:
 
 def prompt_run_memory_test() -> bool:
     """Ask for final memory-test confirmation, canceling on EOF."""
-    while True:
+    while prompt_loop_active():
         try:
             value = read_operator_input("RUN MEMORY TEST [Y]: ").strip().lower()
         except EOFError:
@@ -4535,6 +4564,7 @@ def prompt_run_memory_test() -> bool:
         if value in {"n", "no", "0", "m", "menu", "main"}:
             return False
         print("ENTER Y OR N.")
+    return False
 
 
 def prompt_memory_test_config(options: ScanOptions) -> MemoryTestConfig | None:
@@ -4543,7 +4573,7 @@ def prompt_memory_test_config(options: ScanOptions) -> MemoryTestConfig | None:
     print()
     print_report_title("MEMORY TEST 16K")
     print("FIXED FRAME: INPUT 8E1, OUTPUT 8E1, FLOW=NONE.")
-    print("STREAM TYPE: CHECKSUMMED PRINTABLE ASCII.")
+    print("STREAM TYPE: PRINTABLE ASCII WITH CHECKSUMS.")
     print(f"BUFFER TARGET: {MEMORY_TEST_TARGET_BYTES} BYTES.")
     print(f"VALID BAUDS: {supported_baud_label()}.")
     print("ENTER 0 AT BAUD OR SIZE PROMPT TO RETURN.")
@@ -4651,7 +4681,7 @@ def prompt_start_scan_workflow() -> str:
     print("  3 PHASE 0 BAUD LIVENESS ONLY")
     print("  4 RETURN TO MAIN MENU")
     print(border_line(REPORT_WIDTH))
-    while True:
+    while prompt_loop_active():
         try:
             choice = read_operator_input("ENTER SELECTION [1]: ")
         except EOFError:
@@ -4660,6 +4690,7 @@ def prompt_start_scan_workflow() -> str:
         if workflow is not None:
             return workflow
         print("ENTER 1, 2, 3, OR 4.")
+    return "discovery"
 
 
 def print_menu_help(paged: bool = True) -> None:
@@ -4856,7 +4887,7 @@ def configure_baud_range(options: ScanOptions) -> ScanOptions:
     print("AVAILABLE BAUD RATES:")
     print(supported_baud_label())
     print("SCAN ORDER: FASTEST SELECTED BAUD FIRST.")
-    while True:
+    while prompt_loop_active():
         min_baud = prompt_supported_baud("MINIMUM BAUD", options.min_baud)
         max_baud = prompt_supported_baud("MAXIMUM BAUD", options.max_baud)
         try:
@@ -4866,11 +4897,12 @@ def configure_baud_range(options: ScanOptions) -> ScanOptions:
             print("RE-ENTER BAUD RANGE.")
             continue
         return dataclasses.replace(options, min_baud=min_baud, max_baud=max_baud)
+    return options
 
 
 def configure_ports(options: ScanOptions) -> ScanOptions:
     """Prompt for validated input/output COM ports."""
-    while True:
+    while prompt_loop_active():
         in_port = prompt_port("INPUT/TRANSMIT PORT", options.in_port)
         out_port = prompt_port("OUTPUT/READ PORT", options.out_port)
         try:
@@ -4880,6 +4912,7 @@ def configure_ports(options: ScanOptions) -> ScanOptions:
             print("RE-ENTER COM PORTS.")
             continue
         return dataclasses.replace(options, in_port=in_port, out_port=out_port)
+    return options
 
 
 def yes_no_text(value: bool) -> str:
@@ -4890,6 +4923,7 @@ def yes_no_text(value: bool) -> str:
 def print_scan_validate_setup(options: ScanOptions) -> None:
     """Print the scan/validate setup submenu with setting scope."""
     def setting_line(number: str, label: str, value: object, used_by: str) -> None:
+        """Print one submenu setting with its workflow scope."""
         print(f"  {number} {label:<31} {value}")
         for line in wrapped_value_lines("    USED BY: ", used_by, REPORT_WIDTH):
             print(line)
@@ -4951,7 +4985,7 @@ def print_scan_validate_setup(options: ScanOptions) -> None:
 
 def configure_payload(options: ScanOptions) -> ScanOptions:
     """Show the scan/validation setup submenu."""
-    while True:
+    while prompt_loop_active():
         print_scan_validate_setup(options)
         try:
             choice = read_operator_input("ENTER SELECTION (1-7,0): ").lstrip("\ufeff").strip().lower()
@@ -5021,11 +5055,12 @@ def configure_payload(options: ScanOptions) -> ScanOptions:
             )
         else:
             print("ENTER 1-7 OR 0.")
+    return options
 
 
 def configure_timing(options: ScanOptions) -> ScanOptions:
     """Prompt for timing settings."""
-    while True:
+    while prompt_loop_active():
         print("TIMING AND STALE DATA")
         print("TURBO APPLIES ONLY TO SCAN DISCOVERY.")
         print("VALIDATION USES CONSERVATIVE TIMING.")
@@ -5078,6 +5113,7 @@ def configure_timing(options: ScanOptions) -> ScanOptions:
             max_drain_bytes=max_drain_bytes,
             progress_interval=progress_interval,
         )
+    return options
 
 
 def configure_reports(options: ScanOptions) -> ScanOptions:
@@ -5132,7 +5168,7 @@ def write_payload_only(
                     f"({percent:5.1f}%)"
                 )
                 next_progress_at = now + max(progress_interval, 0.1)
-    except Exception as exc:  # pyserial raises driver-specific subclasses.
+    except SERIAL_IO_ERRORS as exc:
         error = str(exc)
         logger.debug("%s write failed: %s", prefix, error)
     return bytes_sent, error, time.monotonic() - started
@@ -5165,7 +5201,7 @@ def read_until_quiet(
             waiting = getattr(out_serial, "in_waiting", 0)
             read_size = min(max(int(waiting), 1), 4096)
             chunk = out_serial.read(read_size)
-        except Exception as exc:  # pyserial raises driver-specific subclasses.
+        except SERIAL_IO_ERRORS as exc:
             error = str(exc)
             logger.debug("%s read failed: %s", prefix, error)
             break
@@ -5226,7 +5262,7 @@ def read_serial_until_quiet(
             waiting = getattr(serial_port, "in_waiting", 0)
             read_size = min(max(int(waiting), 1), 4096)
             chunk = serial_port.read(read_size)
-        except Exception as exc:  # pyserial raises driver-specific subclasses.
+        except SERIAL_IO_ERRORS as exc:
             error = str(exc)
             logger.debug("%s %s read failed: %s", prefix, direction_label, error)
             break
@@ -5277,7 +5313,7 @@ def read_for_fixed_window(
             waiting = getattr(out_serial, "in_waiting", 0)
             read_size = min(max(int(waiting), 1), 4096)
             chunk = out_serial.read(read_size)
-        except Exception as exc:  # pyserial raises driver-specific subclasses.
+        except SERIAL_IO_ERRORS as exc:
             error = str(exc)
             logger.debug("%s hold observation failed: %s", prefix, error)
             break
@@ -5532,7 +5568,6 @@ def run_flow_control_pause_validation(
                 reset_serial_buffers(in_serial)
                 time.sleep(options.settle_ms / 1000.0)
 
-                drain = DrainResult(0, 0.0, True, "disabled", None)
                 if not options.no_pre_drain:
                     drain = drain_output_until_quiet(
                         out_serial=out_serial,
@@ -5652,7 +5687,7 @@ def run_flow_control_pause_validation(
                     prefix=prefix,
                     logger=logger,
                 )
-    except Exception as exc:
+    except SERIAL_IO_ERRORS as exc:
         logger.exception("flow validation failed for %s", settings.label())
         return flow_validation_error_result(
             flow_control=flow_control,
@@ -5666,7 +5701,7 @@ def run_flow_control_pause_validation(
         if hold_applied:
             try:
                 release_flow_control_hold(out_serial, flow_control)  # type: ignore[name-defined]
-            except Exception:
+            except SERIAL_IO_ERRORS:
                 logger.debug("failed to release %s hold in cleanup", flow_control)
 
     received_bytes = held_bytes + release_bytes
@@ -6456,7 +6491,7 @@ def write_raw_bytes_only(
                 )
                 next_progress_at = now + max(progress_interval, 0.1)
         in_serial.flush()
-    except Exception as exc:  # pyserial raises driver-specific subclasses.
+    except SERIAL_IO_ERRORS as exc:
         error = str(exc)
         logger.debug("%s raw write failed: %s", prefix, error)
     return bytes_sent, error, time.monotonic() - started
@@ -6552,7 +6587,7 @@ def run_bank2_behavior_probe(
                         logger=logger,
                     )
                     error = write_error or read_error
-    except Exception as exc:
+    except SERIAL_IO_ERRORS as exc:
         logger.exception("Bank 2 behavior probe failed for %s %s", name, settings.label())
         error = str(exc)
 
@@ -6919,7 +6954,7 @@ def run_bank2_etx_ack_probe(
                         )
                     )
                     error = reverse_write_error or reverse_read_error
-    except Exception as exc:
+    except SERIAL_IO_ERRORS as exc:
         logger.exception("Bank 2 ETX/ACK probe failed for %s", settings.label())
         error = str(exc)
 
@@ -7053,10 +7088,11 @@ def bank2_conclusion(
     """Return compact conclusion text for a second-bank switch state."""
     stale_seen = stale_nonce_seen(ascii_results) or stale_nonce_seen(eight_bit_results)
 
-    def with_stale_warning(text: str) -> str:
+    def with_stale_warning(message: str) -> str:
+        """Append stale-output context to a conclusion when needed."""
         if stale_seen:
-            return f"{text}; stale row seen"
-        return text
+            return f"{message}; stale row seen"
+        return message
 
     pass_frames = ascii_pass_frame_labels(ascii_results)
     if not pass_frames:
@@ -7572,23 +7608,24 @@ def memory_test_diagnosis(result: MemoryTestResult) -> MemoryTestDiagnosis:
         finding: str,
         exact_stream: str,
         data_check: str,
-        capacity_check: str,
+        capacity_text: str,
         ram_check: str,
-        operator_note: str,
+        operator_guidance: str,
         *,
         content: float = content_ratio,
         completeness: float = completeness_ratio,
         exact_prefix: int = metrics.exact_prefix_bytes,
     ) -> MemoryTestDiagnosis:
+        """Build one memory-test diagnosis with shared measured fields."""
         return MemoryTestDiagnosis(
             code=code,
             result=result_text,
             finding=finding,
             exact_stream=exact_stream,
             data_check=data_check,
-            capacity_check=capacity_check,
+            capacity_check=capacity_text,
             ram_check=ram_check,
-            operator_note=operator_note,
+            operator_note=operator_guidance,
             content_integrity_ratio=content,
             completeness_ratio=completeness,
             exact_prefix_bytes=exact_prefix,
@@ -7939,6 +7976,7 @@ def run_memory_test(options: ScanOptions) -> int:
 def print_commands() -> None:
     """Print the main command menu."""
     def menu_line(left: str = "", right: str = "") -> None:
+        """Print one padded command-menu row."""
         inner_width = SCREEN_WIDTH - 4
         if right:
             text = f"{left:<32}  {right:<34}"
@@ -7963,7 +8001,7 @@ def interactive_menu(options: ScanOptions | None = None) -> MenuSelection | None
     """Show the command-line style configuration menu."""
     if options is None:
         options = default_scan_options()
-    while True:
+    while prompt_loop_active():
         print_commands()
         try:
             choice = read_operator_input("COMMAND (1-8,S,?,0): ").lstrip("\ufeff").strip().lower()
@@ -8009,6 +8047,7 @@ def interactive_menu(options: ScanOptions | None = None) -> MenuSelection | None
             return None
         else:
             print("ENTER 1-8, S, ?, OR 0.")
+    return None
 
 
 def prompt_after_scan_action(
@@ -8024,7 +8063,7 @@ def prompt_after_scan_action(
     print("  2 RETURN TO MAIN MENU")
     print("  0 QUIT")
     print(border_line(REPORT_WIDTH))
-    while True:
+    while prompt_loop_active():
         try:
             choice = read_operator_input("ENTER SELECTION [2]: ").lstrip("\ufeff").strip().lower()
         except EOFError:
@@ -8038,6 +8077,7 @@ def prompt_after_scan_action(
         if choice in {"0", "q", "quit", "exit"}:
             return "quit"
         print("ENTER 1, 2, OR 0.")
+    return "menu"
 
 
 def run_dual_bank_validation(
@@ -8303,10 +8343,11 @@ def run_dual_bank_scan(
         stage_name: str,
         sequence: Sequence[DualSerialSettings],
     ) -> list[CandidateResult]:
+        """Run one staged dual-bank candidate sequence."""
         nonlocal early_stopped, operator_break_action, operator_break_stage
         unique_sequence = [
-            settings for settings in unique_dual_candidates(sequence)
-            if settings not in tested_settings
+            dual_settings for dual_settings in unique_dual_candidates(sequence)
+            if dual_settings not in tested_settings
         ]
         if (
             not unique_sequence
@@ -8322,14 +8363,14 @@ def run_dual_bank_scan(
         stage_results: list[CandidateResult] = []
         index = 0
         while index < len(unique_sequence):
-            settings = unique_sequence[index]
+            dual_settings = unique_sequence[index]
             display_index = len(results) + 1
             try:
-                result = run_dual_candidate(
+                candidate_result = run_dual_candidate(
                     serial_module=serial_module,
                     index=display_index,
                     total=candidate_total,
-                    settings=settings,
+                    settings=dual_settings,
                     options=options,
                     payload=payload,
                     logger=logger,
@@ -8343,7 +8384,7 @@ def run_dual_bank_scan(
                         stage_name.lower(),
                         display_index,
                         candidate_total,
-                        settings.label(),
+                        dual_settings.label(),
                     )
                     continue
                 operator_break_action = action
@@ -8357,18 +8398,18 @@ def run_dual_bank_scan(
                     candidate_total,
                 )
                 break
-            results.append(result)
-            stage_results.append(result)
-            tested_settings.add(settings)
-            print(format_dual_progress(result), flush=True)
+            results.append(candidate_result)
+            stage_results.append(candidate_result)
+            tested_settings.add(dual_settings)
+            print(format_dual_progress(candidate_result), flush=True)
             print(
                 format_scan_eta(len(results), candidate_total, scan_started),
                 flush=True,
             )
-            if options.ask_on_top_match and is_top_match_result(result):
+            if options.ask_on_top_match and is_top_match_result(candidate_result):
                 print()
                 print_report_title("DUAL TOP MATCH FOUND")
-                print_dual_result_details(result)
+                print_dual_result_details(candidate_result)
                 print("    CONTINUE TO LOOK FOR POSSIBLE TIES.")
                 print("    ENTER N TO END NOW AND WRITE REPORT.")
                 print(border_line(REPORT_WIDTH))
@@ -8378,7 +8419,7 @@ def run_dual_bank_scan(
                     logger.info(
                         "operator ended %s after top match: %s",
                         stage_name.lower(),
-                        settings.label(),
+                        dual_settings.label(),
                     )
                     break
             index += 1
@@ -8613,6 +8654,7 @@ def run_self_tests() -> int:
     print("RUNNING SERIAL PROBE SELF-TESTS")
 
     def expect_value_error(func: Callable[[], object], label: str) -> None:
+        """Assert that a callable rejects invalid input with ValueError."""
         try:
             func()
         except ValueError:
@@ -8775,11 +8817,12 @@ def run_self_tests() -> int:
     ), "Bank 2 baud-pair candidates must be dual settings"
 
     def has_dual_frame_pair(input_frame: str, output_frame: str) -> bool:
+        """Return whether the generated bank contains one frame pair."""
         return any(
-            isinstance(settings, DualSerialSettings)
-            and frame_label(settings.input_settings) == input_frame
-            and frame_label(settings.output_settings) == output_frame
-            for settings in dual_bank2
+            isinstance(candidate_settings, DualSerialSettings)
+            and frame_label(candidate_settings.input_settings) == input_frame
+            and frame_label(candidate_settings.output_settings) == output_frame
+            for candidate_settings in dual_bank2
         )
 
     assert has_dual_frame_pair("7E1", "8N1"), "missing mixed 7E1 -> 8N1 pair"
@@ -9000,8 +9043,9 @@ def run_self_tests() -> int:
         output_baud: int,
         *,
         error: str | None = None,
-        status: str = "no-data",
+        row_status: str = "no-data",
     ) -> DualBaudLivenessResult:
+        """Build a compact Phase 0 row for fallback-path assertions."""
         return DualBaudLivenessResult(
             input_baud=input_baud,
             output_baud=output_baud,
@@ -9009,7 +9053,7 @@ def run_self_tests() -> int:
             reason="SERIAL ERROR" if error else "NO DATA",
             settings=dual_phase0_settings(input_baud, output_baud),
             score=0.0,
-            status=status,
+            status=row_status,
             error=error,
             bytes_sent=0,
             bytes_received=0,
@@ -9026,7 +9070,7 @@ def run_self_tests() -> int:
         selected_pairs=[],
         fallback_reason=None,
         elapsed_sec=0.0,
-        results=[fake_phase0_row(38400, 38400, error="COM5 BUSY", status="error")],
+        results=[fake_phase0_row(38400, 38400, error="COM5 BUSY", row_status="error")],
     )
     assert phase0_results_all_serial_errors(
         error_phase0_report
@@ -9037,7 +9081,7 @@ def run_self_tests() -> int:
     mixed_phase0_report = dataclasses.replace(
         error_phase0_report,
         results=[
-            fake_phase0_row(38400, 38400, error="COM5 BUSY", status="error"),
+            fake_phase0_row(38400, 38400, error="COM5 BUSY", row_status="error"),
             fake_phase0_row(19200, 19200),
         ],
     )
@@ -9228,6 +9272,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if action == "menu":
                 break
             return last_status
+    return last_status
 
 
 if __name__ == "__main__":

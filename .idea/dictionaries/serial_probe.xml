@@ -1,0 +1,31 @@
+<component name="ProjectDictionaryState">
+  <dictionary name="serial_probe">
+    <words>
+      <w>ack</w>
+      <w>baud</w>
+      <w>baudrate</w>
+      <w>bauds</w>
+      <w>bytesize</w>
+      <w>cts</w>
+      <w>dataclass</w>
+      <w>dsr</w>
+      <w>dsrdtr</w>
+      <w>dtr</w>
+      <w>etx</w>
+      <w>jsonable</w>
+      <w>liveness</w>
+      <w>nonce</w>
+      <w>nonced</w>
+      <w>nonces</w>
+      <w>overfill</w>
+      <w>pycharm</w>
+      <w>pyserial</w>
+      <w>rts</w>
+      <w>rtscts</w>
+      <w>stopbits</w>
+      <w>xoff</w>
+      <w>xon</w>
+      <w>xonxoff</w>
+    </words>
+  </dictionary>
+</component>
