@@ -5903,7 +5903,7 @@ def bank2_behavior_report_lines(
         "BEHAVIOR RESULT:",
         f"SUMMARY:         {bank2_behavior_summary(results)}",
         "",
-        "PROBE       STATUS      SENT  READ  EXACT FF CRLF FRAME/PAIR              REASON",
+        "PROBE       STATUS      SENT  READ  EX FF CRLF FRAME/PAIR              REASON",
         border_line(REPORT_WIDTH),
     ]
     if not results:
@@ -5914,9 +5914,9 @@ def bank2_behavior_report_lines(
             f"{result.status:<11} "
             f"{result.bytes_sent:>4} "
             f"{result.bytes_received:>5} "
-            f"{'Y' if result.exact_match else 'N':<5} "
-            f"{'Y' if result.form_feed_inserted else 'N':<2} "
-            f"{'Y' if result.cr_lf_changed else 'N':<4} "
+            f"{'Y' if result.exact_match else 'N':>2} "
+            f"{'Y' if result.form_feed_inserted else 'N':>2} "
+            f"{'Y' if result.cr_lf_changed else 'N':>4} "
             f"{frame_or_pair_label(result.settings)[:23]:<23} "
             f"{result.reason[:24]}"
         )
@@ -6423,16 +6423,16 @@ def print_bank2_report(
     )
     if result.behavior_results:
         print(border_line(REPORT_WIDTH))
-        print("  RAW PROBE     STATUS       SENT  READ  EXACT FF CRLF")
+        print("  RAW PROBE     STATUS       SENT  READ  EX FF CRLF")
         for probe in result.behavior_results:
             print(
                 f"  {probe.name:<12} "
                 f"{probe.status:<11} "
                 f"{probe.bytes_sent:>5} "
                 f"{probe.bytes_received:>5} "
-                f"{'Y' if probe.exact_match else 'N':<5} "
-                f"{'Y' if probe.form_feed_inserted else 'N':<2} "
-                f"{'Y' if probe.cr_lf_changed else 'N':<4}"
+                f"{'Y' if probe.exact_match else 'N':>2} "
+                f"{'Y' if probe.form_feed_inserted else 'N':>2} "
+                f"{'Y' if probe.cr_lf_changed else 'N':>4}"
             )
     if result.etx_ack_results:
         print(border_line(REPORT_WIDTH))
