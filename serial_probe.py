@@ -67,6 +67,7 @@ FLOW_VALIDATE_RELEASE_SETTLE_SECONDS = 0.15
 RECEIVE_DEADLINE_SAFETY_FACTOR = 2.0
 RECEIVE_DEADLINE_MARGIN_SECONDS = 2.0
 DEFAULT_BANK2_JOB_TIMEOUT_OBSERVE_SECONDS = 10.0
+DEFAULT_ETX_ACK_OBSERVE_SECONDS = 2.0
 BANK2_BEHAVIOR_MAX_TIED_TARGETS = 3
 TURBO_SETTLE_MS = 10
 TURBO_PRE_DRAIN_TIMEOUT = 0.25
@@ -491,6 +492,29 @@ class Bank2BehaviorProbeResult:
 
 
 @dataclass(frozen=True)
+class Bank2EtxAckProbeResult:
+    """ETX/ACK byte-path observation for one Bank 2 probe frame."""
+
+    settings: SerialSettings | DualSerialSettings
+    forward_bytes_sent: int
+    forward_bytes_received: int
+    reverse_bytes_sent: int
+    reverse_bytes_received: int
+    etx_forward_seen: bool
+    etx_forward_exact: bool
+    ack_reverse_seen: bool
+    reverse_path_observed: bool
+    forward_preview_ascii: str
+    forward_preview_hex: str
+    reverse_preview_ascii: str
+    reverse_preview_hex: str
+    status: str
+    reason: str
+    error: str | None
+    elapsed_sec: float
+
+
+@dataclass(frozen=True)
 class Bank2CharacterizationResult:
     """Append-only result block for one second-bank switch state."""
 
@@ -500,6 +524,7 @@ class Bank2CharacterizationResult:
     eight_bit_results: list[CandidateResult]
     flow_results: list[FlowControlValidationResult]
     behavior_results: list[Bank2BehaviorProbeResult]
+    etx_ack_results: list[Bank2EtxAckProbeResult]
     stale_data_seen: bool
     conclusion: str
     run_id: str
@@ -4390,6 +4415,68 @@ def read_until_quiet(
     return bytes(received), error, time.monotonic() - started
 
 
+def read_serial_until_quiet(
+    serial_port: Any,
+    settings: SerialSettings | DualSerialSettings,
+    expected_bytes: int,
+    read_timeout: float,
+    progress_interval: float,
+    prefix: str,
+    logger: logging.Logger,
+    direction_label: str,
+) -> tuple[bytes, str | None, float]:
+    """Read bytes from a named direction until the line goes quiet."""
+    started = time.monotonic()
+    received = bytearray()
+    last_data_time = time.monotonic()
+    read_timeout = max(read_timeout, 0.1)
+    max_seconds = max(
+        estimated_receive_seconds(settings, expected_bytes) * 2.0 + read_timeout + 5.0,
+        read_timeout + 5.0,
+    )
+    deadline = started + max_seconds
+    next_progress_at = time.monotonic() + max(progress_interval, 0.1)
+    error: str | None = None
+    console_progress(
+        f"{prefix}: READ {direction_label.upper()} UNTIL QUIET FOR {read_timeout:.1f}S"
+    )
+    while True:
+        try:
+            waiting = getattr(serial_port, "in_waiting", 0)
+            read_size = min(max(int(waiting), 1), 4096)
+            chunk = serial_port.read(read_size)
+        except Exception as exc:  # pyserial raises driver-specific subclasses.
+            error = str(exc)
+            logger.debug("%s %s read failed: %s", prefix, direction_label, error)
+            break
+
+        now = time.monotonic()
+        if chunk:
+            received.extend(chunk)
+            last_data_time = now
+        elif (now - last_data_time) >= read_timeout:
+            break
+
+        if now >= next_progress_at:
+            silence = max(0.0, now - last_data_time)
+            console_progress(
+                f"{prefix}: READING {direction_label.upper()} "
+                f"RECEIVED={len(received)} BYTES, "
+                f"QUIET={silence:.1f}/{read_timeout:.1f}S"
+            )
+            next_progress_at = now + max(progress_interval, 0.1)
+
+        if now >= deadline:
+            error = (
+                f"{direction_label.upper()} READ STOPPED BEFORE QUIET "
+                f"AFTER {format_duration(max_seconds)}"
+            )
+            logger.debug("%s", error)
+            break
+
+    return bytes(received), error, time.monotonic() - started
+
+
 def read_for_fixed_window(
     out_serial: Any,
     seconds: float,
@@ -5843,11 +5930,328 @@ def bank2_behavior_report_lines(
     return lines
 
 
+def bank2_etx_ack_payload(run_id: str, switch_hash: str | None) -> bytes:
+    """Return a small ETX-bearing payload for forward path testing."""
+    note = f" NOTE={switch_hash}" if switch_hash else ""
+    marker = (
+        f"<<<BANK2_ETXACK RUN={sanitize_nonce_value(run_id or make_run_id('B2E'))}"
+        f"{note}>>>"
+    ).encode("ascii")
+    return marker + b"\r\nETX-FOLLOWS:" + b"\x03" + b":END\r\n"
+
+
+def classify_etx_ack_bytes(
+    forward_payload: bytes,
+    forward_received: bytes,
+    reverse_received: bytes,
+    error: str | None = None,
+) -> tuple[bool, bool, bool, bool, str, str]:
+    """Classify ETX forward and ACK reverse byte observations."""
+    etx_forward_seen = b"\x03" in forward_received
+    etx_forward_exact = forward_received == forward_payload
+    ack_reverse_seen = b"\x06" in reverse_received
+    reverse_path_observed = ack_reverse_seen
+    if error:
+        return (
+            etx_forward_seen,
+            etx_forward_exact,
+            ack_reverse_seen,
+            reverse_path_observed,
+            "error",
+            error,
+        )
+    if ack_reverse_seen and etx_forward_seen:
+        return (
+            etx_forward_seen,
+            etx_forward_exact,
+            ack_reverse_seen,
+            reverse_path_observed,
+            "reverse-seen",
+            "ETX FORWARD SEEN; ACK REVERSE SEEN.",
+        )
+    if ack_reverse_seen:
+        return (
+            etx_forward_seen,
+            etx_forward_exact,
+            ack_reverse_seen,
+            reverse_path_observed,
+            "reverse-seen",
+            "ACK REVERSE SEEN; ETX FORWARD NOT CONFIRMED.",
+        )
+    if etx_forward_seen:
+        return (
+            etx_forward_seen,
+            etx_forward_exact,
+            ack_reverse_seen,
+            reverse_path_observed,
+            "forward-only",
+            "ETX FORWARD SEEN; ACK REVERSE NOT SEEN.",
+        )
+    if forward_received:
+        return (
+            etx_forward_seen,
+            etx_forward_exact,
+            ack_reverse_seen,
+            reverse_path_observed,
+            "etx-missing",
+            "FORWARD DATA SEEN BUT ETX BYTE WAS NOT OBSERVED.",
+        )
+    return (
+        etx_forward_seen,
+        etx_forward_exact,
+        ack_reverse_seen,
+        reverse_path_observed,
+        "no-data",
+        "NO FORWARD OR REVERSE PROTOCOL BYTES OBSERVED.",
+    )
+
+
+def run_bank2_etx_ack_probe(
+    serial_module: Any,
+    options: ScanOptions,
+    settings: SerialSettings | DualSerialSettings,
+    observe_seconds: float,
+    logger: logging.Logger,
+) -> Bank2EtxAckProbeResult:
+    """Run a selected-frame ETX forward and simulated ACK reverse-path probe."""
+    started = time.monotonic()
+    transmit_settings = transmit_side_settings(settings)
+    receive_settings = receive_side_settings(settings)
+    read_timeout = max(options.read_timeout, observe_seconds, 0.5)
+    payload = bank2_etx_ack_payload(
+        options.run_id,
+        switch_note_hash(options.switch_note),
+    )
+    ack_payload = b"\x06"
+    prefix = f"[B2 ETX/ACK {settings.label()}]"
+    forward_received = b""
+    reverse_received = b""
+    forward_sent = 0
+    reverse_sent = 0
+    error: str | None = None
+    try:
+        print()
+        print_report_title("BANK 2 ETX/ACK PATH PROBE")
+        print(f"PROBE FRAME: {frame_or_pair_label(settings)}")
+        print("FORWARD TEST SENDS ETX (03) TOWARD PRINTER SIDE.")
+        print("REVERSE TEST INJECTS ACK (06) FROM PRINTER SIDE.")
+        print("BYTE-LEVEL PATH TEST ONLY; NO PRINTER MEANING IS ASSIGNED.")
+        print(border_line(REPORT_WIDTH))
+        console_progress(border_line(PROGRESS_WIDTH))
+        console_progress(bordered_text("BANK 2 ETX/ACK PATH", PROGRESS_WIDTH))
+        console_progress(border_line(PROGRESS_WIDTH))
+        with open_serial_port(
+            serial_module,
+            options.out_port,
+            receive_settings,
+            read_timeout,
+        ) as out_serial:
+            with open_serial_port(
+                serial_module,
+                options.in_port,
+                transmit_settings,
+                read_timeout,
+            ) as in_serial:
+                reset_serial_buffers(out_serial)
+                reset_serial_buffers(in_serial)
+                time.sleep(options.settle_ms / 1000.0)
+
+                if not options.no_pre_drain:
+                    drain = drain_output_until_quiet(
+                        out_serial=out_serial,
+                        quiet_seconds=options.pre_drain_quiet,
+                        max_seconds=max(options.pre_drain_timeout, 0.5),
+                        max_bytes=options.max_drain_bytes,
+                        progress_interval=options.progress_interval,
+                        progress=console_progress,
+                        prefix=prefix,
+                        logger=logger,
+                    )
+                    if not drain.quiet:
+                        error = (
+                            "OUTPUT DID NOT GO QUIET BEFORE ETX/ACK PROBE "
+                            f"(REASON={drain.reason.upper()}, "
+                            f"CLEARED={drain.bytes_drained})"
+                        )
+
+                if error is None:
+                    console_progress(f"{prefix}: FORWARD ETX TEST")
+                    forward_sent, write_error, _write_elapsed = write_raw_bytes_only(
+                        in_serial=in_serial,
+                        settings=transmit_settings,
+                        data=payload,
+                        progress_interval=options.progress_interval,
+                        prefix=prefix,
+                        logger=logger,
+                    )
+                    forward_received, forward_error, _forward_elapsed = read_serial_until_quiet(
+                        serial_port=out_serial,
+                        settings=receive_settings,
+                        expected_bytes=len(payload),
+                        read_timeout=read_timeout,
+                        progress_interval=options.progress_interval,
+                        prefix=prefix,
+                        logger=logger,
+                        direction_label="printer-side forward",
+                    )
+                    error = write_error or forward_error
+
+                if error is None:
+                    console_progress(f"{prefix}: REVERSE ACK TEST")
+                    in_serial.reset_input_buffer()
+                    reverse_sent, reverse_write_error, _reverse_write_elapsed = (
+                        write_raw_bytes_only(
+                            in_serial=out_serial,
+                            settings=receive_settings,
+                            data=ack_payload,
+                            progress_interval=options.progress_interval,
+                            prefix=prefix,
+                            logger=logger,
+                        )
+                    )
+                    reverse_received, reverse_read_error, _reverse_read_elapsed = (
+                        read_serial_until_quiet(
+                            serial_port=in_serial,
+                            settings=transmit_settings,
+                            expected_bytes=len(ack_payload),
+                            read_timeout=observe_seconds,
+                            progress_interval=options.progress_interval,
+                            prefix=prefix,
+                            logger=logger,
+                            direction_label="computer-side reverse",
+                        )
+                    )
+                    error = reverse_write_error or reverse_read_error
+    except Exception as exc:
+        logger.exception("Bank 2 ETX/ACK probe failed for %s", settings.label())
+        error = str(exc)
+
+    etx_seen, etx_exact, ack_seen, reverse_seen, status, reason = classify_etx_ack_bytes(
+        payload,
+        forward_received,
+        reverse_received,
+        error,
+    )
+    result = Bank2EtxAckProbeResult(
+        settings=settings,
+        forward_bytes_sent=forward_sent,
+        forward_bytes_received=len(forward_received),
+        reverse_bytes_sent=reverse_sent,
+        reverse_bytes_received=len(reverse_received),
+        etx_forward_seen=etx_seen,
+        etx_forward_exact=etx_exact,
+        ack_reverse_seen=ack_seen,
+        reverse_path_observed=reverse_seen,
+        forward_preview_ascii=preview_ascii(forward_received),
+        forward_preview_hex=preview_hex(forward_received),
+        reverse_preview_ascii=preview_ascii(reverse_received),
+        reverse_preview_hex=preview_hex(reverse_received),
+        status=status,
+        reason=reason,
+        error=error,
+        elapsed_sec=time.monotonic() - started,
+    )
+    logger.info(
+        "Bank 2 ETX/ACK %s: status=%s fwd_sent=%s fwd_read=%s rev_sent=%s rev_read=%s etx=%s ack=%s reason=%s error=%s",
+        settings.label(),
+        result.status,
+        result.forward_bytes_sent,
+        result.forward_bytes_received,
+        result.reverse_bytes_sent,
+        result.reverse_bytes_received,
+        result.etx_forward_seen,
+        result.ack_reverse_seen,
+        result.reason,
+        result.error,
+    )
+    print(
+        f"ETX/ACK {result.status.upper():<12} "
+        f"ETX={'Y' if result.etx_forward_seen else 'N'} "
+        f"ACK={'Y' if result.ack_reverse_seen else 'N'} "
+        f"FWD={result.forward_bytes_sent}/{result.forward_bytes_received} "
+        f"REV={result.reverse_bytes_sent}/{result.reverse_bytes_received} "
+        f"{result.reason}"
+    )
+    return result
+
+
+def run_bank2_etx_ack_probes(
+    serial_module: Any,
+    options: ScanOptions,
+    target: CandidateResult | None,
+    observe_seconds: float,
+    logger: logging.Logger,
+) -> list[Bank2EtxAckProbeResult]:
+    """Run optional ETX/ACK probing on the selected Bank 2 probe frame."""
+    if target is None:
+        print()
+        print_report_title("BANK 2 ETX/ACK PATH PROBE")
+        print("SKIPPED: NO PROBE FRAME WAS FOUND.")
+        print(border_line(REPORT_WIDTH))
+        return []
+    return [
+        run_bank2_etx_ack_probe(
+            serial_module=serial_module,
+            options=options,
+            settings=target.settings,
+            observe_seconds=observe_seconds,
+            logger=logger,
+        )
+    ]
+
+
+def bank2_etx_ack_summary(results: Sequence[Bank2EtxAckProbeResult]) -> str:
+    """Return a concise ETX/ACK path summary for Bank 2 reports."""
+    if not results:
+        return "NOT RUN"
+    if any(result.ack_reverse_seen for result in results):
+        return "ACK REVERSE SEEN"
+    if any(result.etx_forward_seen for result in results):
+        return "ETX FORWARD ONLY; ACK REVERSE NOT SEEN"
+    if any(result.error for result in results):
+        return "ETX/ACK PROBE ERROR"
+    return "ETX/ACK PATH NOT OBSERVED"
+
+
+def bank2_etx_ack_report_lines(
+    results: Sequence[Bank2EtxAckProbeResult],
+) -> list[str]:
+    """Return compact ETX/ACK report lines."""
+    lines = [
+        "ETX/ACK PATH RESULT:",
+        f"SUMMARY:         {bank2_etx_ack_summary(results)}",
+        "",
+        "STATUS       ETX ACK  FWD-S/R  REV-S/R  FRAME/PAIR              REASON",
+        border_line(REPORT_WIDTH),
+    ]
+    if not results:
+        lines.append("(NOT RUN)")
+    for result in results:
+        lines.append(
+            f"{result.status:<12} "
+            f"{'Y' if result.etx_forward_seen else 'N':<3} "
+            f"{'Y' if result.ack_reverse_seen else 'N':<3} "
+            f"{result.forward_bytes_sent:>3}/{result.forward_bytes_received:<4} "
+            f"{result.reverse_bytes_sent:>3}/{result.reverse_bytes_received:<4} "
+            f"{frame_or_pair_label(result.settings)[:23]:<23} "
+            f"{result.reason[:24]}"
+        )
+    lines.extend(
+        [
+            "NOTE: ETX/ACK REQUIRES ACK (06) TO TRAVEL FROM PRINTER SIDE BACK TO COMPUTER SIDE.",
+            "NOTE: THIS PROBE INJECTS ACK FROM THE PRINTER SIDE; IT DOES NOT EMULATE A PRINTER.",
+            border_line(REPORT_WIDTH),
+        ]
+    )
+    return lines
+
+
 def bank2_conclusion(
     ascii_results: Sequence[CandidateResult],
     eight_bit_results: Sequence[CandidateResult],
     flow_results: Sequence[FlowControlValidationResult],
     behavior_results: Sequence[Bank2BehaviorProbeResult],
+    etx_ack_results: Sequence[Bank2EtxAckProbeResult],
 ) -> str:
     """Return compact conclusion text for a second-bank switch state."""
     stale_seen = stale_nonce_seen(ascii_results) or stale_nonce_seen(eight_bit_results)
@@ -5873,10 +6277,21 @@ def bank2_conclusion(
         return with_stale_warning(
             "Raw byte behavior changed or transformed; compare prior blocks"
         )
+    raw_exact = bool(behavior_results) and all(
+        result.status == "exact" for result in behavior_results
+    )
+    if etx_ack_results and any(result.ack_reverse_seen for result in etx_ack_results):
+        text = "8-bit clean; ACK reverse seen"
+        if raw_exact:
+            text = "8-bit clean; raw exact; ACK reverse seen"
+        return with_stale_warning(text)
+    if etx_ack_results and any(result.etx_forward_seen for result in etx_ack_results):
+        text = "8-bit clean; ACK reverse not seen"
+        if raw_exact:
+            text = "8-bit clean; raw exact; ACK reverse not seen"
+        return with_stale_warning(text)
     if bank2_eight_bit_clean_results(eight_bit_results):
-        if behavior_results and all(
-            result.status == "exact" for result in behavior_results
-        ):
+        if raw_exact:
             return with_stale_warning("8-bit clean; raw bytes exact")
         return with_stale_warning("8-bit path clean; frame still ambiguous")
     if len(pass_frames) > 1:
@@ -5905,6 +6320,7 @@ def write_bank2_text_report(
     if result.flow_skip_reason:
         flow_summary = f"SKIPPED: {result.flow_skip_reason}"
     behavior_summary = bank2_behavior_summary(result.behavior_results)
+    etx_ack_summary = bank2_etx_ack_summary(result.etx_ack_results)
     target = best_bank2_followup_target(
         result.ascii_results,
         result.eight_bit_results,
@@ -5924,11 +6340,12 @@ def write_bank2_text_report(
         f"PROBE FRAME:     {target_label}",
         f"FLOW RESULT:     {flow_summary}",
         f"BEHAVIOR RESULT: {behavior_summary}",
+        f"ETX/ACK RESULT:  {etx_ack_summary}",
         f"STALE DATA SEEN: {'YES' if result.stale_data_seen else 'NO'}",
         f"CONCLUSION:      {result.conclusion}",
         "",
         "TABLE:",
-        "DIP NOTE | KNOWN | ASCII SUMMARY | 8-BIT SUMMARY | RAW | FLOW | STALE | CONCLUSION",
+        "DIP NOTE | KNOWN | ASCII SUMMARY | 8-BIT SUMMARY | RAW | ETX/ACK | FLOW | STALE | CONCLUSION",
         border_line(REPORT_WIDTH),
         (
             f"{result.switch_note or '(NOT ENTERED)'} | "
@@ -5936,6 +6353,7 @@ def write_bank2_text_report(
             f"{ascii_summary} | "
             f"{eight_detail} | "
             f"{behavior_summary} | "
+            f"{etx_ack_summary} | "
             f"{flow_summary} | "
             f"{'YES' if result.stale_data_seen else 'NO'} | "
             f"{result.conclusion}"
@@ -5947,14 +6365,18 @@ def write_bank2_text_report(
         f"  8-BIT:          {eight_detail}",
         f"  PROBE FRAME:    {target_label}",
         f"  RAW BYTES:      {behavior_summary}",
+        f"  ETX/ACK:        {etx_ack_summary}",
         f"  FLOW:           {flow_summary}",
         f"  STALE WARNING:  {'YES' if result.stale_data_seen else 'NO'}",
         "",
         *bank2_behavior_report_lines(result.behavior_results),
         "",
+        *bank2_etx_ack_report_lines(result.etx_ack_results),
+        "",
         "INTERPRETATION:",
         "  FRAME PASS HERE MEANS CLEAN ASCII BYTE TRANSFER, NOT UNIQUE PARITY/STOP PROOF.",
         "  8-BIT CLEAN IS STRONGER EVIDENCE FOR AN 8-BIT DATA PATH.",
+        "  ETX/ACK REQUIRES A REVERSE ACK PATH; XON/XOFF DOES NOT PROVE THAT PATH.",
         "  FLOW IS PROVEN ONLY WHEN THE HOLD/RELEASE VALIDATION CHANGES BEHAVIOR.",
         "  BEHAVIOR PROBES OBSERVE BYTES ONLY; THEY DO NOT ASSIGN SWITCH MEANING.",
         "  STALE WARNING MEANS ONE ROW HAD WRONG-RUN DATA; IT IS NOT A SWITCH MEANING.",
@@ -5995,6 +6417,10 @@ def print_bank2_report(
         "  BEHAVIOR RESULT:   ",
         bank2_behavior_summary(result.behavior_results),
     )
+    print_wrapped_value(
+        "  ETX/ACK RESULT:    ",
+        bank2_etx_ack_summary(result.etx_ack_results),
+    )
     if result.behavior_results:
         print(border_line(REPORT_WIDTH))
         print("  RAW PROBE     STATUS       SENT  READ  EXACT FF CRLF")
@@ -6007,6 +6433,18 @@ def print_bank2_report(
                 f"{'Y' if probe.exact_match else 'N':<5} "
                 f"{'Y' if probe.form_feed_inserted else 'N':<2} "
                 f"{'Y' if probe.cr_lf_changed else 'N':<4}"
+            )
+    if result.etx_ack_results:
+        print(border_line(REPORT_WIDTH))
+        print("  ETX/ACK      STATUS       ETX ACK  FWD-S/R  REV-S/R")
+        for probe in result.etx_ack_results:
+            print(
+                f"  PATH         "
+                f"{probe.status:<12} "
+                f"{'Y' if probe.etx_forward_seen else 'N':<3} "
+                f"{'Y' if probe.ack_reverse_seen else 'N':<3} "
+                f"{probe.forward_bytes_sent:>3}/{probe.forward_bytes_received:<4} "
+                f"{probe.reverse_bytes_sent:>3}/{probe.reverse_bytes_received:<4}"
             )
     print(f"  STALE DATA SEEN:    {'YES' if result.stale_data_seen else 'NO'}")
     print_wrapped_value("  CONCLUSION:         ", result.conclusion)
@@ -6027,7 +6465,10 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
     print_report_title("SECOND BANK CHARACTERIZATION")
     print("AUTOMATED TEST FOR THE CURRENT SECOND-BANK DIP SETTING.")
     print(f"PORTS: {options.in_port} -> BUFFER -> {options.out_port}")
-    print("SEQUENCE: PURGE, ASCII FRAME TEST, 8-BIT CHALLENGE, RAW BEHAVIOR, FLOW VALIDATION.")
+    print(
+        "SEQUENCE: PURGE, ASCII FRAME TEST, 8-BIT CHALLENGE, "
+        "RAW BEHAVIOR, ETX/ACK PATH, FLOW VALIDATION."
+    )
     print(border_line(REPORT_WIDTH))
     default_baud = options.min_baud if options.min_baud == options.max_baud else 1200
     input_baud, output_baud = prompt_bank2_known_baud(default_baud)
@@ -6042,6 +6483,14 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
         job_timeout_observe = prompt_float(
             "JOB TIMEOUT OBSERVE SECONDS",
             DEFAULT_BANK2_JOB_TIMEOUT_OBSERVE_SECONDS,
+            0.5,
+        )
+    run_etx_ack = prompt_yes_no("RUN ETX/ACK REVERSE-PATH PROBE", True)
+    etx_ack_observe = DEFAULT_ETX_ACK_OBSERVE_SECONDS
+    if run_etx_ack:
+        etx_ack_observe = prompt_float(
+            "ETX/ACK OBSERVE SECONDS",
+            DEFAULT_ETX_ACK_OBSERVE_SECONDS,
             0.5,
         )
     payload_bytes = max(options.payload_bytes, minimum_payload_size())
@@ -6172,6 +6621,16 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
             print("SKIPPED: NO CLEAN ASCII TARGET WAS FOUND.")
             print(border_line(REPORT_WIDTH))
 
+    etx_ack_results: list[Bank2EtxAckProbeResult] = []
+    if run_etx_ack:
+        etx_ack_results = run_bank2_etx_ack_probes(
+            serial_module=serial_module,
+            options=bank_options,
+            target=followup_target,
+            observe_seconds=etx_ack_observe,
+            logger=logger,
+        )
+
     flow_results: list[FlowControlValidationResult] = []
     flow_skip_reason = bank2_flow_skip_reason(followup_target, input_baud, output_baud)
     if flow_skip_reason:
@@ -6196,6 +6655,7 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
         eight_bit_results,
         flow_results,
         behavior_results,
+        etx_ack_results,
     )
     result = Bank2CharacterizationResult(
         switch_note=switch_note,
@@ -6204,6 +6664,7 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
         eight_bit_results=eight_bit_results,
         flow_results=flow_results,
         behavior_results=behavior_results,
+        etx_ack_results=etx_ack_results,
         stale_data_seen=stale_seen,
         conclusion=conclusion,
         run_id=bank_options.run_id,
@@ -7027,6 +7488,30 @@ def run_self_tests() -> int:
         not exact and not form_feed and cr_lf and status == "transformed"
     ), "raw CR/LF transformation classification failed"
 
+    etx_payload = b"HELLO\x03\r\n"
+    etx_seen, etx_exact, ack_seen, reverse_seen, status, _reason = (
+        classify_etx_ack_bytes(etx_payload, etx_payload, b"\x06")
+    )
+    assert (
+        etx_seen
+        and etx_exact
+        and ack_seen
+        and reverse_seen
+        and status == "reverse-seen"
+    ), "ETX/ACK reverse-seen classification failed"
+    etx_seen, etx_exact, ack_seen, reverse_seen, status, _reason = (
+        classify_etx_ack_bytes(etx_payload, etx_payload, b"")
+    )
+    assert (
+        etx_seen and etx_exact and not ack_seen and not reverse_seen and status == "forward-only"
+    ), "ETX/ACK forward-only classification failed"
+    etx_seen, etx_exact, ack_seen, reverse_seen, status, _reason = (
+        classify_etx_ack_bytes(etx_payload, b"HELLO\r\n", b"")
+    )
+    assert (
+        not etx_seen and not ack_seen and not reverse_seen and status == "etx-missing"
+    ), "ETX/ACK missing-ETX classification failed"
+
     exact_behavior = Bank2BehaviorProbeResult(
         name="CR_ONLY",
         settings=same_followup,
@@ -7048,6 +7533,7 @@ def run_self_tests() -> int:
         eight_bit_results=[same_eight, stale_eight],
         flow_results=[],
         behavior_results=[exact_behavior],
+        etx_ack_results=[],
     )
     assert (
         conclusion == "8-bit clean; raw bytes exact; stale row seen"
