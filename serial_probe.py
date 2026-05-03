@@ -30,13 +30,8 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 BAUD_RATES: list[int] = [
-    75,
-    110,
-    150,
     300,
-    600,
     1200,
-    2400,
     4800,
     9600,
     19200,
@@ -110,6 +105,7 @@ REPORT_WIDTH = 78
 PROGRESS_WIDTH = 70
 TERMINAL_COLUMNS = 80
 PAGE_BODY_LINES = 22
+HELP_BODY_LINES = 20
 RECOMMENDATION_MIN_SCORE = 90.0
 TOP_MATCH_MIN_SCORE = 99.0
 TIE_SCORE_TOLERANCE = 0.5
@@ -1396,6 +1392,8 @@ def banner_lines() -> list[str]:
 def print_paged_lines(
     lines: Sequence[str],
     page_lines: int = PAGE_BODY_LINES,
+    pause_at_end: bool = True,
+    return_label: str = "RETURN",
 ) -> None:
     """Print lines with a simple 80x25-friendly page pause."""
     all_lines = list(lines)
@@ -1420,6 +1418,16 @@ def print_paged_lines(
                 return
             print("PRESS ENTER OR Q.")
         print()
+    if pause_at_end and all_lines:
+        while True:
+            try:
+                choice = read_operator_input(f"PRESS ENTER TO {return_label}: ")
+            except EOFError:
+                return
+            choice = choice.lstrip("\ufeff").strip().lower()
+            if choice in {"", "q", "quit", "0", "m", "menu"}:
+                return
+            print("PRESS ENTER.")
 
 
 def read_operator_input(prompt: str) -> str:
@@ -2862,7 +2870,7 @@ def default_scan_options() -> ScanOptions:
     return ScanOptions(
         in_port="COM1",
         out_port="COM5",
-        min_baud=75,
+        min_baud=300,
         max_baud=38400,
         payload_bytes=DEFAULT_PAYLOAD_BYTES,
         read_timeout=DEFAULT_READ_TIMEOUT,
@@ -4163,7 +4171,7 @@ def prompt_start_scan_workflow() -> str:
         print("ENTER 1, 2, 3, OR 4.")
 
 
-def print_menu_help() -> None:
+def print_menu_help(paged: bool = True) -> None:
     """Print short help for the interactive CLI."""
     print_paged_lines(
         [
@@ -4172,39 +4180,43 @@ def print_menu_help() -> None:
             "",
             "HELP",
             "",
-            "PURPOSE",
-            "  FIND SERIAL SWITCH SETTINGS FOR A PRINTER BUFFER.",
+            "MAIN MENU",
+            "  1 START SCAN:      CHOOSE WORKFLOW 1, 2, 3, OR 4.",
+            "  2 SET COM PORTS:   PC INPUT/TRANSMIT AND OUTPUT/READ PORTS.",
+            "  3 SET BAUD RANGE:  SELECT FROM VALID BAUD TABLE.",
+            f"  BAUDS:             {supported_baud_label()}.",
+            "  4 SCAN/VALIDATE:   MESSAGE SIZE, COUNT, VALIDATION SCOPE.",
+            "  5 TIMING/STALE:    READ WAITS AND OLD-OUTPUT CLEARING.",
+            "  6 REPORT FILES:    TEXT REPORT AND DEBUG LOG PATHS.",
+            "  7 RESET REPORTS:   RESTORE DEFAULT REPORT FILE NAMES.",
+            "  S CURRENT SETTINGS: SHOW ACTIVE SETUP.",
+            "  ? HELP:            THIS SCREEN.",
+            "  0 QUIT:            END PROGRAM.",
             "",
-            "METHOD",
-            "  SEND KNOWN ASCII TEXT TO INPUT PORT.",
-            "  READ OUTPUT PORT.",
-            "  TEST EACH SELECTED SERIAL SETTING.",
-            "  RANK BY MATCH QUALITY.",
+            "START SCAN WORKFLOW",
+            "  1 AUTOMATED DISCOVERY: PHASE 0, FRAME SWEEPS, FULL FALLBACK.",
+            "  2 BANK 2 KNOWN-BAUD:  FRAME, 8-BIT, RAW, ETX/ACK, FLOW.",
+            "  3 PHASE 0 ONLY:       BAUD LIVENESS MATRIX ONLY.",
+            "  4 RETURN TO MAIN MENU.",
             "",
-            "OPERATOR NOTES:",
-            "  START SCAN:      CHOOSE AUTOMATED DISCOVERY, BANK 2 TEST, OR PHASE 0.",
-            "  SWITCHES:        SW1/SW2 ARE NOT TREATED AS TWO COMPLETE PORT PROFILES.",
-            "  BANK 2 TEST:     AFTER A MANUAL SWITCH CHANGE, OPTION 1 RUNS THE TEST.",
-            "  PHASE 0:         TESTS INPUT/OUTPUT BAUD PAIRS AT 8E1 FLOW=NONE.",
-            "  BAUD PAIRS:      INPUT AND OUTPUT PORT SPEEDS MAY DIFFER.",
-            "  FRAME TEST:      AFTER PHASE 0, TESTS FRAME AND FLOW AROUND LIVE PAIRS.",
-            "  NO PHASE 0 HIT:  OFFERS SAME-BAUD FRAME FALLBACK FOR NARROW RANGES.",
-            "  DEVICE PATH:     COM1 -> BUFFER INPUT -> BUFFER OUTPUT -> COM5.",
-            "  PORT SETTINGS:   PROGRAM SETS COM PORTS; DEVICE MANAGER IS IGNORED.",
-            "  SCAN SETUP:      MESSAGE SIZE, COUNT, VALIDATION, FLOW TEST SCOPE.",
-            "  SCAN COUNT:      NUMBER OF DISCOVERY TRIES PER SETTING.",
-            "  DISCOVERY:       STAGED DUAL-PORT TEST BEFORE FULL MATRIX FALLBACK.",
-            "  TURBO:           FASTER DISCOVERY TIMING.",
-            "  ASK ON MATCH:    PAUSE AFTER PASS; ASK CONTINUE.",
-            "  FLOW TESTING:    DISCOVERY FLOW MODES; BANK 2 HOLD/RELEASE TEST.",
-            "  STALE DATA:      DISCARD OLD BUFFER DATA BEFORE EACH TEST.",
-            "  NONCES:          EACH TRIAL PAYLOAD HAS RUN/CANDIDATE/TRIAL IDS.",
-            "  8-BIT TEST:      SEPARATE HIGH-BIT CHALLENGE; ASCII PASS IS NOT ENOUGH.",
-            "  MAX CLEAR:       DEFAULT 32768 BYTES.",
-            "  TOP ROWS:        BEST RESULTS SHOWN AT END.",
-            "  BREAK:           CTRL+C ASKS RESUME, REPORT, MENU, OR QUIT.",
-            "  AFTER SCAN:      RUN AGAIN, MAIN MENU, OR QUIT.",
-        ]
+            "OPERATOR NOTES",
+            "  DEVICE PATH:       COM1 -> BUFFER INPUT -> BUFFER OUTPUT -> COM5.",
+            "  PROGRAM SETTINGS:  PROGRAM SETS BAUD, FRAME, AND FLOW ON OPEN.",
+            "  PHASE 0 SETTINGS:  FIXED 8E1 FLOW=NONE; OPTION 4 DOES NOT CHANGE IT.",
+            "  BAUD PAIRS:        INPUT AND OUTPUT BAUDS MAY DIFFER.",
+            "  NO PHASE 0 HIT:    SAME-BAUD FRAME FALLBACK OFFERED FOR NARROW RANGE.",
+            "  START 1 SETUP:     OPTION 4 ITEMS 1-6 CAN AFFECT DISCOVERY.",
+            "  START 2 SETUP:     OPTION 4 ITEMS 1, 6, AND 7 CAN AFFECT BANK 2.",
+            "  START 3 SETUP:     OPTION 4 DOES NOT AFFECT PHASE 0 ONLY.",
+            "  STALE DATA:        OLD BUFFER OUTPUT IS CLEARED BEFORE TESTS.",
+            "  NONCES:            EACH TEST PAYLOAD HAS RUN/CANDIDATE/TRIAL IDS.",
+            "  8-BIT TEST:        SEPARATE HIGH-BIT CHALLENGE; ASCII IS NOT ENOUGH.",
+            "  BREAK:             CTRL+C ASKS RESUME, REPORT, MENU, OR QUIT.",
+            "  AFTER SCAN:        RUN AGAIN, MAIN MENU, OR QUIT.",
+        ],
+        page_lines=HELP_BODY_LINES if paged else 0,
+        pause_at_end=paged,
+        return_label="RETURN TO MENU",
     )
 
 
@@ -4385,7 +4397,8 @@ def print_scan_validate_setup(options: ScanOptions) -> None:
     """Print the scan/validate setup submenu with setting scope."""
     def setting_line(number: str, label: str, value: object, used_by: str) -> None:
         print(f"  {number} {label:<31} {value}")
-        print(f"    USED BY: {used_by}")
+        for line in wrapped_value_lines("    USED BY: ", used_by, REPORT_WIDTH):
+            print(line)
 
     print()
     print_report_title("SCAN / VALIDATE SETUP")
@@ -4398,45 +4411,45 @@ def print_scan_validate_setup(options: ScanOptions) -> None:
         "DISCOVERY MESSAGE BYTES",
         options.payload_bytes,
         (
-            "AUTOMATED DISCOVERY; BANK 2 ASCII; "
-            f"8-BIT WHEN ABOVE {DEFAULT_EIGHT_BIT_PAYLOAD_BYTES} BYTES."
+            "START 1 DISCOVERY; START 2 BANK 2 ASCII; "
+            f"START 2 8-BIT BYTES=MAX({DEFAULT_EIGHT_BIT_PAYLOAD_BYTES}, THIS)."
         ),
     )
     setting_line(
         "2",
         "DISCOVERY COUNT PER SETTING",
         options.bursts,
-        "AUTOMATED DISCOVERY ONLY.",
+        "START 1 AUTOMATED DISCOVERY ONLY.",
     )
     setting_line(
         "3",
         "DISCOVERY PAUSE ON TOP MATCH",
         yes_no_text(options.ask_on_top_match),
-        "AUTOMATED DISCOVERY ONLY.",
+        "START 1 AUTOMATED DISCOVERY ONLY.",
     )
     setting_line(
         "4",
         "VALIDATE TOP MATCH",
         yes_no_text(options.auto_validate_top_matches),
-        "AUTOMATED DISCOVERY AFTER SCAN.",
+        "START 1 AUTOMATED DISCOVERY AFTER SCAN.",
     )
     setting_line(
         "5",
         "VALIDATE TOP MATCH BYTES",
         options.validate_size_1_bytes,
-        "ONLY WHEN 4=YES; AUTOMATED DISCOVERY TOP-MATCH VALIDATION.",
+        "ONLY WHEN 4=YES; START 1 TOP-MATCH VALIDATION.",
     )
     setting_line(
         "6",
         "FLOW-CONTROL TESTING",
         yes_no_text(options.auto_validate_flow_control),
-        "DISCOVERY FLOW SWEEP; BANK 2 FLOW VALIDATION ON/OFF.",
+        "START 1 FLOW SWEEP; START 2 BANK 2 FLOW VALIDATION ON/OFF.",
     )
     setting_line(
         "7",
         "BANK 2 FLOW TEST BYTES",
         options.flow_validate_size_bytes,
-        "ONLY WHEN 6=YES; BANK 2 FLOW VALIDATION ONLY.",
+        "ONLY WHEN 6=YES; START 2 BANK 2 FLOW VALIDATION ONLY.",
     )
     print("  0 RETURN TO MAIN MENU")
     print(border_line(REPORT_WIDTH))
@@ -7693,7 +7706,7 @@ def run_self_tests() -> int:
     ]
     assert actual_bank2_frames == expected_bank2_frames, "Bank 2 frame order changed"
 
-    dual_bank2 = bank2_frame_candidates(1200, 2400, independent_frames=True)
+    dual_bank2 = bank2_frame_candidates(1200, 4800, independent_frames=True)
     assert len(dual_bank2) == 144, "Bank 2 independent frame product must be 144"
     assert all(
         isinstance(settings, DualSerialSettings) for settings in dual_bank2
@@ -7751,6 +7764,7 @@ def run_self_tests() -> int:
         "same COM port accepted",
     )
     validate_supported_baud(9600)
+    expect_value_error(lambda: validate_supported_baud(2400), "unsupported 2400 baud accepted")
     expect_value_error(lambda: validate_supported_baud(12345), "unsupported baud accepted")
     validate_report_path(Path("serial_probe_report.txt"))
     expect_value_error(lambda: validate_report_path(Path(".")), "directory report path accepted")
@@ -7778,7 +7792,7 @@ def run_self_tests() -> int:
     )
     midrange_options = dataclasses.replace(
         default_scan_options(),
-        min_baud=2400,
+        min_baud=1200,
         max_baud=9600,
     )
     assert same_baud_fallback_pairs(narrow_options) == [
@@ -7787,7 +7801,7 @@ def run_self_tests() -> int:
     assert same_baud_fallback_pairs(midrange_options) == [
         (9600, 9600),
         (4800, 4800),
-        (2400, 2400),
+        (1200, 1200),
     ], "same-baud fallback pairs must follow scan order"
     assert phase0_no_signal_fallback_default(1), "single-baud fallback should default on"
     assert phase0_no_signal_fallback_default(2), "two-baud fallback should default on"
@@ -7967,7 +7981,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if any(arg in {"--self-test", "self-test"} for arg in args):
         return run_self_tests()
     if any(arg in {"-h", "--help", "help"} for arg in args):
-        print_menu_help()
+        print_menu_help(paged=False)
         return 0
     if args:
         print("THIS PROGRAM IS SET FROM THE TERMINAL MENU.")

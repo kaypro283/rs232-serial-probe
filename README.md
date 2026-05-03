@@ -134,27 +134,27 @@ Scan type FULL, quick prompt Y, no usable quick findings:
 With the default printer-buffer baud range, the scan tests:
 
 ```text
-10 baud rates x 2 data-bit choices x 5 parity choices x 2 stop-bit choices x 4 flow-control choices = 800 combinations
+6 baud rates x 2 data-bit choices x 5 parity choices x 2 stop-bit choices x 4 flow-control choices = 480 combinations
 ```
 
 The default baud list is:
 
 ```text
-110, 150, 300, 600, 1200, 2400, 4800, 9600, 19200, 38400
+300, 1200, 4800, 9600, 19200, 38400
 ```
 
-The scan tries the fastest selected baud rate first, then works downward. With the default range, it starts at `38400` and ends at `110`. A normal full scan still tests every data-bit, parity, stop-bit, and flow-control combination. Quick exploratory may test fewer combinations when Phase 0 finds a smaller alive baud set.
+The scan tries the fastest selected baud rate first, then works downward. With the default range, it starts at `38400` and ends at `300`. A normal full scan still tests every data-bit, parity, stop-bit, and flow-control combination. Quick exploratory may test fewer combinations when Phase 0 finds a smaller alive baud set.
 
 ## Speed
 
 The default menu settings are tuned for a practical scan:
 
-- `180` bytes per setting.
+- `384` bytes per setting.
 - `1` test per setting.
 - Every selected serial setting is tested in a normal full scan. QUICK may shorten the exploratory pass with Phase 0 and may shorten the phase-2 candidate list only when confidence gates pass.
 - Output wait after send is `2.0` seconds by default.
 - `Ask on top match` is off by default. If enabled, a `PASS` result pauses the scan and asks whether to continue looking for possible ties.
-- `Auto validate top matches after scan` is on by default. It retests the top-score setting or settings with an 8K payload, then uses a 16K payload if a tie remains. The menu can turn this off or change the sizes.
+- `Auto validate top matches after scan` is on by default. It retests the top-score setting or settings with an 8K payload. The menu can turn this off or change the size.
 - Old-output clearing stops after `32768` bytes by default, which is enough for a 16K buffer plus margin.
 - No early stop.
 
@@ -186,10 +186,10 @@ The console shows:
 Example:
 
 ```text
-22:10:02 *              SETTING 1/800  38400 8N1 FLOW=NONE            *
-22:10:02 [0001/0800 38400 8N1 FLOW=NONE] TEST 1/1: SEND 180 BYTES
-22:10:04 [0001/0800 38400 8N1 FLOW=NONE] TEST 1/1: RESULT FAIL SCORE=0.00
-SCAN TIME 0001/0800: ELAPSED=2S AVG=2S/SET LEFT=26M38S FINISH=22:36:42
+22:10:02 *              SETTING 1/480  38400 8N1 FLOW=NONE            *
+22:10:02 [0001/0480 38400 8N1 FLOW=NONE] TEST 1/1: SEND 384 BYTES
+22:10:04 [0001/0480 38400 8N1 FLOW=NONE] TEST 1/1: RESULT FAIL SCORE=0.00
+SCAN TIME 0001/0480: ELAPSED=2S AVG=2S/SET LEFT=15M58S FINISH=22:26:02
 ```
 
 ## Stale Output
