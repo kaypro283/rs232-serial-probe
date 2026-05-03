@@ -102,13 +102,13 @@ If no baud pair is alive, the program explains the condition. For narrow baud ra
 With the default printer-buffer baud range, the complete same-frame matrix is:
 
 ```text
-6 baud rates x 2 data-bit choices x 5 parity choices x 2 stop-bit choices x 4 flow-control choices = 480 combinations
+7 baud rates x 2 data-bit choices x 5 parity choices x 2 stop-bit choices x 4 flow-control choices = 560 combinations
 ```
 
 The default baud list is:
 
 ```text
-300, 1200, 4800, 9600, 19200, 38400
+300, 1200, 2400, 4800, 9600, 19200, 38400
 ```
 
 The scan tries the fastest selected baud rate first, then works downward. With the default range, it starts at `38400` and ends at `300`. Automated discovery starts with Phase 0 and staged frame sweeps; it runs the larger full matrix only when the staged checks do not find a strong pair.

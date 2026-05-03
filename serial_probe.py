@@ -32,6 +32,7 @@ from typing import Any, Callable, Sequence
 BAUD_RATES: list[int] = [
     300,
     1200,
+    2400,
     4800,
     9600,
     19200,
@@ -8352,6 +8353,14 @@ def run_self_tests() -> int:
     assert (
         phase0_1200_timing.pre_drain_timeout > PHASE0_PRE_DRAIN_TIMEOUT
     ), "Phase 0 1200 baud pre-drain timeout was not expanded"
+    phase0_2400_timing = effective_discovery_timing(
+        phase0_options,
+        phase0_baseline_settings(2400),
+        phase0_payload_bytes(),
+    )
+    assert (
+        phase0_2400_timing.pre_drain_timeout > PHASE0_PRE_DRAIN_TIMEOUT
+    ), "Phase 0 2400 baud pre-drain timeout was not expanded"
     phase0_4800_timing = effective_discovery_timing(
         phase0_options,
         phase0_baseline_settings(4800),
@@ -8378,6 +8387,20 @@ def run_self_tests() -> int:
     assert (
         default_1200_timing.pre_drain_timeout > DEFAULT_PRE_DRAIN_TIMEOUT
     ), "general 1200 baud pre-drain timeout was not expanded"
+    default_2400_timing = effective_discovery_timing(
+        default_options,
+        SerialSettings(2400, 8, "none", 1, "none"),
+        DEFAULT_PAYLOAD_BYTES,
+    )
+    assert (
+        default_2400_timing.read_timeout == DEFAULT_READ_TIMEOUT
+    ), "general 2400 baud timing should not change normal read quiet"
+    assert (
+        default_2400_timing.pre_drain_quiet > DEFAULT_PRE_DRAIN_QUIET
+    ), "general 2400 baud pre-drain quiet was not expanded"
+    assert (
+        default_2400_timing.pre_drain_timeout > DEFAULT_PRE_DRAIN_TIMEOUT
+    ), "general 2400 baud pre-drain timeout was not expanded"
     default_4800_timing = effective_discovery_timing(
         default_options,
         SerialSettings(4800, 8, "none", 1, "none"),
@@ -8476,7 +8499,7 @@ def run_self_tests() -> int:
         "same COM port accepted",
     )
     validate_supported_baud(9600)
-    expect_value_error(lambda: validate_supported_baud(2400), "unsupported 2400 baud accepted")
+    validate_supported_baud(2400)
     expect_value_error(lambda: validate_supported_baud(12345), "unsupported baud accepted")
     memory_settings = memory_test_settings(38400, 9600)
     assert memory_settings.input_settings == SerialSettings(
@@ -8573,6 +8596,7 @@ def run_self_tests() -> int:
     assert same_baud_fallback_pairs(midrange_options) == [
         (9600, 9600),
         (4800, 4800),
+        (2400, 2400),
         (1200, 1200),
     ], "same-baud fallback pairs must follow scan order"
     assert phase0_no_signal_fallback_default(1), "single-baud fallback should default on"
