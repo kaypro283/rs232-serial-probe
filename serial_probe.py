@@ -62,6 +62,7 @@ MEMORY_TEST_READ_QUIET_SECONDS = 2.0
 MEMORY_TEST_PRE_DRAIN_TIMEOUT = 2.5
 MEMORY_TEST_MODE_IMAGE = "image"
 MEMORY_TEST_MODE_FILL = "fill"
+MEMORY_TEST_MODE_CUSTOM = "custom"
 FLOW_VALIDATE_PAYLOAD_BYTES = 1024
 FLOW_VALIDATE_READ_TIMEOUT = 2.0
 FLOW_VALIDATE_HOLD_SECONDS = 1.0
@@ -292,6 +293,7 @@ class ScoreMetrics:
     length_ratio: float
     start_marker_present: bool
     end_marker_present: bool
+    exact_prefix_bytes: int = 0
     valid_probe_line_count: int = 0
     current_nonce_line_count: int = 0
     wrong_nonce_line_count: int = 0
@@ -353,6 +355,7 @@ class TrialResult:
     evidence: tuple[str, ...] = ()
     nonce_summary: str = ""
     payload_mode: str = PAYLOAD_MODE_ASCII
+    bytes_received_at_write_done: int = 0
 
 
 @dataclass(frozen=True)
@@ -452,6 +455,26 @@ class MemoryTestResult:
     started_at: str
     completed_at: str
     elapsed_sec: float
+
+
+@dataclass(frozen=True)
+class MemoryTestDiagnosis:
+    """Operator-facing interpretation for one 16K memory-test result."""
+
+    code: str
+    result: str
+    finding: str
+    exact_stream: str
+    data_check: str
+    capacity_check: str
+    ram_check: str
+    operator_note: str
+    content_integrity_ratio: float
+    completeness_ratio: float
+    exact_prefix_bytes: int
+    bytes_received_at_write_done: int
+    bytes_delivered_after_write_done: int
+    write_pressure_bytes: int
 
 
 @dataclass(frozen=True)
@@ -1005,6 +1028,16 @@ def eight_bit_payload_slices(expected: bytes) -> tuple[int, int] | None:
     return header_end + 2, footer_start
 
 
+def exact_prefix_byte_count(expected: bytes, received: bytes) -> int:
+    """Return how many received bytes match the expected stream from byte zero."""
+    count = 0
+    for expected_byte, received_byte in zip(expected, received):
+        if expected_byte != received_byte:
+            break
+        count += 1
+    return count
+
+
 def score_eight_bit_received(expected: bytes, received: bytes) -> ScoreResult:
     """Score a raw eight-bit challenge payload."""
     expected_len = len(expected)
@@ -1013,6 +1046,7 @@ def score_eight_bit_received(expected: bytes, received: bytes) -> ScoreResult:
     extra = max(received_len - expected_len, 0)
     length_ratio = min(expected_len, received_len) / max(expected_len, received_len, 1)
     exact_ratio = exact_byte_match_ratio(expected, received)
+    exact_prefix = exact_prefix_byte_count(expected, received)
     ascii_ratio = printable_ascii_ratio(received)
     start_marker = b"<<<SERIAL_PROBE_8BIT_BEGIN" in received
     end_marker = b"<<<SERIAL_PROBE_8BIT_END" in received
@@ -1054,6 +1088,7 @@ def score_eight_bit_received(expected: bytes, received: bytes) -> ScoreResult:
         length_ratio=length_ratio,
         start_marker_present=start_marker,
         end_marker_present=end_marker,
+        exact_prefix_bytes=exact_prefix,
         high_bit_bytes_sent=high_sent,
         high_bit_bytes_received=high_received,
         high_bit_exact_ratio=high_exact_ratio,
@@ -1096,6 +1131,7 @@ def score_received(expected: bytes, received: bytes) -> ScoreResult:
     extra = max(received_len - expected_len, 0)
     length_ratio = min(expected_len, received_len) / max(expected_len, received_len, 1)
     exact_ratio = exact_byte_match_ratio(expected, received)
+    exact_prefix = exact_prefix_byte_count(expected, received)
     expected_lines = parse_valid_probe_lines(expected)
     expected_nonce = expected_nonce_from_payload(expected)
     received_parsed_lines = parse_probe_lines(received)
@@ -1165,6 +1201,7 @@ def score_received(expected: bytes, received: bytes) -> ScoreResult:
         length_ratio=length_ratio,
         start_marker_present=start_marker,
         end_marker_present=end_marker,
+        exact_prefix_bytes=exact_prefix,
         valid_probe_line_count=len(received_parsed_lines),
         current_nonce_line_count=current_nonce_lines,
         wrong_nonce_line_count=wrong_nonce_lines,
@@ -1844,7 +1881,8 @@ def print_progress_legend() -> None:
     print("  CLEARED=N             OLD OUTPUT REMOVED BEFORE SEND.")
     print("  QUIET=S/T             OUTPUT QUIET TIME AND LIMIT.")
     print("  PASS GOOD PART FAIL STALE ERROR  RESULT INDICATOR.")
-    print("  SCORE                 0-100 MATCH CONFIDENCE.")
+    print("  SCORE                 0-100 TRANSFER MATCH CONFIDENCE, NOT RAM HEALTH.")
+    print("  MEMORY DIAGNOSIS      SEPARATES CLEAN OVERFLOW FROM CONTENT CORRUPTION.")
     print("  SCAN TIME             ELAPSED, LEFT, FINISH TIME.")
     print("  CTRL+C                OPERATOR BREAK MENU.")
 
@@ -2086,6 +2124,7 @@ def execute_burst(
 
     bytes_sent = 0
     write_error: str | None = None
+    bytes_received_at_write_done = 0
     write_started = time.monotonic()
     if progress:
         estimated = estimated_transmit_seconds(settings, len(expected))
@@ -2120,6 +2159,7 @@ def execute_burst(
         write_error = str(exc)
         logger.debug("burst %s write failed: %s", burst_index, write_error)
     finally:
+        bytes_received_at_write_done = received_length(received, received_lock)
         last_data_time = time.monotonic()
         writer_done.set()
     write_elapsed = time.monotonic() - write_started
@@ -2224,6 +2264,7 @@ def execute_burst(
         evidence=score.evidence,
         nonce_summary=payload.nonce.compact() if payload.nonce else "",
         payload_mode=payload.payload_mode,
+        bytes_received_at_write_done=bytes_received_at_write_done,
     )
 
 
@@ -2256,6 +2297,7 @@ def aggregate_metrics(trials: Sequence[TrialResult]) -> ScoreMetrics:
         length_ratio=statistics.fmean(trial.metrics.length_ratio for trial in trials),
         start_marker_present=all(trial.metrics.start_marker_present for trial in trials),
         end_marker_present=all(trial.metrics.end_marker_present for trial in trials),
+        exact_prefix_bytes=sum(trial.metrics.exact_prefix_bytes for trial in trials),
         valid_probe_line_count=sum(trial.metrics.valid_probe_line_count for trial in trials),
         current_nonce_line_count=sum(
             trial.metrics.current_nonce_line_count for trial in trials
@@ -4333,6 +4375,8 @@ def memory_test_mode_label(mode: str) -> str:
     """Return compact operator-facing text for a memory-test mode."""
     if mode == MEMORY_TEST_MODE_FILL:
         return "FILL 16K"
+    if mode == MEMORY_TEST_MODE_CUSTOM:
+        return "CUSTOM SIZE"
     return "16K IMAGE"
 
 
@@ -4345,6 +4389,8 @@ def parse_memory_test_mode_choice(choice: str, fill_available: bool) -> str | No
         return MEMORY_TEST_MODE_IMAGE
     if choice in {"2", "f", "fill", "stress"} and fill_available:
         return MEMORY_TEST_MODE_FILL
+    if choice in {"3", "c", "custom", "bytes", "size"}:
+        return MEMORY_TEST_MODE_CUSTOM
     if choice in {"0", "m", "menu", "main", "return"}:
         return "menu"
     return None
@@ -4410,8 +4456,11 @@ def prompt_memory_test_mode(input_baud: int, output_baud: int) -> str | None:
         if fill_available:
             print(f"  2 FILL 16K    SEND {fill_bytes} ASCII BYTES")
             print(f"                EST. PEAK BUFFER USE: {peak_fill} BYTES")
+            print("                OVERFLOW STRESS; REPORT CLASSIFIES CLEAN DROP VS CORRUPTION")
         else:
             print("  2 FILL 16K    NOT AVAILABLE; INPUT BAUD MUST BE FASTER")
+        print("  3 CUSTOM      SEND OPERATOR BYTE COUNT")
+        print("                USE TO BRACKET NEAR-FILL AFTER OVERFLOW DIAGNOSIS")
         print("  0 RETURN TO MAIN MENU")
         print(border_line(REPORT_WIDTH))
         try:
@@ -4426,9 +4475,39 @@ def prompt_memory_test_mode(input_baud: int, output_baud: int) -> str | None:
         if mode is not None:
             return mode
         if fill_available:
-            print("ENTER 1, 2, OR 0.")
+            print("ENTER 1, 2, 3, OR 0.")
         else:
-            print("ENTER 1 OR 0. FILL 16K NEEDS INPUT BAUD > OUTPUT BAUD.")
+            print("ENTER 1, 3, OR 0. FILL 16K NEEDS INPUT BAUD > OUTPUT BAUD.")
+
+
+def prompt_memory_test_payload_bytes(default_bytes: int) -> int | None:
+    """Prompt for a custom memory-test byte count."""
+    minimum = minimum_payload_size()
+    maximum = MEMORY_TEST_TARGET_BYTES * 8
+    while True:
+        try:
+            value = read_operator_input(
+                f"CUSTOM PAYLOAD BYTES [{default_bytes}] (0=MENU): "
+            ).strip()
+        except EOFError:
+            return None
+        value = value.lstrip("\ufeff").strip().lower()
+        if value in {"0", "m", "menu", "main", "return"}:
+            return None
+        if value == "":
+            return default_bytes
+        try:
+            payload_bytes = int(value)
+        except ValueError:
+            print("ENTER A WHOLE NUMBER, OR 0 FOR MENU.")
+            continue
+        if payload_bytes < minimum:
+            print(f"ENTER AT LEAST {minimum} BYTES.")
+            continue
+        if payload_bytes > maximum:
+            print(f"ENTER {maximum} BYTES OR LESS.")
+            continue
+        return payload_bytes
 
 
 def prompt_memory_test_note(current: str) -> str | None:
@@ -4480,11 +4559,15 @@ def prompt_memory_test_config(options: ScanOptions) -> MemoryTestConfig | None:
     if mode is None:
         return None
 
-    payload_bytes = (
-        memory_test_fill_payload_bytes(input_baud, output_baud)
-        if mode == MEMORY_TEST_MODE_FILL
-        else MEMORY_TEST_TARGET_BYTES
-    )
+    if mode == MEMORY_TEST_MODE_FILL:
+        payload_bytes = memory_test_fill_payload_bytes(input_baud, output_baud)
+    elif mode == MEMORY_TEST_MODE_CUSTOM:
+        custom_payload = prompt_memory_test_payload_bytes(MEMORY_TEST_TARGET_BYTES)
+        if custom_payload is None:
+            return None
+        payload_bytes = custom_payload
+    else:
+        payload_bytes = MEMORY_TEST_TARGET_BYTES
     payload_bytes = max(payload_bytes, minimum_payload_size())
     switch_note = prompt_memory_test_note(options.switch_note)
     if switch_note is None:
@@ -4519,6 +4602,13 @@ def prompt_memory_test_config(options: ScanOptions) -> MemoryTestConfig | None:
     print(f"  FINISH ABOUT:        {format_finish_clock(transfer_estimate)}")
     if peak_estimate < MEMORY_TEST_TARGET_BYTES:
         print("  NOTE:                THIS BAUD PAIR MAY NOT FILL 16K.")
+    if mode == MEMORY_TEST_MODE_FILL:
+        print("  NOTE:                FILL MODE TRIES TO OVERFILL THE BUFFER.")
+        print("                       IF START MATCHES BUT END IS MISSING,")
+        print("                       THE BUFFER IS PROBABLY FULL.")
+    if mode == MEMORY_TEST_MODE_CUSTOM:
+        print("  NOTE:                CUSTOM SIZE IS FOR BRACKETING NEAR-FILL")
+        print("                       WITHOUT FORCING THE OVERFLOW-STRESS SIZE.")
     print(border_line(REPORT_WIDTH))
     if not prompt_run_memory_test():
         return None
@@ -7422,8 +7512,222 @@ def memory_test_reason(candidate: CandidateResult, payload: ProbePayload) -> str
 
 
 def memory_test_status_text(candidate: CandidateResult, payload: ProbePayload) -> str:
-    """Return PASS or FAIL for a memory-test result."""
+    """Return the exact-stream check status for compatibility with old reports."""
     return "PASS" if memory_test_passed(candidate, payload) else "FAIL"
+
+
+def memory_test_primary_trial(candidate: CandidateResult) -> TrialResult | None:
+    """Return the single memory-test trial when it is available."""
+    return candidate.trials[0] if candidate.trials else None
+
+
+def memory_test_content_integrity_ratio(
+    candidate: CandidateResult,
+    payload: ProbePayload,
+) -> float:
+    """Return match quality over bytes that were actually returned."""
+    compared = min(payload.byte_count, candidate.bytes_received)
+    if compared <= 0:
+        return 0.0
+    return min(candidate.metrics.exact_prefix_bytes, compared) / compared
+
+
+def memory_test_completeness_ratio(
+    candidate: CandidateResult,
+    payload: ProbePayload,
+) -> float:
+    """Return how much of the expected stream came back, ignoring extra bytes."""
+    if payload.byte_count <= 0:
+        return 0.0
+    return min(candidate.bytes_received, payload.byte_count) / payload.byte_count
+
+
+def memory_test_diagnosis(result: MemoryTestResult) -> MemoryTestDiagnosis:
+    """Classify one memory-test result for operator interpretation."""
+    candidate = result.candidate
+    payload = result.payload
+    metrics = candidate.metrics
+    trial = memory_test_primary_trial(candidate)
+    received_at_write_done = trial.bytes_received_at_write_done if trial else 0
+    delivered_after_write_done = max(
+        0,
+        candidate.bytes_received - received_at_write_done,
+    )
+    write_pressure = max(0, candidate.bytes_sent - received_at_write_done)
+    content_ratio = memory_test_content_integrity_ratio(candidate, payload)
+    completeness_ratio = memory_test_completeness_ratio(candidate, payload)
+    clean_prefix = content_ratio >= 0.98 and metrics.printable_ascii_ratio >= 0.98
+    post_write_near_target = (
+        delivered_after_write_done >= int(result.config.target_bytes * 0.90)
+    )
+    peak_estimate = estimated_memory_test_peak_fill_bytes(
+        result.config.input_baud,
+        result.config.output_baud,
+        result.config.payload_bytes,
+    )
+
+    def diagnosis(
+        code: str,
+        result_text: str,
+        finding: str,
+        exact_stream: str,
+        data_check: str,
+        capacity_check: str,
+        ram_check: str,
+        operator_note: str,
+        *,
+        content: float = content_ratio,
+        completeness: float = completeness_ratio,
+        exact_prefix: int = metrics.exact_prefix_bytes,
+    ) -> MemoryTestDiagnosis:
+        return MemoryTestDiagnosis(
+            code=code,
+            result=result_text,
+            finding=finding,
+            exact_stream=exact_stream,
+            data_check=data_check,
+            capacity_check=capacity_check,
+            ram_check=ram_check,
+            operator_note=operator_note,
+            content_integrity_ratio=content,
+            completeness_ratio=completeness,
+            exact_prefix_bytes=exact_prefix,
+            bytes_received_at_write_done=received_at_write_done,
+            bytes_delivered_after_write_done=delivered_after_write_done,
+            write_pressure_bytes=write_pressure,
+        )
+
+    if memory_test_passed(candidate, payload):
+        capacity_check = (
+            "NOT FILLED"
+            if peak_estimate < result.config.target_bytes
+            else "NO OVERFLOW"
+        )
+        operator_note = (
+            "PATH PASSED. USE FILL OR CUSTOM MODE TO LOAD RAM."
+            if peak_estimate < result.config.target_bytes
+            else "EXACT MEMORY STREAM RETURNED."
+        )
+        return diagnosis(
+            "exact-pass",
+            "EXACT STREAM RETURNED",
+            "ALL BYTES RETURNED IN ORDER.",
+            "PASS",
+            "PASS",
+            capacity_check,
+            "NO ERROR SEEN",
+            operator_note,
+            content=1.0,
+            completeness=1.0,
+        )
+    if candidate.error:
+        return diagnosis(
+            "serial-error",
+            "SERIAL ERROR",
+            f"PORT ERROR: {candidate.error}",
+            "NOT TESTED",
+            "UNKNOWN",
+            "UNKNOWN",
+            "UNKNOWN",
+            "CHECK PORTS, CABLES, AND SETTINGS.",
+        )
+    if candidate.bytes_sent < payload.byte_count:
+        return diagnosis(
+            "incomplete-send",
+            "PAYLOAD NOT FULLY SENT",
+            "THE PC DID NOT SEND THE FULL PLANNED STREAM.",
+            "NO",
+            "UNKNOWN",
+            "UNKNOWN",
+            "UNKNOWN",
+            "RERUN BEFORE JUDGING THE BUFFER.",
+        )
+    if candidate.bytes_received == 0:
+        return diagnosis(
+            "no-output",
+            "NO OUTPUT",
+            "NO BYTES RETURNED FROM THE BUFFER.",
+            "NO",
+            "UNKNOWN",
+            "UNKNOWN",
+            "UNKNOWN",
+            "CHECK BAUD, FRAME, CABLES, AND BUFFER OUTPUT.",
+            content=0.0,
+            completeness=0.0,
+            exact_prefix=0,
+        )
+    if metrics.extra_bytes:
+        return diagnosis(
+            "extra-output",
+            "CHECK SETTINGS",
+            "EXTRA OUTPUT WAS RECEIVED.",
+            "NO",
+            "UNUSABLE",
+            "UNKNOWN",
+            "UNKNOWN",
+            "CLEAR OLD DATA OR CHECK BAUD/FRAME BEFORE RAM TESTING.",
+        )
+    if (
+        metrics.missing_bytes
+        and clean_prefix
+        and trial is not None
+        and result.config.mode in {MEMORY_TEST_MODE_FILL, MEMORY_TEST_MODE_CUSTOM}
+        and write_pressure >= result.config.target_bytes
+        and post_write_near_target
+    ):
+        return diagnosis(
+            "probable-overflow-clean",
+            "BUFFER FULL OBSERVED",
+            "ABOUT 16K RETURNED AFTER WRITE; EXCESS BYTES DROPPED.",
+            "NO - OVERFILL TEST",
+            "PASS FOR RETURNED BYTES",
+            "FULL / OVERFLOW",
+            "NO ERROR SEEN",
+            "USE CUSTOM SIZE BELOW THIS POINT FOR A NON-OVERFLOW RAM CHECK.",
+        )
+    if metrics.missing_bytes and clean_prefix:
+        return diagnosis(
+            "clean-prefix-incomplete",
+            "OUTPUT ENDED EARLY",
+            "START OF STREAM MATCHED; REMAINING BYTES DID NOT ARRIVE.",
+            "NO",
+            "PASS FOR RETURNED BYTES",
+            "UNKNOWN",
+            "NO ERROR SEEN IN RETURNED BYTES",
+            "RERUN OR TRY A SMALLER CUSTOM SIZE.",
+        )
+    if metrics.missing_bytes:
+        return diagnosis(
+            "missing-with-content-errors",
+            "CHECK DATA",
+            "OUTPUT IS SHORT AND RETURNED DATA DOES NOT STAY IN ORDER.",
+            "NO",
+            "FAIL",
+            "UNKNOWN",
+            "POSSIBLE IF REPEATABLE",
+            "REPEAT TEST; SAME OFFSET POINTS TO RAM OR DATA PATH.",
+        )
+    if metrics.exact_byte_match_ratio < 1.0:
+        return diagnosis(
+            "possible-content-corruption",
+            "POSSIBLE RAM OR DATA CORRUPTION",
+            "RETURNED CONTENT CHANGED.",
+            "NO",
+            "FAIL",
+            "UNKNOWN",
+            "SUSPECT IF REPEATABLE",
+            "REPEAT TEST; SAME BYTE OR BIT ERRORS POINT TO RAM.",
+        )
+    return diagnosis(
+        "inconclusive",
+        "INCONCLUSIVE",
+        "RESULT DOES NOT MATCH A CLEAR TEST PATTERN.",
+        "NO",
+        "UNKNOWN",
+        "UNKNOWN",
+        "UNKNOWN",
+        "RERUN WITH A CUSTOM SIZE AND CHECK SETTINGS.",
+    )
 
 
 def write_memory_test_text_report(path: Path, result: MemoryTestResult) -> None:
@@ -7433,6 +7737,7 @@ def write_memory_test_text_report(path: Path, result: MemoryTestResult) -> None:
     metrics = candidate.metrics
     settings = result.settings
     trial = candidate.trials[0] if candidate.trials else None
+    diagnosis = memory_test_diagnosis(result)
     peak_estimate = estimated_memory_test_peak_fill_bytes(
         result.config.input_baud,
         result.config.output_baud,
@@ -7446,8 +7751,12 @@ def write_memory_test_text_report(path: Path, result: MemoryTestResult) -> None:
         f"COMPLETED UTC:   {result.completed_at}",
         f"RUN ID:          {result.config.run_id}",
         f"MODE:            {memory_test_mode_label(result.config.mode)}",
-        f"STATUS:          {memory_test_status_text(candidate, payload)}",
-        f"REASON:          {memory_test_reason(candidate, payload)}",
+        f"RESULT:          {diagnosis.result}",
+        f"FINDING:         {diagnosis.finding}",
+        f"EXACT STREAM:    {diagnosis.exact_stream}",
+        f"DATA CHECK:      {diagnosis.data_check}",
+        f"CAPACITY CHECK:  {diagnosis.capacity_check}",
+        f"RAM CHECK:       {diagnosis.ram_check}",
         f"COM PATH:        {result.config.in_port} -> BUFFER -> {result.config.out_port}",
         f"INPUT SETTING:   {settings.input_settings.label()}",
         f"OUTPUT SETTING:  {settings.output_settings.label()}",
@@ -7457,13 +7766,18 @@ def write_memory_test_text_report(path: Path, result: MemoryTestResult) -> None:
         f"EST. PEAK FILL:  {peak_estimate} BYTES",
         f"SENT:            {candidate.bytes_sent} BYTES",
         f"RECEIVED:        {candidate.bytes_received} BYTES",
-        f"SCORE:           {candidate.score:.2f}",
-        f"EXACT RATIO:     {metrics.exact_byte_match_ratio:.3f}",
+        f"RETURNED MATCH:  {diagnosis.content_integrity_ratio:.3f}",
+        f"COMPLETENESS:    {diagnosis.completeness_ratio:.3f}",
+        f"MATCHED START:   {diagnosis.exact_prefix_bytes} BYTE(S)",
         f"LINE CHECKS:     {metrics.valid_probe_line_count}/{payload.line_count}",
         f"MISSING/EXTRA:   {metrics.missing_bytes}/{metrics.extra_bytes}",
+        f"READ BY WRITE:   {diagnosis.bytes_received_at_write_done} BYTE(S)",
+        f"POST-WRITE READ: {diagnosis.bytes_delivered_after_write_done} BYTE(S)",
+        f"WRITE PRESSURE:  {diagnosis.write_pressure_bytes} BYTE(S)",
         f"PURGE:           {result.purge.bytes_drained} BYTES, {result.purge.reason.upper()}",
         f"ELAPSED:         {format_duration(result.elapsed_sec)}",
     ]
+    lines.extend(wrapped_value_lines("NOTE:            ", diagnosis.operator_note, REPORT_WIDTH))
     if trial:
         lines.extend(
             [
@@ -7481,6 +7795,7 @@ def print_memory_test_report(result: MemoryTestResult, report_path: Path) -> Non
     candidate = result.candidate
     payload = result.payload
     metrics = candidate.metrics
+    diagnosis = memory_test_diagnosis(result)
     peak_estimate = estimated_memory_test_peak_fill_bytes(
         result.config.input_baud,
         result.config.output_baud,
@@ -7488,20 +7803,29 @@ def print_memory_test_report(result: MemoryTestResult, report_path: Path) -> Non
     )
     print()
     print_report_title("MEMORY TEST RESULT")
-    print(f"  STATUS:              {memory_test_status_text(candidate, payload)}")
-    print_wrapped_value("  REASON:              ", memory_test_reason(candidate, payload))
+    print(f"  RESULT:              {diagnosis.result}")
+    print_wrapped_value("  FINDING:             ", diagnosis.finding)
+    print(f"  EXACT STREAM:        {diagnosis.exact_stream}")
+    print(f"  DATA CHECK:          {diagnosis.data_check}")
+    print(f"  CAPACITY CHECK:      {diagnosis.capacity_check}")
+    print(f"  RAM CHECK:           {diagnosis.ram_check}")
     print(f"  MODE:                {memory_test_mode_label(result.config.mode)}")
     print(f"  PAYLOAD:             {payload.byte_count} ASCII BYTES")
     print(f"  EST. PEAK BUFFER:    {peak_estimate} BYTES")
     print(f"  INPUT:               {result.settings.input_settings.label()}")
     print(f"  OUTPUT:              {result.settings.output_settings.label()}")
     print(f"  SENT/RECEIVED:       {candidate.bytes_sent}/{candidate.bytes_received}")
-    print(f"  SCORE:               {candidate.score:.2f}")
-    print(f"  EXACT BYTE RATIO:    {metrics.exact_byte_match_ratio:.3f}")
+    print(f"  RETURNED MATCH:      {diagnosis.content_integrity_ratio:.3f}")
+    print(f"  COMPLETENESS:        {diagnosis.completeness_ratio:.3f}")
+    print(f"  MATCHED FROM START:  {diagnosis.exact_prefix_bytes} BYTE(S)")
     print(f"  LINE CHECKS:         {metrics.valid_probe_line_count}/{payload.line_count}")
     print(f"  MISSING/EXTRA:       {metrics.missing_bytes}/{metrics.extra_bytes}")
+    print(f"  READ BY WRITE DONE:  {diagnosis.bytes_received_at_write_done} BYTE(S)")
+    print(f"  POST-WRITE DELIVER:  {diagnosis.bytes_delivered_after_write_done} BYTE(S)")
+    print(f"  WRITE PRESSURE:      {diagnosis.write_pressure_bytes} BYTE(S)")
     print(f"  PURGE:               {result.purge.bytes_drained} BYTES, {result.purge.reason.upper()}")
     print(f"  RUN TIME:            {format_duration(result.elapsed_sec)}")
+    print_wrapped_value("  NOTE:                ", diagnosis.operator_note)
     print_wrapped_value("  TEXT REPORT:         ", f"{report_path} (APPENDED)")
     print(border_line(REPORT_WIDTH))
 
@@ -7555,7 +7879,9 @@ def run_memory_test(options: ScanOptions) -> int:
     print(f"INPUT: {settings.input_settings.label()}.")
     print(f"OUTPUT: {settings.output_settings.label()}.")
     print(f"ESTIMATE: {format_duration(transfer_estimate)}; FINISH ABOUT {format_finish_clock(transfer_estimate)}.")
-    print("RESULT REQUIRES EXACT BYTE-FOR-BYTE ASCII MATCH.")
+    print("REPORT SEPARATES EXACT STREAM, DATA CHECK, CAPACITY CHECK, AND RAM CHECK.")
+    if config.mode == MEMORY_TEST_MODE_FILL:
+        print("FILL MODE MAY REPORT BUFFER FULL WHEN EXCESS BYTES ARE DROPPED.")
     print_progress_legend()
     print(border_line(REPORT_WIDTH))
 
@@ -7577,7 +7903,7 @@ def run_memory_test(options: ScanOptions) -> int:
         print()
         print_report_title("MEMORY TEST PURGE WARNING")
         print("OUTPUT DID NOT REPORT QUIET BEFORE THE TEST.")
-        print("RESULT MAY BE MARKED STALE OR FAIL.")
+        print("RESULT MAY BE MARKED STALE OR CHECK SETTINGS.")
         if purge.error:
             print_wrapped_value("  DETAIL: ", purge.error)
         print(border_line(REPORT_WIDTH))
@@ -7606,7 +7932,8 @@ def run_memory_test(options: ScanOptions) -> int:
     )
     write_memory_test_text_report(options.text_report, result)
     print_memory_test_report(result, options.text_report)
-    return 0 if memory_test_passed(candidate, payload) else 1
+    final_code = memory_test_diagnosis(result).code
+    return 0 if final_code in {"exact-pass", "probable-overflow-clean"} else 1
 
 
 def print_commands() -> None:
@@ -8535,6 +8862,9 @@ def run_self_tests() -> int:
         parse_memory_test_mode_choice("", False) == MEMORY_TEST_MODE_IMAGE
     ), "blank memory mode should default to image when fill is unavailable"
     assert (
+        parse_memory_test_mode_choice("3", False) == MEMORY_TEST_MODE_CUSTOM
+    ), "custom memory mode should be available without fill"
+    assert (
         parse_memory_test_mode_choice("2", False) is None
     ), "fill mode should be invalid when input baud is not faster"
     memory_payload = generate_payload(MEMORY_TEST_TARGET_BYTES, nonce_a)
@@ -8543,16 +8873,15 @@ def run_self_tests() -> int:
         memory_candidate,
         memory_payload,
     ), "exact memory-test candidate did not pass"
+    assert (
+        memory_candidate.metrics.exact_prefix_bytes == memory_payload.byte_count
+    ), "exact memory-test prefix metric was not complete"
     missing_memory = dataclasses.replace(
         memory_candidate,
         bytes_received=memory_payload.byte_count - 1,
         score=99.0,
         status="partial",
-        metrics=dataclasses.replace(
-            memory_candidate.metrics,
-            exact_byte_match_ratio=0.999,
-            missing_bytes=1,
-        ),
+        metrics=score_received(memory_payload.data, memory_payload.data[:-1]).metrics,
     )
     assert not memory_test_passed(
         missing_memory,
@@ -8561,6 +8890,69 @@ def run_self_tests() -> int:
     assert (
         "MISSING" in memory_test_reason(missing_memory, memory_payload)
     ), "missing memory-test byte reason was not clear"
+    overflow_payload = generate_payload(MEMORY_TEST_TARGET_BYTES * 2, nonce_a)
+    overflow_received = overflow_payload.data[:26945]
+    overflow_score = score_received(overflow_payload.data, overflow_received)
+    overflow_trial = TrialResult(
+        burst_index=1,
+        bytes_sent=overflow_payload.byte_count,
+        bytes_received=len(overflow_received),
+        bytes_drained_before=0,
+        drain_status="quiet",
+        score=overflow_score.score,
+        metrics=overflow_score.metrics,
+        status="partial",
+        error=None,
+        elapsed_sec=0.0,
+        timing=zero_timing_breakdown(),
+        received_preview_ascii="",
+        received_preview_hex="",
+        score_classification=overflow_score.classification,
+        evidence=overflow_score.evidence,
+        nonce_summary=nonce_a.compact(),
+        payload_mode=overflow_payload.payload_mode,
+        bytes_received_at_write_done=10527,
+    )
+    overflow_candidate = aggregate_candidate_result(
+        index=1,
+        total=1,
+        settings=memory_test_settings(19200, 9600),
+        trials=[overflow_trial],
+        elapsed_sec=0.0,
+    )
+    overflow_result = MemoryTestResult(
+        config=MemoryTestConfig(
+            in_port="COM1",
+            out_port="COM5",
+            input_baud=19200,
+            output_baud=9600,
+            mode=MEMORY_TEST_MODE_FILL,
+            payload_bytes=overflow_payload.byte_count,
+            target_bytes=MEMORY_TEST_TARGET_BYTES,
+            switch_note="",
+            run_id=nonce_a.run_id,
+        ),
+        settings=memory_test_settings(19200, 9600),
+        payload=overflow_payload,
+        purge=DrainResult(0, 0.0, True, "quiet", None),
+        candidate=overflow_candidate,
+        started_at="",
+        completed_at="",
+        elapsed_sec=0.0,
+    )
+    overflow_diagnosis = memory_test_diagnosis(overflow_result)
+    assert (
+        overflow_diagnosis.code == "probable-overflow-clean"
+    ), "beginning-matched incomplete memory test was not classified as probable overflow"
+    assert (
+        overflow_diagnosis.result == "BUFFER FULL OBSERVED"
+    ), "probable overflow should not present as a generic fail"
+    assert (
+        overflow_diagnosis.ram_check == "NO ERROR SEEN"
+    ), "clean overflow should not imply bad RAM"
+    assert (
+        overflow_diagnosis.bytes_delivered_after_write_done == 16418
+    ), "post-write delivered byte count did not preserve observed fill estimate"
     validate_report_path(Path("serial_probe_report.txt"))
     expect_value_error(lambda: validate_report_path(Path(".")), "directory report path accepted")
     expect_value_error(

@@ -53,18 +53,33 @@ The memory test is deliberately separate from scan discovery:
 - Flow control: `none`.
 - User-selected input baud and output baud from the supported baud table.
 - Append-only result block in the normal text report.
-- Exact match required for `PASS`; missing, extra, changed, stale, or no output bytes fail the test.
+- Result fields separate exact stream return, returned-data integrity, capacity behavior, and RAM suspicion.
+- In `FILL 16K` mode, dropped excess bytes can be a useful `BUFFER FULL OBSERVED` result rather than a generic failure.
 
-The size menu has two modes:
+The size menu has three modes:
 
 ```text
 1 16K IMAGE   SEND 16384 ASCII BYTES
 2 FILL 16K    SEND ENOUGH ASCII TO APPROACH 16K WHILE OUTPUT DRAINS
+3 CUSTOM      SEND OPERATOR BYTE COUNT
 ```
 
 `FILL 16K` is available only when input baud is faster than output baud. If input and output are the same speed, or output is faster, the buffer may pass data through without filling the 16K RAM. The program shows the estimated peak buffer use before it starts.
 
+`CUSTOM` is useful after an overflow-like result: lower the payload and rerun to bracket the largest clean near-fill transfer without forcing another overflow-stress run.
+
 At low output baud rates this test can take a long time. A full 16K stream at `300` baud with `8E1` framing takes about ten minutes to drain, before any safety margin.
+
+Interpretation is part of the memory-test report:
+
+- `RESULT` gives the operator-level outcome, such as `EXACT STREAM RETURNED`, `BUFFER FULL OBSERVED`, or `CHECK DATA`.
+- `DATA CHECK` says whether returned bytes matched.
+- `CAPACITY CHECK` says whether the run observed full/overflow behavior.
+- `RAM CHECK` says whether the returned bytes suggest a RAM/data-path fault.
+- `RETURNED MATCH` shows whether the bytes that came back matched the expected stream.
+- `COMPLETENESS` shows how much of the planned stream returned.
+- `READ BY WRITE DONE`, `POST-WRITE READ`, and `WRITE PRESSURE` help distinguish a full-buffer drop from stored-data corruption.
+- Bad RAM is more likely when byte counts are near correct but content changes, especially if repeated tests fail at the same offsets or bit positions.
 
 ## Start Scan Workflow
 
