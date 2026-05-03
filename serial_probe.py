@@ -5756,7 +5756,7 @@ def run_bank2_behavior_probes(
         return []
     print()
     print_report_title("BANK 2 RAW JOB-BEHAVIOR PROBES")
-    print(f"TARGETS: {len(targets)} FOLLOW-UP FRAME(S).")
+    print(f"TARGETS: {len(targets)} PROBE FRAME(S).")
     print(f"TIMEOUT OBSERVE WINDOW: {observe_seconds:.1f}S.")
     print("BYTE-LEVEL OBSERVATIONS ONLY; COMPARE SWITCH-STATE REPORT BLOCKS.")
     print(border_line(REPORT_WIDTH))
@@ -5921,7 +5921,7 @@ def write_bank2_text_report(
         f"KNOWN BAUD/PAIR: {result.known_baud_text}",
         f"ASCII PASS:      {ascii_summary}",
         f"8-BIT RESULT:    {eight_detail}",
-        f"FOLLOW-UP FRAME: {target_label}",
+        f"PROBE FRAME:     {target_label}",
         f"FLOW RESULT:     {flow_summary}",
         f"BEHAVIOR RESULT: {behavior_summary}",
         f"STALE DATA SEEN: {'YES' if result.stale_data_seen else 'NO'}",
@@ -5945,7 +5945,7 @@ def write_bank2_text_report(
         "EVIDENCE:",
         f"  ASCII:          {ascii_summary}",
         f"  8-BIT:          {eight_detail}",
-        f"  FOLLOW-UP:      {target_label}",
+        f"  PROBE FRAME:    {target_label}",
         f"  RAW BYTES:      {behavior_summary}",
         f"  FLOW:           {flow_summary}",
         f"  STALE WARNING:  {'YES' if result.stale_data_seen else 'NO'}",
@@ -5984,7 +5984,7 @@ def print_bank2_report(
         bank2_eight_bit_detail_summary(result.eight_bit_results),
     )
     print_wrapped_value(
-        "  FOLLOW-UP FRAME:   ",
+        "  PROBE FRAME:     ",
         frame_or_pair_label(target.settings) if target else "(NONE)",
     )
     flow_summary = bank2_flow_summary(result.flow_results)
