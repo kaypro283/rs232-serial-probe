@@ -96,6 +96,7 @@ PHASE0_BASELINE_STOP_BITS = 1
 PHASE0_BASELINE_FLOW_CONTROL = "none"
 DUAL_PHASE0_BAUD_PAIR_LIMIT = 6
 DUAL_PHASE0_FALLBACK_PAIR_LIMIT = 4
+PHASE0_NO_SIGNAL_AUTO_FALLBACK_BAUD_LIMIT = 2
 FNV_OFFSET_32 = 0x811C9DC5
 FNV_PRIME_32 = 0x01000193
 ProgressCallback = Callable[[str], None]
@@ -131,6 +132,10 @@ def flow_control_code(flow_control: str) -> str:
 
 class ReturnToMainMenuAfterReport(Exception):
     """Signal that the operator asked for the main menu after report writing."""
+
+
+class ReturnToMainMenu(Exception):
+    """Signal that the operator asked for the main menu without starting a scan."""
 
 
 class QuitProgramAfterReport(Exception):
@@ -3443,6 +3448,62 @@ def select_dual_phase0_pairs(
     return [], "NO DUAL-BANK BAUD PAIRS PRODUCED A USABLE SIGNAL."
 
 
+def same_baud_fallback_pairs(options: ScanOptions) -> list[tuple[int, int]]:
+    """Return same-baud pairs in scan order for no-signal Phase 0 recovery."""
+    return [(baud, baud) for baud in scan_bauds(options.min_baud, options.max_baud)]
+
+
+def phase0_results_all_serial_errors(report: DualBaudLivenessReport) -> bool:
+    """Return True when Phase 0 failed only because serial I/O could not run."""
+    return bool(report.results) and all(result.error for result in report.results)
+
+
+def first_phase0_error(report: DualBaudLivenessReport) -> str | None:
+    """Return the first Phase 0 serial error detail, if any."""
+    for result in report.results:
+        if result.error:
+            return result.error
+    return None
+
+
+def phase0_no_signal_fallback_default(pair_count: int) -> bool:
+    """Return the operator default for no-signal same-baud fallback."""
+    return 0 < pair_count <= PHASE0_NO_SIGNAL_AUTO_FALLBACK_BAUD_LIMIT
+
+
+def prompt_phase0_no_signal_fallback(
+    options: ScanOptions,
+    report: DualBaudLivenessReport,
+) -> tuple[list[tuple[int, int]], str | None]:
+    """Ask whether to continue with a same-baud frame fallback after Phase 0."""
+    fallback_pairs = same_baud_fallback_pairs(options)
+    if not fallback_pairs:
+        return [], "NO SELECTED BAUDS WERE AVAILABLE FOR FRAME FALLBACK."
+
+    print()
+    print_report_title("PHASE 0 NO-SIGNAL FALLBACK")
+    print("PHASE 0 DID NOT SELECT A BAUD PAIR FOR FRAME TESTING.")
+    if phase0_results_all_serial_errors(report):
+        print("EVERY PHASE 0 ROW ENDED WITH A SERIAL PORT ERROR.")
+        detail = first_phase0_error(report)
+        if detail:
+            print_wrapped_value("  DETAIL:               ", detail)
+        print("CHECK COM PORT NUMBERS AND CLOSE OTHER PROGRAMS USING THE PORTS.")
+        print(border_line(REPORT_WIDTH))
+        return [], "NO PHASE 0 SIGNAL; SERIAL PORT ERRORS PREVENTED FRAME FALLBACK."
+
+    candidate_count = dual_scan_candidate_count(fallback_pairs)
+    print("A FRAME FALLBACK CAN STILL FIND SETTINGS WHEN THE FIXED 8E1 PROBE IS WRONG.")
+    print(f"SAME-BAUD PAIRS:       {len(fallback_pairs)}")
+    print(f"FRAME PAIRS TO TEST:   {candidate_count}")
+    print("FOR A WIDE RANGE, NARROW THE BAUD RANGE FIRST IF THIS IS TOO MANY.")
+    print(border_line(REPORT_WIDTH))
+    default = phase0_no_signal_fallback_default(len(fallback_pairs))
+    if not prompt_yes_no("RUN SAME-BAUD FRAME FALLBACK", default):
+        return [], "NO PHASE 0 SIGNAL; SAME-BAUD FRAME FALLBACK DECLINED."
+    return fallback_pairs, "NO PHASE 0 SIGNAL; RUNNING SAME-BAUD FRAME FALLBACK."
+
+
 def print_dual_phase0_summary(report: DualBaudLivenessReport) -> None:
     """Print a concise dual-bank Phase 0 summary."""
     input_bauds = sorted({input_baud for input_baud, _ in report.alive_pairs}, reverse=True)
@@ -3972,6 +4033,22 @@ def prompt_yes_no_question(question: str, current: bool) -> bool:
         print("ENTER Y OR N.")
 
 
+def parse_start_scan_workflow_choice(choice: str) -> str | None:
+    """Return a start-scan workflow key for one operator choice."""
+    choice = choice.lstrip("\ufeff").strip().lower()
+    if choice == "":
+        return "discovery"
+    if choice in {"1", "d", "discovery", "auto", "automatic"}:
+        return "discovery"
+    if choice in {"2", "b", "bank", "bank2", "switch"}:
+        return "bank2"
+    if choice in {"3", "p", "phase0", "baud"}:
+        return "phase0"
+    if choice in {"4", "m", "menu", "main"}:
+        return "menu"
+    return None
+
+
 def prompt_start_scan_workflow() -> str:
     """Ask which automated workflow option 1 should run."""
     print()
@@ -3979,21 +4056,17 @@ def prompt_start_scan_workflow() -> str:
     print("  1 AUTOMATED DISCOVERY")
     print("  2 BANK 2 SWITCH-STATE TEST USING KNOWN BAUD")
     print("  3 PHASE 0 BAUD LIVENESS ONLY")
+    print("  4 RETURN TO MAIN MENU")
     print(border_line(REPORT_WIDTH))
     while True:
         try:
-            choice = read_operator_input("ENTER SELECTION [1]: ").lstrip("\ufeff").strip().lower()
+            choice = read_operator_input("ENTER SELECTION [1]: ")
         except EOFError:
             return "discovery"
-        if choice == "":
-            return "discovery"
-        if choice in {"1", "d", "discovery", "auto", "automatic"}:
-            return "discovery"
-        if choice in {"2", "b", "bank", "bank2", "switch"}:
-            return "bank2"
-        if choice in {"3", "p", "phase0", "baud"}:
-            return "phase0"
-        print("ENTER 1, 2, OR 3.")
+        workflow = parse_start_scan_workflow_choice(choice)
+        if workflow is not None:
+            return workflow
+        print("ENTER 1, 2, 3, OR 4.")
 
 
 def print_menu_help() -> None:
@@ -4021,6 +4094,7 @@ def print_menu_help() -> None:
             "  PHASE 0:         TESTS INPUT/OUTPUT BAUD PAIRS AT 8E1 FLOW=NONE.",
             "  BAUD PAIRS:      INPUT AND OUTPUT PORT SPEEDS MAY DIFFER.",
             "  FRAME TEST:      AFTER PHASE 0, TESTS FRAME AND FLOW AROUND LIVE PAIRS.",
+            "  NO PHASE 0 HIT:  OFFERS SAME-BAUD FRAME FALLBACK FOR NARROW RANGES.",
             "  DEVICE PATH:     COM1 -> BUFFER INPUT -> BUFFER OUTPUT -> COM5.",
             "  PORT SETTINGS:   PROGRAM SETS COM PORTS; DEVICE MANAGER IS IGNORED.",
             "  SCAN SIZE:       BYTES SENT FOR EACH DISCOVERY SETTING.",
@@ -4121,7 +4195,7 @@ def print_configuration(options: ScanOptions) -> None:
     lines.extend(
         setting_lines(
             "SCAN ORDER:",
-            "PHASE 0 BAUD PAIRS; STAGED FRAME SWEEPS; FULL MATRIX IF NEEDED",
+            "PHASE 0 BAUD PAIRS; SAME-BAUD FALLBACK IF NEEDED; STAGED FRAME SWEEPS",
         )
     )
     lines.extend(
@@ -6892,9 +6966,21 @@ def run_dual_bank_scan(
 
     selected_pairs = phase0_report.selected_pairs
     if not selected_pairs:
+        selected_pairs, fallback_reason = prompt_phase0_no_signal_fallback(
+            options,
+            phase0_report,
+        )
+        phase0_report = dataclasses.replace(
+            phase0_report,
+            selected_pairs=selected_pairs,
+            fallback_reason=fallback_reason or phase0_report.fallback_reason,
+        )
+    if not selected_pairs:
         print()
         print_report_title("DUAL BANK SCAN SKIPPED")
-        print("NO BAUD PAIRS WERE GOOD ENOUGH TO EXPAND INTO FRAME TESTING.")
+        print("NO BAUD PAIRS WERE SELECTED FOR FRAME TESTING.")
+        if phase0_report.fallback_reason:
+            print_wrapped_value("  DETAIL:               ", phase0_report.fallback_reason)
         print(border_line(REPORT_WIDTH))
         return 1
 
@@ -7282,6 +7368,8 @@ def run_scan(options: ScanOptions) -> int:
     """Prompt for and run the selected start-scan workflow."""
     validate_options(options)
     workflow = prompt_start_scan_workflow()
+    if workflow == "menu":
+        raise ReturnToMainMenu()
     if workflow == "bank2":
         run_second_bank_characterization(options)
         return 0
@@ -7440,6 +7528,86 @@ def run_self_tests() -> int:
         frame_or_pair_label(dual_settings) == "IN 8N1 -> OUT 7E2"
     ), "dual frame label did not include both sides"
 
+    assert parse_start_scan_workflow_choice("") == "discovery", "blank workflow must default to discovery"
+    assert parse_start_scan_workflow_choice("1") == "discovery", "workflow 1 parse failed"
+    assert parse_start_scan_workflow_choice("2") == "bank2", "workflow 2 parse failed"
+    assert parse_start_scan_workflow_choice("3") == "phase0", "workflow 3 parse failed"
+    assert parse_start_scan_workflow_choice("4") == "menu", "workflow 4 must return to menu"
+    assert parse_start_scan_workflow_choice("main") == "menu", "workflow menu alias parse failed"
+    assert parse_start_scan_workflow_choice("bad") is None, "invalid workflow choice should not parse"
+
+    narrow_options = dataclasses.replace(
+        default_scan_options(),
+        min_baud=38400,
+        max_baud=38400,
+    )
+    midrange_options = dataclasses.replace(
+        default_scan_options(),
+        min_baud=2400,
+        max_baud=9600,
+    )
+    assert same_baud_fallback_pairs(narrow_options) == [
+        (38400, 38400)
+    ], "single-baud fallback pair missing"
+    assert same_baud_fallback_pairs(midrange_options) == [
+        (9600, 9600),
+        (4800, 4800),
+        (2400, 2400),
+    ], "same-baud fallback pairs must follow scan order"
+    assert phase0_no_signal_fallback_default(1), "single-baud fallback should default on"
+    assert phase0_no_signal_fallback_default(2), "two-baud fallback should default on"
+    assert not phase0_no_signal_fallback_default(3), "wide fallback should require consent"
+
+    def fake_phase0_row(
+        input_baud: int,
+        output_baud: int,
+        *,
+        error: str | None = None,
+        status: str = "no-data",
+    ) -> DualBaudLivenessResult:
+        return DualBaudLivenessResult(
+            input_baud=input_baud,
+            output_baud=output_baud,
+            alive=False,
+            reason="SERIAL ERROR" if error else "NO DATA",
+            settings=dual_phase0_settings(input_baud, output_baud),
+            score=0.0,
+            status=status,
+            error=error,
+            bytes_sent=0,
+            bytes_received=0,
+            bytes_drained_before=0,
+            elapsed_sec=0.0,
+            metrics=aggregate_metrics([]),
+        )
+
+    error_phase0_report = DualBaudLivenessReport(
+        ran=True,
+        tested_pairs=[(38400, 38400)],
+        total_pairs=1,
+        alive_pairs=[],
+        selected_pairs=[],
+        fallback_reason=None,
+        elapsed_sec=0.0,
+        results=[fake_phase0_row(38400, 38400, error="COM5 BUSY", status="error")],
+    )
+    assert phase0_results_all_serial_errors(
+        error_phase0_report
+    ), "all-error Phase 0 report was not recognized"
+    assert (
+        first_phase0_error(error_phase0_report) == "COM5 BUSY"
+    ), "first Phase 0 error detail was not preserved"
+    mixed_phase0_report = dataclasses.replace(
+        error_phase0_report,
+        results=[
+            fake_phase0_row(38400, 38400, error="COM5 BUSY", status="error"),
+            fake_phase0_row(19200, 19200),
+        ],
+    )
+    assert not phase0_results_all_serial_errors(
+        mixed_phase0_report
+    ), "mixed Phase 0 outcomes should not be classified as all serial errors"
+
     asym_followup = DualSerialSettings(
         SerialSettings(38400, 8, "even", 1, "none"),
         SerialSettings(38400, 8, "none", 1, "none"),
@@ -7587,11 +7755,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             return last_status
         options = selected_options
         while True:
-            scan_started = True
             try:
                 last_status = run_scan(options)
+                scan_started = True
                 action = prompt_after_scan_action()
+            except ReturnToMainMenu:
+                break
             except ReturnToMainMenuAfterReport:
+                scan_started = True
                 last_status = OPERATOR_BREAK_EXIT_CODE
                 break
             except QuitProgramAfterReport:
@@ -7599,6 +7770,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             except KeyboardInterrupt:
                 print()
                 print("INTERRUPTED BY OPERATOR.")
+                scan_started = True
                 last_status = OPERATOR_BREAK_EXIT_CODE
                 action = prompt_after_scan_action("TEST INTERRUPTED")
             if action == "rerun":
