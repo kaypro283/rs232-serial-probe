@@ -21,7 +21,6 @@ import platform
 import re
 import statistics
 import string
-import subprocess
 import sys
 import threading
 import textwrap
@@ -133,11 +132,12 @@ PAYLOAD_MODE_EIGHT_BIT = "eight_bit"
 PAYLOAD_MODE_PHASE0 = "phase0"
 STALE_STATUSES = {"stale-output", "wrong-nonce", "mixed-nonce"}
 SERIAL_IO_ERRORS: tuple[type[Exception], ...] = (
-    AttributeError,
     OSError,
     RuntimeError,
-    TypeError,
-    ValueError,
+)
+BEST_EFFORT_PLATFORM_ERRORS: tuple[type[Exception], ...] = (
+    AttributeError,
+    OSError,
 )
 
 
@@ -1266,21 +1266,8 @@ def ensure_distinct_ports(in_port: str, out_port: str) -> None:
         raise ValueError("INPUT AND OUTPUT PORTS MUST NOT BE THE SAME")
 
 
-def import_or_install_pyserial() -> Any:
-    """Import pyserial, attempting installation if it is missing."""
-    try:
-        import serial  # type: ignore[import-not-found]
-
-        return serial
-    except ImportError:
-        install_command = [sys.executable, "-m", "pip", "install", "pyserial"]
-        print("PYSERIAL MISSING; TRYING: " + " ".join(install_command))
-        try:
-            subprocess.check_call(install_command)
-        except (OSError, subprocess.CalledProcessError):
-            print("INSTALL PYSERIAL WITH: PYTHON -M PIP INSTALL PYSERIAL")
-            raise SystemExit(2)
-
+def import_pyserial() -> Any:
+    """Import pyserial or exit with an explicit installation instruction."""
     try:
         import serial  # type: ignore[import-not-found]
 
@@ -1401,7 +1388,7 @@ def modem_line_snapshot(serial_port: Any) -> dict[str, bool]:
     for name in ("cts", "dsr", "cd", "ri", "rts", "dtr"):
         try:
             snapshot[name] = bool(getattr(serial_port, name))
-        except SERIAL_IO_ERRORS:
+        except BEST_EFFORT_PLATFORM_ERRORS:
             snapshot[name] = False
     return snapshot
 
@@ -1457,7 +1444,7 @@ def enable_terminal_style() -> None:
                     handle,
                     mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING,
                 )
-        except SERIAL_IO_ERRORS:
+        except BEST_EFFORT_PLATFORM_ERRORS:
             pass
     print(ANSI_GREEN, end="")
     atexit.register(lambda: print(ANSI_RESET, end=""))
@@ -1857,9 +1844,14 @@ def effective_timing_range_label(options: ScanOptions, candidates: Sequence[Seri
 
 def receive_completion_detected(received: bytes, expected: bytes) -> bool:
     """Return True when a received payload has enough structure to stop early."""
+    end_marker = (
+        b"<<<SERIAL_PROBE_8BIT_END"
+        if b"<<<SERIAL_PROBE_8BIT_BEGIN" in expected
+        else b"<<<SERIAL_PROBE_END"
+    )
     if len(received) < len(expected):
         return False
-    if b"<<<SERIAL_PROBE_END" not in received:
+    if end_marker not in received:
         return False
     if len(received) == len(expected):
         return True
@@ -7349,7 +7341,7 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
         return
 
     logger = setup_logging(bank_options.log_file)
-    serial_module = import_or_install_pyserial()
+    serial_module = import_pyserial()
     known_text = (
         f"IN {input_baud} / OUT {output_baud}"
         if input_baud != output_baud
@@ -7875,7 +7867,7 @@ def run_memory_test(options: ScanOptions) -> int:
         raise ReturnToMainMenu()
 
     logger = setup_logging(options.log_file)
-    serial_module = import_or_install_pyserial()
+    serial_module = import_pyserial()
     settings = memory_test_settings(config.input_baud, config.output_baud)
     nonce = ProbeNonce(
         run_id=config.run_id,
@@ -8609,7 +8601,7 @@ def run_scan(options: ScanOptions) -> int:
         return 0
 
     logger = setup_logging(options.log_file)
-    serial_module = import_or_install_pyserial()
+    serial_module = import_pyserial()
     return run_dual_bank_scan(
         serial_module=serial_module,
         options=options,

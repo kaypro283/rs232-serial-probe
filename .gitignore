@@ -2,5 +2,7 @@ __pycache__/
 *.py[cod]
 
 serial_probe_*.log
+serial_probe_report.txt
 serial_probe_report_*.json
 serial_probe_summary_*.csv
+output
