@@ -401,7 +401,6 @@ class ScanOptions:
     ask_on_top_match: bool
     auto_validate_top_matches: bool
     validate_size_1_bytes: int
-    validate_size_2_tie_bytes: int
     auto_validate_flow_control: bool
     flow_validate_size_bytes: int
     run_id: str = ""
@@ -2882,7 +2881,6 @@ def default_scan_options() -> ScanOptions:
         ask_on_top_match=False,
         auto_validate_top_matches=True,
         validate_size_1_bytes=8 * 1024,
-        validate_size_2_tie_bytes=16 * 1024,
         auto_validate_flow_control=True,
         flow_validate_size_bytes=FLOW_VALIDATE_PAYLOAD_BYTES,
     )
@@ -2922,13 +2920,6 @@ def validate_options(options: ScanOptions) -> None:
         raise ValueError("MAX CLEAR BYTES MUST BE POSITIVE")
     if options.validate_size_1_bytes < minimum_payload_size():
         raise ValueError(f"VALIDATE SIZE 1 MUST BE AT LEAST {minimum_payload_size()} BYTES")
-    if options.validate_size_2_tie_bytes < 0:
-        raise ValueError("VALIDATE SIZE 2 ON TIE CANNOT BE NEGATIVE")
-    if (
-        options.validate_size_2_tie_bytes > 0
-        and options.validate_size_2_tie_bytes < minimum_payload_size()
-    ):
-        raise ValueError(f"VALIDATE SIZE 2 MUST BE 0 OR AT LEAST {minimum_payload_size()} BYTES")
     if options.flow_validate_size_bytes < minimum_payload_size():
         raise ValueError(f"FLOW VALIDATE SIZE MUST BE AT LEAST {minimum_payload_size()} BYTES")
     validate_report_path(options.text_report)
@@ -4046,15 +4037,6 @@ def prompt_supported_baud(label: str, current: int) -> int:
         return baud
 
 
-def prompt_int_zero_or_min(label: str, current: int, minimum: int) -> int:
-    """Prompt for an integer that may be zero or at least minimum."""
-    while True:
-        value = prompt_int(label, current, minimum=0)
-        if value == 0 or value >= minimum:
-            return value
-        print(f"ENTER 0 OR A VALUE >= {minimum}.")
-
-
 def prompt_float(label: str, current: float, minimum: float | None = None) -> float:
     """Prompt for a float value, preserving current on blank input."""
     while True:
@@ -4209,12 +4191,12 @@ def print_menu_help() -> None:
             "  NO PHASE 0 HIT:  OFFERS SAME-BAUD FRAME FALLBACK FOR NARROW RANGES.",
             "  DEVICE PATH:     COM1 -> BUFFER INPUT -> BUFFER OUTPUT -> COM5.",
             "  PORT SETTINGS:   PROGRAM SETS COM PORTS; DEVICE MANAGER IS IGNORED.",
-            "  SCAN SIZE:       BYTES SENT FOR EACH DISCOVERY SETTING.",
+            "  SCAN SETUP:      MESSAGE SIZE, COUNT, VALIDATION, FLOW TEST SCOPE.",
             "  SCAN COUNT:      NUMBER OF DISCOVERY TRIES PER SETTING.",
             "  DISCOVERY:       STAGED DUAL-PORT TEST BEFORE FULL MATRIX FALLBACK.",
             "  TURBO:           FASTER DISCOVERY TIMING.",
             "  ASK ON MATCH:    PAUSE AFTER PASS; ASK CONTINUE.",
-            "  FLOW VALIDATE:   AFTER BEST FRAME, TEST NONE/XON/RTS/DSR BEHAVIOR.",
+            "  FLOW TESTING:    DISCOVERY FLOW MODES; BANK 2 HOLD/RELEASE TEST.",
             "  STALE DATA:      DISCARD OLD BUFFER DATA BEFORE EACH TEST.",
             "  NONCES:          EACH TRIAL PAYLOAD HAS RUN/CANDIDATE/TRIAL IDS.",
             "  8-BIT TEST:      SEPARATE HIGH-BIT CHALLENGE; ASCII PASS IS NOT ENOUGH.",
@@ -4319,22 +4301,20 @@ def print_configuration(options: ScanOptions) -> None:
             (
                 "OFF"
                 if not options.auto_validate_top_matches
-                else (
-                    f"ON, SIZE1={options.validate_size_1_bytes} BYTES, "
-                    f"SIZE2={options.validate_size_2_tie_bytes} BYTES"
-                    if options.validate_size_2_tie_bytes > 0
-                    else f"ON, SIZE1={options.validate_size_1_bytes} BYTES, SIZE2=OFF"
-                )
+                else f"ON, SIZE={options.validate_size_1_bytes} BYTES"
             ),
         )
     )
     lines.extend(
         setting_lines(
-            "FLOW VALIDATE:",
+            "FLOW TESTING:",
             (
                 "OFF"
                 if not options.auto_validate_flow_control
-                else f"ON, SIZE={options.flow_validate_size_bytes} BYTES"
+                else (
+                    "ON, DISCOVERY FLOW MODES; "
+                    f"BANK 2 VALIDATE SIZE={options.flow_validate_size_bytes} BYTES"
+                )
             ),
         )
     )
@@ -4396,59 +4376,144 @@ def configure_ports(options: ScanOptions) -> ScanOptions:
         return dataclasses.replace(options, in_port=in_port, out_port=out_port)
 
 
-def configure_payload(options: ScanOptions) -> ScanOptions:
-    """Prompt for payload and burst settings."""
-    print("SCAN SIZE AND VALIDATION")
-    print(f"MINIMUM TEST MESSAGE IS {minimum_payload_size()} BYTES.")
-    payload_bytes = prompt_int(
-        "SCAN MESSAGE SIZE IN BYTES",
+def yes_no_text(value: bool) -> str:
+    """Return a short operator-facing yes/no word."""
+    return "YES" if value else "NO"
+
+
+def print_scan_validate_setup(options: ScanOptions) -> None:
+    """Print the scan/validate setup submenu with setting scope."""
+    def setting_line(number: str, label: str, value: object, used_by: str) -> None:
+        print(f"  {number} {label:<31} {value}")
+        print(f"    USED BY: {used_by}")
+
+    print()
+    print_report_title("SCAN / VALIDATE SETUP")
+    print("THESE SETTINGS DO NOT CHANGE PHASE 0.")
+    print("PHASE 0 USES FIXED BAUD-LIVENESS PAYLOAD AND COUNT.")
+    print(f"MINIMUM MESSAGE SIZE: {minimum_payload_size()} BYTES.")
+    print(border_line(REPORT_WIDTH))
+    setting_line(
+        "1",
+        "DISCOVERY MESSAGE BYTES",
         options.payload_bytes,
-        minimum=minimum_payload_size(),
+        (
+            "AUTOMATED DISCOVERY; BANK 2 ASCII; "
+            f"8-BIT WHEN ABOVE {DEFAULT_EIGHT_BIT_PAYLOAD_BYTES} BYTES."
+        ),
     )
-    bursts = prompt_int("SCAN COUNT PER SETTING", options.bursts, minimum=1)
-    ask_on_top_match = prompt_yes_no(
-        "ASK WHETHER TO CONTINUE AFTER TOP MATCH",
-        options.ask_on_top_match,
+    setting_line(
+        "2",
+        "DISCOVERY COUNT PER SETTING",
+        options.bursts,
+        "AUTOMATED DISCOVERY ONLY.",
     )
-    auto_validate = prompt_yes_no(
-        "AUTO VALIDATE TOP MATCHES AFTER SCAN",
-        options.auto_validate_top_matches,
+    setting_line(
+        "3",
+        "DISCOVERY PAUSE ON TOP MATCH",
+        yes_no_text(options.ask_on_top_match),
+        "AUTOMATED DISCOVERY ONLY.",
     )
-    auto_flow_validate = prompt_yes_no(
-        "AUTO VALIDATE FLOW CONTROL AFTER SCAN",
-        options.auto_validate_flow_control,
+    setting_line(
+        "4",
+        "VALIDATE TOP MATCH",
+        yes_no_text(options.auto_validate_top_matches),
+        "AUTOMATED DISCOVERY AFTER SCAN.",
     )
-    validate_size_1 = options.validate_size_1_bytes
-    validate_size_2 = options.validate_size_2_tie_bytes
-    flow_validate_size = options.flow_validate_size_bytes
-    if auto_validate:
-        validate_size_1 = prompt_int(
-            "VALIDATE SIZE 1 BYTES",
-            options.validate_size_1_bytes,
-            minimum=minimum_payload_size(),
-        )
-        validate_size_2 = prompt_int_zero_or_min(
-            "VALIDATE SIZE 2 ON TIE (0=OFF)",
-            options.validate_size_2_tie_bytes,
-            minimum_payload_size(),
-        )
-    if auto_flow_validate:
-        flow_validate_size = prompt_int(
-            "FLOW VALIDATE SIZE BYTES",
-            options.flow_validate_size_bytes,
-            minimum=minimum_payload_size(),
-        )
-    return dataclasses.replace(
-        options,
-        payload_bytes=payload_bytes,
-        bursts=bursts,
-        ask_on_top_match=ask_on_top_match,
-        auto_validate_top_matches=auto_validate,
-        validate_size_1_bytes=validate_size_1,
-        validate_size_2_tie_bytes=validate_size_2,
-        auto_validate_flow_control=auto_flow_validate,
-        flow_validate_size_bytes=flow_validate_size,
+    setting_line(
+        "5",
+        "VALIDATE TOP MATCH BYTES",
+        options.validate_size_1_bytes,
+        "ONLY WHEN 4=YES; AUTOMATED DISCOVERY TOP-MATCH VALIDATION.",
     )
+    setting_line(
+        "6",
+        "FLOW-CONTROL TESTING",
+        yes_no_text(options.auto_validate_flow_control),
+        "DISCOVERY FLOW SWEEP; BANK 2 FLOW VALIDATION ON/OFF.",
+    )
+    setting_line(
+        "7",
+        "BANK 2 FLOW TEST BYTES",
+        options.flow_validate_size_bytes,
+        "ONLY WHEN 6=YES; BANK 2 FLOW VALIDATION ONLY.",
+    )
+    print("  0 RETURN TO MAIN MENU")
+    print(border_line(REPORT_WIDTH))
+
+
+def configure_payload(options: ScanOptions) -> ScanOptions:
+    """Show the scan/validation setup submenu."""
+    while True:
+        print_scan_validate_setup(options)
+        try:
+            choice = read_operator_input("ENTER SELECTION (1-7,0): ").lstrip("\ufeff").strip().lower()
+        except EOFError:
+            return options
+        if choice in {"0", "m", "menu", "main", "return"}:
+            return options
+        if choice == "1":
+            options = dataclasses.replace(
+                options,
+                payload_bytes=prompt_int(
+                    "DISCOVERY MESSAGE BYTES",
+                    options.payload_bytes,
+                    minimum=minimum_payload_size(),
+                ),
+            )
+        elif choice == "2":
+            options = dataclasses.replace(
+                options,
+                bursts=prompt_int(
+                    "DISCOVERY COUNT PER SETTING",
+                    options.bursts,
+                    minimum=1,
+                ),
+            )
+        elif choice == "3":
+            options = dataclasses.replace(
+                options,
+                ask_on_top_match=prompt_yes_no(
+                    "DISCOVERY PAUSE ON TOP MATCH",
+                    options.ask_on_top_match,
+                ),
+            )
+        elif choice == "4":
+            options = dataclasses.replace(
+                options,
+                auto_validate_top_matches=prompt_yes_no(
+                    "VALIDATE TOP MATCH",
+                    options.auto_validate_top_matches,
+                ),
+            )
+        elif choice == "5":
+            options = dataclasses.replace(
+                options,
+                validate_size_1_bytes=prompt_int(
+                    "VALIDATE TOP MATCH BYTES",
+                    options.validate_size_1_bytes,
+                    minimum=minimum_payload_size(),
+                ),
+            )
+        elif choice == "6":
+            options = dataclasses.replace(
+                options,
+                auto_validate_flow_control=prompt_yes_no(
+                    "FLOW-CONTROL TESTING",
+                    options.auto_validate_flow_control,
+                ),
+            )
+        elif choice == "7":
+            options = dataclasses.replace(
+                options,
+                flow_validate_size_bytes=prompt_int(
+                    "BANK 2 FLOW TEST BYTES",
+                    options.flow_validate_size_bytes,
+                    minimum=minimum_payload_size(),
+                ),
+            )
+        else:
+            print("ENTER 1-7 OR 0.")
 
 
 def configure_timing(options: ScanOptions) -> ScanOptions:
@@ -6844,7 +6909,14 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
 
     flow_results: list[FlowControlValidationResult] = []
     flow_skip_reason = bank2_flow_skip_reason(followup_target, input_baud, output_baud)
-    if flow_skip_reason:
+    if not bank_options.auto_validate_flow_control:
+        flow_skip_reason = "FLOW-CONTROL TESTING DISABLED IN SCAN / VALIDATE SETUP"
+        print()
+        print_report_title("BANK 2 FLOW VALIDATION")
+        print(f"SKIPPED: {flow_skip_reason}.")
+        print(border_line(REPORT_WIDTH))
+        logger.info("Bank 2 flow validation skipped: disabled by operator")
+    elif flow_skip_reason:
         print()
         print_report_title("BANK 2 FLOW VALIDATION")
         print(f"SKIPPED: {flow_skip_reason}.")
@@ -6900,7 +6972,7 @@ def print_commands() -> None:
     print(bordered_text("MAIN MENU", SCREEN_WIDTH))
     print(border_line(SCREEN_WIDTH))
     menu_line("  1  START SCAN", "  2  SET COM PORTS")
-    menu_line("  3  SET BAUD RANGE", "  4  SCAN SIZE / VALIDATE")
+    menu_line("  3  SET BAUD RANGE", "  4  SCAN / VALIDATE SETUP")
     menu_line("  5  TIMING / STALE DATA", "  6  SET REPORT FILES")
     menu_line("  7  RESET REPORT FILES", "  S  CURRENT SETTINGS")
     menu_line("  ?  HELP", "  0  QUIT")
@@ -7176,11 +7248,9 @@ def run_dual_bank_scan(
     print("FULL MATRIX RUNS ONLY IF STAGED DISCOVERY DOES NOT FIND A GOOD PAIR.")
     print("FRAME SWEEPS USE FLOW=NONE; FLOW SWEEP TESTS HANDSHAKE SETTINGS.")
     if options.auto_validate_top_matches:
-        print(f"VALIDATION: ON; SIZE1={options.validate_size_1_bytes} BYTES.")
+        print(f"VALIDATION: ON; SIZE={options.validate_size_1_bytes} BYTES.")
     else:
         print("VALIDATION: OFF.")
-    if options.auto_validate_flow_control:
-        print("FLOW VALIDATION: DEFERRED; DUAL MODE FIRST FINDS THE FRAME PAIR.")
     print_progress_legend()
     print(f"REPORT: {options.text_report} (APPEND)")
     print(f"DEBUG LOG: {options.log_file}")
