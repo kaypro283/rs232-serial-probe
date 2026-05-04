@@ -6261,15 +6261,23 @@ def bank2_frame_serial_settings(baud: int) -> list[SerialSettings]:
         (8, "none", 1),
         (7, "even", 1),
         (7, "odd", 1),
+        (7, "mark", 1),
+        (7, "space", 1),
         (8, "even", 1),
         (8, "odd", 1),
+        (8, "mark", 1),
+        (8, "space", 1),
         (7, "none", 1),
         (7, "even", 2),
         (7, "odd", 2),
+        (7, "mark", 2),
+        (7, "space", 2),
         (7, "none", 2),
         (8, "none", 2),
         (8, "even", 2),
         (8, "odd", 2),
+        (8, "mark", 2),
+        (8, "space", 2),
     ]
     return [
         SerialSettings(
@@ -9026,15 +9034,23 @@ def run_self_tests() -> int:
         "8N1",
         "7E1",
         "7O1",
+        "7M1",
+        "7S1",
         "8E1",
         "8O1",
+        "8M1",
+        "8S1",
         "7N1",
         "7E2",
         "7O2",
+        "7M2",
+        "7S2",
         "7N2",
         "8N2",
         "8E2",
         "8O2",
+        "8M2",
+        "8S2",
     ]
     actual_bank2_frames = [
         frame_label(settings) for settings in bank2_frame_serial_settings(1200)
@@ -9042,7 +9058,7 @@ def run_self_tests() -> int:
     assert actual_bank2_frames == expected_bank2_frames, "known-baud frame order changed"
 
     dual_bank2 = bank2_frame_candidates(1200, 4800, independent_frames=True)
-    assert len(dual_bank2) == 144, "known-baud independent frame product must be 144"
+    assert len(dual_bank2) == 400, "known-baud independent frame product must be 400"
     assert all(
         isinstance(settings, DualSerialSettings) for settings in dual_bank2
     ), "known-baud pair candidates must be dual settings"
@@ -9058,9 +9074,10 @@ def run_self_tests() -> int:
 
     assert has_dual_frame_pair("7E1", "8N1"), "missing mixed 7E1 -> 8N1 pair"
     assert has_dual_frame_pair("8N1", "7O2"), "missing mixed 8N1 -> 7O2 pair"
+    assert has_dual_frame_pair("7M1", "8S2"), "missing mixed 7M1 -> 8S2 pair"
 
     legacy_bank2 = bank2_frame_candidates(1200, 1200, independent_frames=False)
-    assert len(legacy_bank2) == 12, "legacy same-frame known-baud list must be 12"
+    assert len(legacy_bank2) == 20, "legacy same-frame known-baud list must be 20"
     assert all(
         isinstance(settings, SerialSettings) for settings in legacy_bank2
     ), "legacy same-frame known-baud list must use SerialSettings"
