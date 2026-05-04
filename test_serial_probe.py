@@ -681,3 +681,31 @@ def test_terminal_progress_rows_fit_80_columns() -> None:
     ]
 
     assert all(len(row) <= serial_probe.TERMINAL_COLUMNS for row in rows)
+
+
+def test_flow_validation_reason_wraps_inside_80_columns() -> None:
+    result = serial_probe.FlowControlValidationResult(
+        flow_control="rts/cts",
+        method="rts-hold-release",
+        settings=serial_probe.SerialSettings(38400, 8, "even", 1, "rts/cts"),
+        bytes_sent=1024,
+        bytes_received=1024,
+        bytes_seen_while_held=1024,
+        score=100.0,
+        indicator="FAIL",
+        status="no-pause",
+        reason="OUTPUT DID NOT PAUSE; SAW 1024 BYTES WHILE HELD (LIMIT 16).",
+        error=None,
+        elapsed_sec=0.0,
+        metrics=serial_probe.score_received(b"abc", b"abc").metrics,
+    )
+
+    row_lines = serial_probe.flow_validation_table_row_lines(result)
+    joined_reason = " ".join(line.strip() for line in row_lines)
+
+    assert len(row_lines) > 1
+    assert "OUTPUT DID NOT PAUSE; SAW 1024 BYTES WHILE HELD (LIMIT 16)." in joined_reason
+    assert all(len(line) <= serial_probe.REPORT_WIDTH for line in row_lines)
+
+    report_lines = serial_probe.flow_validation_report_lines([result])
+    assert all(len(line) <= serial_probe.REPORT_WIDTH for line in report_lines)

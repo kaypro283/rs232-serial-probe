@@ -6257,6 +6257,39 @@ def flow_control_validation_recommendation(
     return "FLOW CONTROL VALIDATION WAS NOT RUN."
 
 
+FLOW_VALIDATION_METHOD_WIDTH = 16
+FLOW_VALIDATION_TABLE_HEADER = (
+    f"{'FLOW':<8} {'RESULT':<7} {'SCORE':>5} {'SENT':>6} {'READ':>6} "
+    f"{'HELD':>5} {'METHOD':<{FLOW_VALIDATION_METHOD_WIDTH}} REASON"
+)
+
+
+def flow_validation_table_row_lines(
+    result: FlowControlValidationResult,
+) -> list[str]:
+    """Return one flow-validation table row, wrapping reason text at 80 columns."""
+    method = fit_terminal_line(result.method, FLOW_VALIDATION_METHOD_WIDTH)
+    prefix = (
+        f"{result.flow_control.upper():<8} "
+        f"{result.indicator:<7} "
+        f"{result.score:>5.1f} "
+        f"{result.bytes_sent:>6} "
+        f"{result.bytes_received:>6} "
+        f"{result.bytes_seen_while_held:>5} "
+        f"{method:<{FLOW_VALIDATION_METHOD_WIDTH}} "
+    )
+    reason_width = max(1, REPORT_WIDTH - len(prefix))
+    reason_lines = textwrap.wrap(
+        result.reason,
+        width=reason_width,
+        break_long_words=True,
+    ) or [""]
+    return [
+        prefix + reason_lines[0],
+        *(" " * len(prefix) + line for line in reason_lines[1:]),
+    ]
+
+
 def flow_validation_report_lines(
     results: Sequence[FlowControlValidationResult],
 ) -> list[str]:
@@ -6265,20 +6298,11 @@ def flow_validation_report_lines(
         "FLOW CONTROL VALIDATION:",
         f"FINDING:         {flow_control_validation_recommendation(results)}",
         "",
-        "FLOW     RESULT  SCORE   SENT   READ  HELD METHOD             REASON",
+        FLOW_VALIDATION_TABLE_HEADER,
         border_line(REPORT_WIDTH),
     ]
     for result in results:
-        lines.append(
-            f"{result.flow_control.upper():<8} "
-            f"{result.indicator:<7} "
-            f"{result.score:>5.1f} "
-            f"{result.bytes_sent:>6} "
-            f"{result.bytes_received:>6} "
-            f"{result.bytes_seen_while_held:>5} "
-            f"{result.method:<18} "
-            f"{result.reason[:28]}"
-        )
+        lines.extend(flow_validation_table_row_lines(result))
     lines.extend(
         [
             "NOTE: OUTPUT-SIDE HOLD/RELEASE PROVES ONLY OBSERVED PAUSE/RESUME.",
@@ -6303,19 +6327,11 @@ def print_flow_control_validation_report(
         flow_control_validation_recommendation(results),
     )
     print(border_line(REPORT_WIDTH))
-    print("FLOW     RESULT  SCORE   SENT   READ  HELD METHOD             REASON")
+    print(FLOW_VALIDATION_TABLE_HEADER)
     print(border_line(REPORT_WIDTH))
     for result in results:
-        print(
-            f"{result.flow_control.upper():<8} "
-            f"{result.indicator:<7} "
-            f"{result.score:>5.1f} "
-            f"{result.bytes_sent:>6} "
-            f"{result.bytes_received:>6} "
-            f"{result.bytes_seen_while_held:>5} "
-            f"{result.method:<18} "
-            f"{result.reason[:28]}"
-        )
+        for line in flow_validation_table_row_lines(result):
+            print(line)
     print("NOTE: OUTPUT-SIDE HOLD/RELEASE PROVES ONLY OBSERVED PAUSE/RESUME.")
     print("NOTE: INPUT-SIDE BACKPRESSURE IS NOT PROVEN BY THIS FLOW VALIDATION.")
     print(border_line(REPORT_WIDTH))
