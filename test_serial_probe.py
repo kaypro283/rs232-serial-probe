@@ -289,6 +289,38 @@ def test_memory_target_presets_and_64k_defaults() -> None:
     )
 
 
+def test_memory_test_prompts_explain_full_and_default_to_all_loops(
+    monkeypatch: MonkeyPatch,
+    capsys: CaptureFixture[str],
+) -> None:
+    prompts: list[str] = []
+    values = iter(["", "", "2", "", "", "", ""])
+
+    def fake_read(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(values)
+
+    options = dataclasses.replace(
+        serial_probe.default_scan_options(),
+        input_baud=38400,
+        output_baud=19200,
+    )
+    monkeypatch.setattr(serial_probe, "read_operator_input", fake_read)
+    monkeypatch.setattr(serial_probe, "make_run_id", lambda _prefix: "MTEST")
+
+    config = serial_probe.prompt_memory_test_config(options)
+    output = capsys.readouterr().out
+
+    assert config is not None
+    assert config.loop_count == 2
+    assert config.accept_full_result
+    assert not config.stop_on_unexpected
+    assert "CLEAN FULL MEANS RETURNED BYTES STAYED IN ORDER" in output
+    assert "LOOPS RUN ALL REQUESTED PASSES BY DEFAULT" in output
+    assert any("COUNT CLEAN FULL AS PASS [Y]" in prompt for prompt in prompts)
+    assert any("STOP EARLY ON CHECK RESULT [N]" in prompt for prompt in prompts)
+
+
 def test_memory_loop_status_and_summary_use_neutral_terms() -> None:
     payload = serial_probe.generate_payload(serial_probe.DEFAULT_PAYLOAD_BYTES)
     settings = serial_probe.memory_test_settings(38400, 9600)
@@ -389,7 +421,18 @@ def test_memory_test_high_bit_ascii_output_reports_frame_issue() -> None:
 
     assert diagnosis.code == "probable-frame-mismatch"
     assert serial_probe.memory_test_loop_status(diagnosis) == "FRAME"
-    assert diagnosis.ram_check == "NOT JUDGED"
+    assert diagnosis.ram_check == "NOT JUDGED - NOT PROVEN BAD"
+    assert "NOT PROVEN BROKEN" in diagnosis.finding
+    assert "FIX SERIAL SETUP FIRST" in diagnosis.operator_note
+    verdict, next_step = serial_probe.memory_test_summary_verdict(
+        result.config,
+        [result],
+        stopped_on_unexpected=True,
+    )
+    assert "NOT A MEMORY VERDICT" in verdict
+    assert "NOTHING IS PROVEN BROKEN YET" in verdict
+    assert "FIX SERIAL SETUP FIRST" in next_step
+    assert "STOP EARLY TO NO" in next_step
 
 
 def test_bank2_behavior_payload_classes_cover_control_ranges() -> None:

@@ -69,7 +69,9 @@ The memory test first asks for a target size. Presets cover 16K, 32K, 48K, and 6
 
 `CUSTOM` is useful after an overflow-like result: lower the payload and rerun to bracket the largest clean near-fill transfer without forcing another overflow-stress run.
 
-Before starting, the memory test asks for a finite loop count, whether `CLEAN FULL` counts as `OK`, and whether to stop on the first unexpected result. Baud changes are made once from the main menu in `2 SET COM PORTS / BAUD`. The default is one loop, counting clean `FULL` as `OK` for fill-mode tests, and stopping when a loop needs operator review. `CLEAN FULL OK` applies only to `STATUS: FULL`; `FRAME`, `CHECK`, `STALE`, and `ERROR` still stop when `STOP ON UNEXPECTED` is `YES`.
+Before starting, the memory test asks for a finite loop count. In overfill-style tests it also asks whether `COUNT CLEAN FULL AS PASS` is allowed. A clean-full result means the returned bytes stayed in order, but the overfill test dropped bytes after the buffer filled; it is useful capacity evidence, not an exact all-bytes-returned stream. That policy applies only to `STATUS: FULL`. It does not forgive `FRAME`, `CHECK`, `STALE`, or `ERROR`.
+
+By default, loops run all requested passes. If you choose `STOP EARLY ON CHECK RESULT`, the run stops after the first loop that needs review. Use stop-early mode when you are saving time; leave it off when you asked for repeated loops and want the report to show repeatability.
 
 At low output baud rates this test can take a long time. A full 64K stream at `300` baud with `8E1` framing takes more than 35 minutes to drain, before any safety margin.
 
@@ -80,6 +82,7 @@ Interpretation is part of the memory-test report:
 - `DATA CHECK` says whether returned bytes matched.
 - `CAPACITY CHECK` says whether the run observed full/overflow behavior.
 - `RAM CHECK` says whether the returned bytes suggest a RAM/data-path fault.
+- `WHAT TO FIX`, `VERDICT`, and `NEXT` say, in plain terms, whether anything is proven broken. A `FRAME` result means the memory test has not judged RAM yet; fix or discover the serial frame first, then rerun memory.
 - `RETURNED MATCH` shows whether the bytes that came back matched the expected stream.
 - `COMPLETENESS` shows how much of the planned stream returned.
 - `READ BY WRITE DONE`, `POST-WRITE READ`, and `WRITE PRESSURE` help distinguish a full-buffer drop from stored-data corruption.
