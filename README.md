@@ -25,7 +25,7 @@ Usage screen:
 python serial_probe.py --help
 ```
 
-The first screen is the command menu. Use `6 CURRENT SETTINGS` to view ports, each port's configured baud, the last scan baud range, test message size, repeat count, timing, old-output clearing, Phase 0 liveness settings, fixed report files, and available test workflows. `1 START SCAN` opens the discovery workflow menu. `5 MEMORY TEST` runs the fixed-frame memory test.
+The first screen is the command menu. Use `5 CURRENT SETTINGS` to view ports, each port's configured baud, the last scan baud range, test message size, repeat count, timing, old-output clearing, Phase 0 liveness settings, fixed report files, and available test workflows. `1 START SCAN` opens the discovery workflow menu.
 
 The terminal UI is written for an 80-column by 25-line early terminal style. Long operator screens pause with `PRESS ENTER FOR MORE, Q TO STOP:`. Screens use terse uppercase operator text and bright green text when the console supports ANSI color. PyCharm runs are treated as color-capable. Set `NO_COLOR=1` before running if you want plain console text.
 
@@ -42,51 +42,6 @@ Use the default settings or set ports and fixed bauds with `2 SET COM PORTS / BA
 After a scan finishes or is interrupted by the operator, the program stays in the terminal UI and asks whether to run the same settings again, return to the main menu, or quit.
 
 During a running scan or validation pass, press `Ctrl+C` for the `OPERATOR BREAK` menu. The menu can resume the same test, end the test and write a partial report, return to the main menu after writing the report, or quit after writing the report.
-
-## Memory Test
-
-Select `5 MEMORY TEST` from the main menu to send a checked ASCII printer-style stream through the buffer and compare the output byte for byte.
-
-The memory test is deliberately separate from scan discovery:
-
-- Fixed frame: `8E1`.
-- Flow control: `DSR/DTR`.
-- Input baud and output baud from `2 SET COM PORTS / BAUD`.
-- Loop blocks and a final summary in the normal text report for the current session.
-- Result fields separate exact stream return, returned-data integrity, capacity behavior, and RAM suspicion.
-- In `FILL` mode, dropped excess bytes can be a useful clean-full result rather than a generic problem.
-- If the fixed `8E1` memory frame does not match the buffer output frame, ASCII output may contain high-bit/framing-looking bytes. The report treats that as `CHECK SERIAL FRAME` and does not judge RAM from that run.
-
-The memory test first asks for a target size. Presets cover 16K, 32K, 48K, and 64K, and the custom choice accepts a K-sized target. The size menu then uses that target:
-
-```text
-1 64K IMAGE   SEND 65536 ASCII BYTES
-2 FILL 64K    SEND ENOUGH ASCII TO APPROACH 64K WHILE OUTPUT DRAINS
-3 CUSTOM      SEND OPERATOR BYTE COUNT
-```
-
-`FILL` is available only when input baud is faster than output baud. If input and output are the same speed, or output is faster, the buffer may pass data through without filling RAM. The program shows the estimated peak buffer use before it starts.
-
-`CUSTOM` is useful after an overflow-like result: lower the payload and rerun to bracket the largest clean near-fill transfer without forcing another overflow-stress run.
-
-Before starting, the memory test asks for a finite loop count. In overfill-style tests it also asks whether `COUNT CLEAN FULL AS PASS` is allowed. A clean-full result means the returned bytes stayed in order, but the overfill test dropped bytes after the buffer filled; it is useful capacity evidence, not an exact all-bytes-returned stream. That policy applies only to `STATUS: FULL`. It does not forgive `FRAME`, `CHECK`, `STALE`, or `ERROR`.
-
-By default, loops run all requested passes. If you choose `STOP EARLY ON CHECK RESULT`, the run stops after the first loop that needs review. Use stop-early mode when you are saving time; leave it off when you asked for repeated loops and want the report to show repeatability.
-
-At low output baud rates this test can take a long time. A full 64K stream at `300` baud with `8E1` framing takes more than 35 minutes to drain, before any safety margin.
-
-Interpretation is part of the memory-test report:
-
-- `RESULT` gives the operator-level outcome, such as `EXACT STREAM RETURNED`, `BUFFER FULL OBSERVED`, or `CHECK DATA`.
-- `STATUS` is terse: `OK`, `FULL`, `SHORT`, `FRAME`, `CHANGED`, `STALE`, `ERROR`, or `CHECK`.
-- `DATA CHECK` says whether returned bytes matched.
-- `CAPACITY CHECK` says whether the run observed full/overflow behavior.
-- `RAM CHECK` says whether the returned bytes suggest a RAM/data-path fault.
-- `WHAT TO FIX`, `VERDICT`, and `NEXT` say, in plain terms, whether anything is proven broken. A `FRAME` result means the memory test has not judged RAM yet; fix or discover the serial frame first, then rerun memory.
-- `RETURNED MATCH` shows whether the bytes that came back matched the expected stream.
-- `COMPLETENESS` shows how much of the planned stream returned.
-- `READ BY WRITE DONE`, `POST-WRITE READ`, and `WRITE PRESSURE` help distinguish a full-buffer drop from stored-data corruption.
-- Bad RAM is more likely when byte counts are near correct but content changes, especially if repeated tests change at the same offsets or bit positions.
 
 ## Start Scan Workflow
 
@@ -199,7 +154,7 @@ If the buffer is already dumping old data, the scan cannot reliably score the cu
 
 The `TIMING / PER-TEST STALE` menu controls the quick stale-data check that happens before individual tests. Its `MAX QUICK CLEAR TIME BEFORE TEST` setting is not meant to empty a full low-baud buffer.
 
-When the output baud and frame are known, the tool uses calculated long purge limits instead. Known-baud device tests, memory tests, flow validation, dual validation, and post-Phase-0 frame scans use those known-baud purge paths.
+When the output baud and frame are known, the tool uses calculated long purge limits instead. Known-baud device tests, flow validation, dual validation, and post-Phase-0 frame scans use those known-baud purge paths.
 
 If the output does not go quiet, the test is marked:
 

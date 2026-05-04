@@ -58,17 +58,6 @@ BUFFER_PURGE_CAPACITY_BYTES = 64 * KIB_BYTES
 BUFFER_PURGE_QUIET_SECONDS = 1.5
 BUFFER_PURGE_PER_BAUD_MAX_SECONDS = 2.5
 BUFFER_PURGE_PROGRESS_INTERVAL = 1.0
-MEMORY_TEST_TARGET_BYTES = BUFFER_PURGE_CAPACITY_BYTES
-MEMORY_TEST_TARGET_KIB_PRESETS: tuple[int, ...] = (16, 32, 48, 64)
-MEMORY_TEST_MAX_TARGET_KIB = max(MEMORY_TEST_TARGET_KIB_PRESETS)
-MEMORY_TEST_MAX_PAYLOAD_FACTOR = 8
-MEMORY_TEST_MAX_LOOPS = 999
-MEMORY_TEST_READ_QUIET_SECONDS = 2.0
-MEMORY_TEST_PRE_DRAIN_TIMEOUT = 2.5
-MEMORY_TEST_MODE_IMAGE = "image"
-MEMORY_TEST_MODE_FILL = "fill"
-MEMORY_TEST_MODE_CUSTOM = "custom"
-MEMORY_TEST_FLOW_CONTROL = "dsr/dtr"
 FLOW_VALIDATE_PAYLOAD_BYTES = 1024
 FLOW_VALIDATE_READ_TIMEOUT = 2.0
 FLOW_VALIDATE_HOLD_SECONDS = 1.0
@@ -451,60 +440,6 @@ class MenuSelection:
     action: str
     options: ScanOptions
     workflow: str = ""
-
-
-@dataclass(frozen=True)
-class MemoryTestConfig:
-    """Operator-selected settings for one memory test."""
-
-    in_port: str
-    out_port: str
-    input_baud: int
-    output_baud: int
-    mode: str
-    payload_bytes: int
-    target_bytes: int
-    loop_count: int
-    accept_full_result: bool
-    stop_on_unexpected: bool
-    switch_note: str
-    run_id: str
-
-
-@dataclass(frozen=True)
-class MemoryTestResult:
-    """Result block for one fixed 8E1 DSR/DTR memory test."""
-
-    config: MemoryTestConfig
-    settings: DualSerialSettings
-    payload: ProbePayload
-    purge: DrainResult
-    candidate: CandidateResult
-    loop_index: int
-    loop_total: int
-    started_at: str
-    completed_at: str
-    elapsed_sec: float
-
-
-@dataclass(frozen=True)
-class MemoryTestDiagnosis:
-    """Operator-facing interpretation for one memory-test result."""
-
-    code: str
-    result: str
-    finding: str
-    exact_stream: str
-    data_check: str
-    capacity_check: str
-    ram_check: str
-    operator_note: str
-    content_integrity_ratio: float
-    completeness_ratio: float
-    exact_prefix_bytes: int
-    bytes_received_at_write_done: int
-    bytes_delivered_after_write_done: int
-    write_pressure_bytes: int
 
 
 @dataclass(frozen=True)
@@ -1531,6 +1466,11 @@ def fit_terminal_line(text: object, width: int = TERMINAL_COLUMNS) -> str:
     return cleaned[: width - 3] + "..."
 
 
+def terminal_text(value: object) -> str:
+    """Return operator-facing text in the uppercase terminal style."""
+    return str(value).replace("\t", " ").upper()
+
+
 def banner_lines() -> list[str]:
     """Return the terminal-style program banner lines."""
     return [
@@ -1602,7 +1542,7 @@ def wrapped_value_lines(
     """Return prefixed lines wrapped to the terminal width."""
     available = max(20, width - len(prefix))
     wrapped = textwrap.wrap(
-        str(value),
+        terminal_text(value),
         width=available,
         break_long_words=True,
     ) or [""]
@@ -1640,7 +1580,7 @@ def format_duration(seconds: float) -> str:
 
 
 def byte_size_label(byte_count: int) -> str:
-    """Return a compact byte-count label for memory and purge screens."""
+    """Return a compact byte-count label for purge and report screens."""
     if byte_count > 0 and byte_count % KIB_BYTES == 0:
         return f"{byte_count // KIB_BYTES}K"
     return f"{byte_count} BYTES"
@@ -1945,7 +1885,7 @@ def console_progress(message: str) -> None:
     """Print a timestamped live progress message."""
     prefix = f"{time.strftime('%H:%M:%S')} "
     width = max(20, TERMINAL_COLUMNS - len(prefix))
-    lines = str(message).splitlines() or [""]
+    lines = terminal_text(message).splitlines() or [""]
     for line_index, line in enumerate(lines):
         wrapped = textwrap.wrap(
             line,
@@ -1968,8 +1908,7 @@ def print_progress_legend() -> None:
     print("  CLEARED=N             OLD OUTPUT REMOVED BEFORE SEND.")
     print("  QUIET=S/T             OUTPUT QUIET TIME AND LIMIT.")
     print("  PASS GOOD PART FAIL STALE ERROR  RESULT INDICATOR.")
-    print("  SCORE                 0-100 TRANSFER MATCH CONFIDENCE, NOT RAM HEALTH.")
-    print("  MEMORY DIAGNOSIS      SEPARATES CLEAN OVERFLOW FROM CONTENT CORRUPTION.")
+    print("  SCORE                 0-100 TRANSFER MATCH CONFIDENCE.")
     print("  SCAN TIME             ELAPSED, LEFT, FINISH TIME.")
     print("  CTRL+C                OPERATOR BREAK MENU.")
 
@@ -2969,7 +2908,7 @@ def progress_status_text(status: str, error: str | None) -> str:
     """Return compact status text for one live progress row."""
     text = status.upper().replace("-", " ")
     if error:
-        text = f"{text}: {error}"
+        text = f"{text}: {terminal_text(error)}"
     return " ".join(text.split())
 
 
@@ -2977,6 +2916,7 @@ def append_status_to_progress(base: str, status: str) -> str:
     """Append status text without exceeding the fixed terminal width."""
     if not status:
         return fit_terminal_line(base)
+    status = terminal_text(status)
     available = TERMINAL_COLUMNS - len(base) - 1
     if available <= 0:
         return fit_terminal_line(base)
@@ -4004,10 +3944,10 @@ def dual_phase0_result_row(result: DualBaudLivenessResult) -> str:
         f"{result.bytes_sent:>5} "
         f"{result.bytes_received:>5} "
         f"{result.bytes_drained_before:>5} "
-        f"{result.status[:10]:<10} "
+        f"{result.status.upper()[:10]:<10} "
     )
     reason_width = max(1, REPORT_WIDTH - len(prefix))
-    return prefix + fit_terminal_line(result.reason, reason_width)
+    return prefix + fit_terminal_line(terminal_text(result.reason), reason_width)
 
 
 def dual_phase0_report_lines(report: DualBaudLivenessReport) -> list[str]:
@@ -4101,7 +4041,7 @@ def write_phase0_text_report(
             "  PHASE 0 IS A BAUD-LIVENESS GATE USING FIXED 8E1 FLOW=NONE.",
             "  ALIVE PAIRS SHOW BASIC CHECKED PROBE STRUCTURE AT THAT BAUD PAIR.",
             "  A NON-ALIVE ROW DOES NOT PROVE THE BAUD IS IMPOSSIBLE WITH ANOTHER FRAME.",
-            "  FRAME, FLOW, RAW BYTE, ETX/ACK, AND MEMORY TESTS NEED LATER WORKFLOWS.",
+            "  FRAME, FLOW, RAW BYTE, AND ETX/ACK NEED LATER WORKFLOWS.",
             border_line(REPORT_WIDTH),
         ]
     )
@@ -4591,7 +4531,7 @@ def prompt_supported_baud(label: str, current: int) -> int:
         try:
             validate_supported_baud(baud)
         except ValueError as exc:
-            print(exc)
+            print(terminal_text(exc))
             continue
         return baud
     return current
@@ -4628,7 +4568,7 @@ def prompt_port(label: str, current: str) -> str:
         try:
             validate_port_name(port)
         except ValueError as exc:
-            print(f"PORT ERROR: {exc}")
+            print(f"PORT ERROR: {terminal_text(exc)}")
             continue
         return normalize_port_name(port)
     return normalize_port_name(current)
@@ -4670,212 +4610,6 @@ def prompt_yes_no_question(question: str, current: bool) -> bool:
     return current
 
 
-def memory_test_settings(input_baud: int, output_baud: int) -> DualSerialSettings:
-    """Return fixed 8E1 DSR/DTR settings for the memory test."""
-    validate_supported_baud(input_baud)
-    validate_supported_baud(output_baud)
-    return DualSerialSettings(
-        input_settings=SerialSettings(
-            input_baud,
-            8,
-            "even",
-            1,
-            MEMORY_TEST_FLOW_CONTROL,
-        ),
-        output_settings=SerialSettings(
-            output_baud,
-            8,
-            "even",
-            1,
-            MEMORY_TEST_FLOW_CONTROL,
-        ),
-    )
-
-
-def memory_test_fill_payload_bytes(
-    input_baud: int,
-    output_baud: int,
-    target_bytes: int = MEMORY_TEST_TARGET_BYTES,
-) -> int:
-    """Return bytes needed to approach target occupancy while output drains."""
-    settings = memory_test_settings(input_baud, output_baud)
-    input_rate = input_baud / serial_frame_bits(settings.input_settings)
-    output_rate = output_baud / serial_frame_bits(settings.output_settings)
-    if input_rate <= output_rate:
-        return target_bytes
-    fill_fraction = 1.0 - (output_rate / input_rate)
-    return max(target_bytes, math.ceil(target_bytes / fill_fraction))
-
-
-def estimated_memory_test_peak_fill_bytes(
-    input_baud: int,
-    output_baud: int,
-    payload_bytes: int,
-) -> int:
-    """Estimate peak buffered bytes during a continuous memory-test stream."""
-    settings = memory_test_settings(input_baud, output_baud)
-    send_seconds = estimated_transmit_seconds(settings.input_settings, payload_bytes)
-    output_rate = output_baud / serial_frame_bits(settings.output_settings)
-    drained_during_send = send_seconds * output_rate
-    peak = payload_bytes - drained_during_send
-    return max(0, min(payload_bytes, int(round(peak))))
-
-
-def parse_memory_test_target_choice(choice: str) -> int | str | None:
-    """Return a target byte count, custom sentinel, menu sentinel, or None."""
-    choice = choice.lstrip("\ufeff").strip().lower()
-    if choice == "":
-        return MEMORY_TEST_TARGET_BYTES
-    if choice in {"0", "m", "menu", "main", "return"}:
-        return "menu"
-    if choice in {"c", "custom", "k", "kb", "kib"}:
-        return "custom"
-    for index, kib in enumerate(MEMORY_TEST_TARGET_KIB_PRESETS, start=1):
-        if choice in {str(index), str(kib), f"{kib}k", f"{kib}kb", f"{kib}kib"}:
-            return kib * KIB_BYTES
-    if choice == str(len(MEMORY_TEST_TARGET_KIB_PRESETS) + 1):
-        return "custom"
-    return None
-
-
-def prompt_memory_test_custom_target_bytes(default_bytes: int) -> int | None:
-    """Prompt for a custom memory-test target in K-sized blocks."""
-    default_kib = max(1, math.ceil(default_bytes / KIB_BYTES))
-    while prompt_loop_active():
-        try:
-            value = read_operator_input(
-                f"CUSTOM MEMORY TARGET K [{default_kib}] (0=MENU): "
-            ).strip()
-        except EOFError:
-            return None
-        value = value.lstrip("\ufeff").strip().lower()
-        if value in {"0", "m", "menu", "main", "return"}:
-            return None
-        if value == "":
-            target_kib = default_kib
-        else:
-            if value.endswith("kib"):
-                value = value[:-3]
-            elif value.endswith("kb"):
-                value = value[:-2]
-            elif value.endswith("k"):
-                value = value[:-1]
-            try:
-                target_kib = int(value)
-            except ValueError:
-                print("ENTER A WHOLE K VALUE, OR 0 FOR MENU.")
-                continue
-        if target_kib < 1:
-            print("ENTER AT LEAST 1K.")
-            continue
-        if target_kib > MEMORY_TEST_MAX_TARGET_KIB:
-            print(f"ENTER {MEMORY_TEST_MAX_TARGET_KIB}K OR LESS.")
-            continue
-        return target_kib * KIB_BYTES
-    return None
-
-
-def prompt_memory_test_target_bytes(default_bytes: int = MEMORY_TEST_TARGET_BYTES) -> int | None:
-    """Prompt for the memory-test target size."""
-    default_choice = str(
-        MEMORY_TEST_TARGET_KIB_PRESETS.index(default_bytes // KIB_BYTES) + 1
-        if default_bytes % KIB_BYTES == 0
-        and default_bytes // KIB_BYTES in MEMORY_TEST_TARGET_KIB_PRESETS
-        else len(MEMORY_TEST_TARGET_KIB_PRESETS) + 1
-    )
-    while prompt_loop_active():
-        print()
-        print_report_title("MEMORY TARGET")
-        print("  TARGET IS THE BUFFER FILL SIZE TO PROVE OR STRESS.")
-        for index, kib in enumerate(MEMORY_TEST_TARGET_KIB_PRESETS, start=1):
-            print(f"  {index} {kib}K")
-        print(f"  {len(MEMORY_TEST_TARGET_KIB_PRESETS) + 1} CUSTOM K")
-        print("  0 RETURN TO MAIN MENU")
-        print(border_line(REPORT_WIDTH))
-        try:
-            choice = read_operator_input(
-                f"ENTER SELECTION [{default_choice}]: "
-            )
-        except EOFError:
-            return None
-        target = parse_memory_test_target_choice(choice)
-        if target == "menu":
-            return None
-        if target == "custom":
-            return prompt_memory_test_custom_target_bytes(default_bytes)
-        if isinstance(target, int):
-            return target
-        print(
-            "ENTER 1-"
-            f"{len(MEMORY_TEST_TARGET_KIB_PRESETS) + 1}, A PRESET K VALUE, OR 0."
-        )
-    return None
-
-
-def memory_test_mode_label(mode: str, target_bytes: int = MEMORY_TEST_TARGET_BYTES) -> str:
-    """Return compact operator-facing text for a memory-test mode."""
-    target_label = byte_size_label(target_bytes)
-    if mode == MEMORY_TEST_MODE_FILL:
-        return f"FILL {target_label}"
-    if mode == MEMORY_TEST_MODE_CUSTOM:
-        return "CUSTOM SIZE"
-    return f"{target_label} IMAGE"
-
-
-def memory_test_clean_full_policy_available(
-    mode: str,
-    payload_bytes: int,
-    target_bytes: int,
-) -> bool:
-    """Return whether a clean-full policy can affect this memory test."""
-    return (
-        mode in {MEMORY_TEST_MODE_FILL, MEMORY_TEST_MODE_CUSTOM}
-        and payload_bytes > target_bytes
-    )
-
-
-def memory_test_clean_full_policy_text(
-    mode: str,
-    payload_bytes: int,
-    target_bytes: int,
-    accept_full_result: bool,
-) -> str:
-    """Return the report value for the clean-full pass policy."""
-    if not memory_test_clean_full_policy_available(
-        mode,
-        payload_bytes,
-        target_bytes,
-    ):
-        return "NOT USED"
-    return yes_no_text(accept_full_result)
-
-
-def parse_memory_test_mode_choice(choice: str, fill_available: bool) -> str | None:
-    """Return a memory-test mode key for one operator menu choice."""
-    choice = choice.lstrip("\ufeff").strip().lower()
-    target_aliases = {
-        f"{kib}{suffix}"
-        for kib in MEMORY_TEST_TARGET_KIB_PRESETS
-        for suffix in ("k", "kb", "kib")
-    }
-    if choice == "":
-        return MEMORY_TEST_MODE_FILL if fill_available else MEMORY_TEST_MODE_IMAGE
-    if choice in {"1", "i", "image", *target_aliases}:
-        return MEMORY_TEST_MODE_IMAGE
-    if choice in {"2", "f", "fill", "stress"} and fill_available:
-        return MEMORY_TEST_MODE_FILL
-    if choice in {"3", "c", "custom", "bytes", "size"}:
-        return MEMORY_TEST_MODE_CUSTOM
-    if choice in {"0", "m", "menu", "main", "return"}:
-        return "menu"
-    return None
-
-
-def default_memory_test_bauds(options: ScanOptions) -> tuple[int, int]:
-    """Return configured input/output bauds for the memory test."""
-    return options.input_baud, options.output_baud
-
-
 def prompt_supported_baud_or_menu(label: str, current: int) -> int | None:
     """Prompt for a supported baud value, allowing return to main menu."""
     while prompt_loop_active():
@@ -4899,258 +4633,10 @@ def prompt_supported_baud_or_menu(label: str, current: int) -> int | None:
         try:
             validate_supported_baud(baud)
         except ValueError as exc:
-            print(exc)
+            print(terminal_text(exc))
             continue
         return baud
     return None
-
-
-def prompt_memory_test_mode(
-    input_baud: int,
-    output_baud: int,
-    target_bytes: int,
-) -> str | None:
-    """Prompt for the memory-test payload mode."""
-    fill_available = input_baud > output_baud
-    target_label = byte_size_label(target_bytes)
-    fill_bytes = memory_test_fill_payload_bytes(input_baud, output_baud, target_bytes)
-    peak_image = estimated_memory_test_peak_fill_bytes(
-        input_baud,
-        output_baud,
-        target_bytes,
-    )
-    peak_fill = estimated_memory_test_peak_fill_bytes(
-        input_baud,
-        output_baud,
-        fill_bytes,
-    )
-    default_choice = "2" if fill_available else "1"
-    while prompt_loop_active():
-        print()
-        print_report_title("MEMORY TEST SIZE")
-        print(f"  1 {target_label} IMAGE   SEND {target_bytes} ASCII BYTES")
-        print(f"                EST. PEAK BUFFER USE: {peak_image} BYTES")
-        if fill_available:
-            print(f"  2 FILL {target_label}    SEND {fill_bytes} ASCII BYTES")
-            print(f"                EST. PEAK BUFFER USE: {peak_fill} BYTES")
-            print("                OVERFLOW STRESS; REPORT CLASSIFIES CLEAN DROP VS CORRUPTION")
-        else:
-            print(f"  2 FILL {target_label}    NOT AVAILABLE; INPUT BAUD MUST BE FASTER")
-        print("  3 CUSTOM      SEND OPERATOR BYTE COUNT")
-        print("                USE TO BRACKET NEAR-FILL AFTER OVERFLOW DIAGNOSIS")
-        print("  0 RETURN TO MAIN MENU")
-        print(border_line(REPORT_WIDTH))
-        try:
-            choice = read_operator_input(
-                f"ENTER SELECTION [{default_choice}]: "
-            )
-        except EOFError:
-            return None
-        mode = parse_memory_test_mode_choice(choice, fill_available)
-        if mode == "menu":
-            return None
-        if mode is not None:
-            return mode
-        if fill_available:
-            print("ENTER 1, 2, 3, OR 0.")
-        else:
-            print(
-                f"ENTER 1, 3, OR 0. FILL {target_label} "
-                "NEEDS INPUT BAUD > OUTPUT BAUD."
-            )
-    return None
-
-
-def prompt_memory_test_payload_bytes(default_bytes: int, target_bytes: int) -> int | None:
-    """Prompt for a custom memory-test byte count."""
-    minimum = minimum_payload_size()
-    maximum = target_bytes * MEMORY_TEST_MAX_PAYLOAD_FACTOR
-    while prompt_loop_active():
-        try:
-            value = read_operator_input(
-                f"CUSTOM PAYLOAD BYTES [{default_bytes}] (0=MENU): "
-            ).strip()
-        except EOFError:
-            return None
-        value = value.lstrip("\ufeff").strip().lower()
-        if value in {"0", "m", "menu", "main", "return"}:
-            return None
-        if value == "":
-            return default_bytes
-        try:
-            payload_bytes = int(value)
-        except ValueError:
-            print("ENTER A WHOLE NUMBER, OR 0 FOR MENU.")
-            continue
-        if payload_bytes < minimum:
-            print(f"ENTER AT LEAST {minimum} BYTES.")
-            continue
-        if payload_bytes > maximum:
-            print(f"ENTER {maximum} BYTES OR LESS.")
-            continue
-        return payload_bytes
-    return None
-
-
-def prompt_memory_test_note(current: str) -> str | None:
-    """Prompt for the memory-test report note, canceling on EOF."""
-    try:
-        value = read_operator_input(
-            f"DEVICE/SWITCH NOTE FOR REPORT [{current}]: "
-        ).strip()
-    except EOFError:
-        return None
-    return current if value == "" else value
-
-
-def prompt_run_memory_test() -> bool:
-    """Ask for final memory-test confirmation, canceling on EOF."""
-    while prompt_loop_active():
-        try:
-            value = read_operator_input("RUN MEMORY TEST [Y]: ").strip().lower()
-        except EOFError:
-            return False
-        if value == "":
-            return True
-        if value in {"y", "yes"}:
-            return True
-        if value in {"n", "no", "0", "m", "menu", "main"}:
-            return False
-        print("ENTER Y OR N.")
-    return False
-
-
-def prompt_memory_test_config(options: ScanOptions) -> MemoryTestConfig | None:
-    """Prompt for one fixed-frame memory test run."""
-    input_baud, output_baud = default_memory_test_bauds(options)
-    print()
-    print_report_title("MEMORY TEST")
-    print("FIXED FRAME: INPUT 8E1, OUTPUT 8E1, FLOW=DSR/DTR.")
-    print("STREAM TYPE: PRINTABLE ASCII WITH CHECKSUMS.")
-    print(f"DEFAULT BUFFER TARGET: {byte_size_detail(MEMORY_TEST_TARGET_BYTES)}.")
-    print("TARGET CAN BE SELECTED IN K-SIZED STEPS.")
-    print(
-        f"USING OPTION 2 BAUDS: INPUT {input_baud}, OUTPUT {output_baud}."
-    )
-    print("CHANGE COM PORTS OR BAUDS FROM MAIN MENU OPTION 2.")
-    print("ENTER 0 AT SIZE PROMPT TO RETURN.")
-    print(border_line(REPORT_WIDTH))
-
-    target_bytes = prompt_memory_test_target_bytes(MEMORY_TEST_TARGET_BYTES)
-    if target_bytes is None:
-        return None
-    mode = prompt_memory_test_mode(input_baud, output_baud, target_bytes)
-    if mode is None:
-        return None
-
-    if mode == MEMORY_TEST_MODE_FILL:
-        payload_bytes = memory_test_fill_payload_bytes(
-            input_baud,
-            output_baud,
-            target_bytes,
-        )
-    elif mode == MEMORY_TEST_MODE_CUSTOM:
-        custom_payload = prompt_memory_test_payload_bytes(target_bytes, target_bytes)
-        if custom_payload is None:
-            return None
-        payload_bytes = custom_payload
-    else:
-        payload_bytes = target_bytes
-    payload_bytes = max(payload_bytes, minimum_payload_size())
-    loop_count = prompt_int(
-        "TEST LOOPS",
-        1,
-        minimum=1,
-        maximum=MEMORY_TEST_MAX_LOOPS,
-    )
-    if memory_test_clean_full_policy_available(mode, payload_bytes, target_bytes):
-        print()
-        print("CLEAN FULL MEANS RETURNED BYTES STAYED IN ORDER,")
-        print("BUT THE OVERFILL TEST DROPPED BYTES AFTER THE BUFFER FILLED.")
-        print("YES COUNTS THAT AS A USEFUL FILL RESULT; NO MARKS IT FOR REVIEW.")
-        print("THIS DOES NOT APPLY TO FRAME, CHECK, STALE, OR ERROR RESULTS.")
-        accept_full_result = prompt_yes_no("COUNT CLEAN FULL AS PASS", True)
-    else:
-        accept_full_result = False
-    if loop_count > 1:
-        print()
-        print("LOOPS RUN ALL REQUESTED PASSES BY DEFAULT.")
-        print("CHOOSE YES ONLY TO STOP AFTER THE FIRST CHECK/FRAME/ERROR RESULT.")
-        stop_on_unexpected = prompt_yes_no("STOP EARLY ON CHECK RESULT", False)
-    else:
-        stop_on_unexpected = False
-    switch_note = prompt_memory_test_note(options.switch_note)
-    if switch_note is None:
-        return None
-    run_id = make_run_id("M")
-    settings = memory_test_settings(input_baud, output_baud)
-    send_estimate = estimated_transmit_seconds(
-        settings.input_settings,
-        payload_bytes,
-    )
-    receive_estimate = estimated_receive_seconds(
-        settings.output_settings,
-        payload_bytes,
-    )
-    transfer_estimate = (
-        max(send_estimate, receive_estimate) + MEMORY_TEST_READ_QUIET_SECONDS
-    )
-    total_estimate = transfer_estimate * loop_count
-    peak_estimate = estimated_memory_test_peak_fill_bytes(
-        input_baud,
-        output_baud,
-        payload_bytes,
-    )
-
-    print()
-    print_report_title("MEMORY TEST PLAN")
-    print(f"  MODE:                {memory_test_mode_label(mode, target_bytes)}")
-    print(f"  TARGET:              {byte_size_detail(target_bytes)}")
-    print(f"  PAYLOAD:             {payload_bytes} ASCII BYTES")
-    print(f"  LOOPS:               {loop_count}")
-    print(
-        "  CLEAN FULL PASS:     "
-        f"{memory_test_clean_full_policy_text(mode, payload_bytes, target_bytes, accept_full_result)}"
-    )
-    print(f"  STOP EARLY:          {yes_no_text(stop_on_unexpected)}")
-    print(f"  EST. PEAK BUFFER:    {peak_estimate} BYTES")
-    print(f"  INPUT:               {input_baud} 8E1 DSR/DTR")
-    print(f"  OUTPUT:              {output_baud} 8E1 DSR/DTR")
-    print(f"  EACH ESTIMATE:       {format_duration(transfer_estimate)}")
-    print(f"  TOTAL ESTIMATE:      {format_duration(total_estimate)}")
-    print(f"  FINISH ABOUT:        {format_finish_clock(total_estimate)}")
-    if peak_estimate < target_bytes:
-        print(
-            f"  NOTE:                THIS BAUD PAIR MAY NOT FILL "
-            f"{byte_size_label(target_bytes)}."
-        )
-    if mode == MEMORY_TEST_MODE_FILL:
-        print("  NOTE:                FILL MODE TRIES TO OVERFILL THE BUFFER.")
-        print("                       IF START MATCHES BUT END IS MISSING,")
-        print("                       THE BUFFER IS PROBABLY FULL.")
-        print("                       CLEAN FULL PASS APPLIES ONLY TO STATUS FULL.")
-        print("                       FRAME, CHECK, STALE, OR ERROR STILL NEED REVIEW.")
-    if mode == MEMORY_TEST_MODE_CUSTOM:
-        print("  NOTE:                CUSTOM SIZE IS FOR BRACKETING NEAR-FILL")
-        print("                       WITHOUT FORCING THE OVERFLOW-STRESS SIZE.")
-    print(border_line(REPORT_WIDTH))
-    if not prompt_run_memory_test():
-        return None
-
-    return MemoryTestConfig(
-        in_port=options.in_port,
-        out_port=options.out_port,
-        input_baud=input_baud,
-        output_baud=output_baud,
-        mode=mode,
-        payload_bytes=payload_bytes,
-        target_bytes=target_bytes,
-        loop_count=loop_count,
-        accept_full_result=accept_full_result,
-        stop_on_unexpected=stop_on_unexpected,
-        switch_note=switch_note,
-        run_id=run_id,
-    )
 
 
 def parse_start_scan_workflow_choice(choice: str) -> str | None:
@@ -5210,9 +4696,8 @@ def print_menu_help(paged: bool = True) -> None:
             "  3 SCAN/VALIDATE:   MESSAGE SIZE, COUNT, VALIDATION SCOPE.",
             f"  BAUDS:             {supported_baud_label()}.",
             "  4 TIMING/STALE:    PER-TEST READ WAITS AND QUICK OLD-OUTPUT CLEARING.",
-            "  5 MEMORY TEST:     SELECT 16K..64K ASCII STREAM, 8E1, DSR/DTR.",
-            "  6 CURRENT SETTINGS: SHOW ACTIVE SETUP.",
-            "  7 HELP:            THIS SCREEN.",
+            "  5 CURRENT SETTINGS: SHOW ACTIVE SETUP.",
+            "  6 HELP:            THIS SCREEN.",
             "  0 QUIT:            END PROGRAM.",
             "",
             "START SCAN WORKFLOW",
@@ -5224,7 +4709,7 @@ def print_menu_help(paged: bool = True) -> None:
             "OPERATOR NOTES",
             "  DEVICE PATH:       COM1 -> BUFFER INPUT -> BUFFER OUTPUT -> COM5.",
             "  PROGRAM SETTINGS:  PROGRAM SETS BAUD, FRAME, AND FLOW ON OPEN.",
-            "  OPTION 2 BAUDS:    USED BY KNOWN-BAUD AND MEMORY TEST RUNS.",
+            "  OPTION 2 BAUDS:    USED BY KNOWN-BAUD DEVICE TEST RUNS.",
             "  BAUD RANGE:        ASKED BY START SCAN 1 AND 3.",
             "  PHASE 0 SETTINGS:  FIXED 8E1 FLOW=NONE; OPTION 3 DOES NOT CHANGE IT.",
             "  BAUD PAIRS:        INPUT AND OUTPUT BAUDS MAY DIFFER.",
@@ -5232,10 +4717,9 @@ def print_menu_help(paged: bool = True) -> None:
             "  START 1 SETUP:     OPTION 3 ITEMS 1-6 CAN AFFECT DISCOVERY.",
             "  START 2 SETUP:     OPTION 3 ITEMS 1, 6, AND 7 CAN AFFECT KNOWN-BAUD.",
             "  START 3 SETUP:     OPTION 3 DOES NOT AFFECT PHASE 0 ONLY.",
-            "  MEMORY TEST:       MAIN MENU 5; FIXED 8E1, DSR/DTR, ASCII CHECK.",
             "  REPORT FILES:      FIXED TXT REPORT AND DEBUG LOG; NEW SESSION OVERWRITES.",
             "  STALE DATA:        QUICK PER-TEST CLEARING REJECTS OLD OUTPUT.",
-            "  KNOWN-BAUD PURGE:  KNOWN-BAUD, MEMORY, AND VALIDATION USE LONG ESTIMATES.",
+            "  KNOWN-BAUD PURGE:  KNOWN-BAUD AND VALIDATION USE LONG ESTIMATES.",
             "  NONCES:            EACH TEST PAYLOAD HAS RUN/CANDIDATE/TRIAL IDS.",
             "  8-BIT TEST:        SEPARATE HIGH-BIT CHALLENGE; ASCII IS NOT ENOUGH.",
             "  SCAN BREAK:        CTRL+C ASKS RESUME, REPORT, MENU, OR QUIT.",
@@ -5286,15 +4770,6 @@ def print_configuration(options: ScanOptions) -> None:
         range_error = str(exc)
     lines: list[str] = ["", *banner_lines(), "CURRENT SETTINGS"]
     lines.extend(setting_lines("START SCAN:", "DISCOVERY / KNOWN-BAUD DEVICE / PHASE 0"))
-    lines.extend(
-        setting_lines(
-            "MEMORY TEST:",
-            (
-                "MAIN MENU 5; USES OPTION 2 PORTS AND BAUDS; "
-                "SELECT 16K..64K ASCII; FIXED 8E1 FLOW=DSR/DTR"
-            ),
-        )
-    )
     lines.extend(
         setting_lines(
             "OPTION 2 PORTS:",
@@ -5448,7 +4923,7 @@ def configure_baud_range(
         try:
             available_bauds(min_baud, max_baud)
         except ValueError as exc:
-            print(f"BAUD RANGE ERROR: {exc}")
+            print(f"BAUD RANGE ERROR: {terminal_text(exc)}")
             print("RE-ENTER BAUD RANGE.")
             continue
         return dataclasses.replace(options, min_baud=min_baud, max_baud=max_baud)
@@ -5473,7 +4948,7 @@ def configure_ports(options: ScanOptions) -> ScanOptions:
         try:
             ensure_distinct_ports(in_port, out_port)
         except ValueError as exc:
-            print(f"PORT ERROR: {exc}")
+            print(f"PORT ERROR: {terminal_text(exc)}")
             print("RE-ENTER COM PORTS.")
             continue
         return dataclasses.replace(
@@ -6430,7 +5905,7 @@ def format_flow_validation_progress(
         f"{setting_label:32s} "
         f"SENT={result.bytes_sent:6d} READ={result.bytes_received:6d} "
         f"HELD={result.bytes_seen_while_held:5d} "
-        f"SCORE={result.score:6.2f} {result.reason}",
+        f"SCORE={result.score:6.2f} {terminal_text(result.reason)}",
         TERMINAL_COLUMNS,
     )
 
@@ -6493,7 +5968,7 @@ def flow_validation_table_row_lines(
     result: FlowControlValidationResult,
 ) -> list[str]:
     """Return one flow-validation table row, wrapping reason text at 80 columns."""
-    method = fit_terminal_line(result.method, FLOW_VALIDATION_METHOD_WIDTH)
+    method = fit_terminal_line(terminal_text(result.method), FLOW_VALIDATION_METHOD_WIDTH)
     flow_label = fit_terminal_line(result.flow_control.upper(), 8)
     prefix = (
         f"{flow_label:<8} "
@@ -6506,7 +5981,7 @@ def flow_validation_table_row_lines(
     )
     reason_width = max(1, REPORT_WIDTH - len(prefix))
     reason_lines = textwrap.wrap(
-        result.reason,
+        terminal_text(result.reason),
         width=reason_width,
         break_long_words=True,
     ) or [""]
@@ -7607,7 +7082,7 @@ def format_bank2_behavior_progress(
     total: int,
 ) -> str:
     """Return one compact console line for a raw behavior probe."""
-    frame_text = frame_or_pair_label(result.settings)[:24]
+    frame_text = frame_or_pair_label(result.settings).replace(" -> ", "->")[:17]
     flags = []
     if result.exact_match:
         flags.append("EXACT")
@@ -7621,11 +7096,13 @@ def format_bank2_behavior_progress(
         if result.first_mismatch_offset is None
         else str(result.first_mismatch_offset)
     )
-    return (
-        f"RAW [{index:02d}/{total:02d}] {result.status.upper():<11} "
-        f"{frame_text:24s} "
-        f"SENT={result.bytes_sent:4d} READ={result.bytes_received:4d} "
-        f"DIFF={diff_text:<5} FLAGS={flag_text:<10} {result.reason}"
+    return fit_terminal_line(
+        f"RAW [{index:02d}/{total:02d}] {result.status.upper()[:11]} "
+        f"{frame_text} "
+        f"S={progress_count_label(result.bytes_sent)} "
+        f"R={progress_count_label(result.bytes_received)} "
+        f"D={diff_text} F={flag_text} {terminal_text(result.reason)}",
+        TERMINAL_COLUMNS,
     )
 
 
@@ -7755,7 +7232,7 @@ def bank2_raw_console_row(result: Bank2BehaviorProbeResult) -> str:
     """Return one console raw-probe table row."""
     return (
         f"  {result.name:<12} "
-        f"{result.status:<11} "
+        f"{result.status.upper():<11} "
         f"{bank2_raw_sr_text(result.bytes_sent, result.bytes_received):>9} "
         f"{bank2_raw_diff_text(result):>5} "
         f"{yn_flag(result.exact_match):>2} "
@@ -7785,7 +7262,7 @@ def bank2_raw_report_row(result: Bank2BehaviorProbeResult) -> str:
     """Return one text-report raw-probe table row."""
     return (
         f"{result.name:<12} "
-        f"{result.status:<11} "
+        f"{result.status.upper():<11} "
         f"{bank2_raw_sr_text(result.bytes_sent, result.bytes_received):>9} "
         f"{result.missing_bytes:>4} "
         f"{result.extra_bytes:>5} "
@@ -8073,7 +7550,7 @@ def run_bank2_etx_ack_probe(
         f"ACK={'Y' if result.ack_reverse_seen else 'N'} "
         f"FWD={result.forward_bytes_sent}/{result.forward_bytes_received} "
         f"REV={result.reverse_bytes_sent}/{result.reverse_bytes_received} "
-        f"{result.reason}"
+        f"{terminal_text(result.reason)}"
     )
     return result
 
@@ -8132,13 +7609,13 @@ def bank2_etx_ack_report_lines(
         lines.append("(NOT RUN)")
     for result in results:
         lines.append(
-            f"{result.status:<12} "
+            f"{result.status.upper():<12} "
             f"{'Y' if result.etx_forward_seen else 'N':<3} "
             f"{'Y' if result.ack_reverse_seen else 'N':<3} "
             f"{result.forward_bytes_sent:>3}/{result.forward_bytes_received:<4} "
             f"{result.reverse_bytes_sent:>3}/{result.reverse_bytes_received:<4} "
             f"{frame_or_pair_label(result.settings)[:23]:<23} "
-            f"{result.reason[:24]}"
+            f"{terminal_text(result.reason)[:24]}"
         )
     lines.extend(
         [
@@ -8239,8 +7716,8 @@ def bank2_next_action(result: Bank2CharacterizationResult) -> str:
         )
     if not bank2_eight_bit_clean_results(result.eight_bit_results):
         return (
-            "USE THE ASCII FRAME ONLY FOR PRINTABLE 7-BIT TRAFFIC; FOR MEMORY, "
-            "RAW DATA, OR PRINTER CONTROL BYTES, FIND AN 8-BIT CLEAN SETTING."
+            "USE THE ASCII FRAME ONLY FOR PRINTABLE 7-BIT TRAFFIC; FOR RAW DATA "
+            "OR PRINTER CONTROL BYTES, FIND AN 8-BIT CLEAN SETTING."
         )
     if result.flow_skip_reason:
         return "COMPARE THIS BLOCK TO OTHER DEVICE/SWITCH STATES; FLOW WAS NOT PROVEN HERE."
@@ -8409,7 +7886,7 @@ def print_bank2_report(
         for probe in result.etx_ack_results:
             print(
                 f"  PATH         "
-                f"{probe.status:<12} "
+                f"{probe.status.upper():<12} "
                 f"{'Y' if probe.etx_forward_seen else 'N':<3} "
                 f"{'Y' if probe.ack_reverse_seen else 'N':<3} "
                 f"{probe.forward_bytes_sent:>3}/{probe.forward_bytes_received:<4} "
@@ -8484,7 +7961,7 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
     try:
         ensure_distinct_ports(bank_options.in_port, bank_options.out_port)
     except ValueError as exc:
-        print(f"SETTINGS ERROR: {exc}")
+        print(f"SETTINGS ERROR: {terminal_text(exc)}")
         return
 
     logger = setup_logging(bank_options.log_file)
@@ -8619,13 +8096,13 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
         flow_skip_reason = "FLOW-CONTROL TESTING DISABLED IN SCAN / VALIDATE SETUP"
         print()
         print_report_title("KNOWN-BAUD FLOW VALIDATION")
-        print(f"SKIPPED: {flow_skip_reason}.")
+        print(f"SKIPPED: {terminal_text(flow_skip_reason)}.")
         print(border_line(REPORT_WIDTH))
         logger.info("Known-baud flow validation skipped: disabled by operator")
     elif flow_skip_reason:
         print()
         print_report_title("KNOWN-BAUD FLOW VALIDATION")
-        print(f"SKIPPED: {flow_skip_reason}.")
+        print(f"SKIPPED: {terminal_text(flow_skip_reason)}.")
         print("RESULT: NOT OBSERVABLE IN THIS KNOWN-BAUD RUN.")
         print(border_line(REPORT_WIDTH))
         logger.info("Known-baud flow validation skipped: %s", flow_skip_reason)
@@ -8684,852 +8161,6 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
     print_bank2_report(result, bank_options.text_report)
 
 
-def memory_test_passed(candidate: CandidateResult, payload: ProbePayload) -> bool:
-    """Return True only when the memory-test output exactly matches input."""
-    return (
-        candidate.error is None
-        and candidate.status == "exact"
-        and candidate.score >= PERFECT_SCORE
-        and candidate.bytes_sent == payload.byte_count
-        and candidate.bytes_received == payload.byte_count
-        and candidate.metrics.exact_byte_match_ratio >= 1.0
-        and candidate.metrics.missing_bytes == 0
-        and candidate.metrics.extra_bytes == 0
-    )
-
-
-def memory_test_reason(candidate: CandidateResult, payload: ProbePayload) -> str:
-    """Return one concise result reason for the memory test."""
-    if memory_test_passed(candidate, payload):
-        return "EXACT ASCII STREAM RETURNED."
-    if candidate.error:
-        return f"SERIAL ERROR: {candidate.error}"
-    if candidate.bytes_sent < payload.byte_count:
-        return "PAYLOAD WAS NOT FULLY SENT."
-    if candidate.bytes_received == 0:
-        return "NO OUTPUT WAS RECEIVED."
-    if candidate.metrics.missing_bytes:
-        return f"{candidate.metrics.missing_bytes} OUTPUT BYTE(S) MISSING."
-    if candidate.metrics.extra_bytes:
-        return f"{candidate.metrics.extra_bytes} EXTRA OUTPUT BYTE(S) RECEIVED."
-    return "OUTPUT CONTENT DID NOT EXACTLY MATCH INPUT."
-
-
-def memory_test_status_text(candidate: CandidateResult, payload: ProbePayload) -> str:
-    """Return the exact-stream check status for compatibility with old reports."""
-    return "OK" if memory_test_passed(candidate, payload) else "CHECK"
-
-
-def memory_test_loop_status(diagnosis: MemoryTestDiagnosis) -> str:
-    """Return a terse operator status for one memory-test loop."""
-    if diagnosis.code == "exact-pass":
-        return "OK"
-    if diagnosis.code == "probable-overflow-clean":
-        return "FULL"
-    if diagnosis.code == "clean-prefix-incomplete":
-        return "SHORT"
-    if diagnosis.code == "probable-frame-mismatch":
-        return "FRAME"
-    if diagnosis.code in {"missing-with-content-errors", "possible-content-corruption"}:
-        return "CHANGED"
-    if diagnosis.code == "extra-output":
-        return "STALE"
-    if diagnosis.code in {"serial-error", "incomplete-send"}:
-        return "ERROR"
-    return "CHECK"
-
-
-def memory_test_result_expected(result: MemoryTestResult) -> bool:
-    """Return whether one memory-test loop met the selected operator policy."""
-    diagnosis = memory_test_diagnosis(result)
-    status = memory_test_loop_status(diagnosis)
-    return status == "OK" or (
-        status == "FULL" and result.config.accept_full_result
-    )
-
-
-def memory_test_primary_trial(candidate: CandidateResult) -> TrialResult | None:
-    """Return the single memory-test trial when it is available."""
-    return candidate.trials[0] if candidate.trials else None
-
-
-def memory_test_content_integrity_ratio(
-    candidate: CandidateResult,
-    payload: ProbePayload,
-) -> float:
-    """Return match quality over bytes that were actually returned."""
-    compared = min(payload.byte_count, candidate.bytes_received)
-    if compared <= 0:
-        return 0.0
-    return min(candidate.metrics.exact_prefix_bytes, compared) / compared
-
-
-def memory_test_completeness_ratio(
-    candidate: CandidateResult,
-    payload: ProbePayload,
-) -> float:
-    """Return how much of the expected stream came back, ignoring extra bytes."""
-    if payload.byte_count <= 0:
-        return 0.0
-    return min(candidate.bytes_received, payload.byte_count) / payload.byte_count
-
-
-def memory_test_frame_mismatch_likely(
-    candidate: CandidateResult,
-    payload: ProbePayload,
-) -> bool:
-    """Return True when ASCII memory output looks like wrong serial framing."""
-    metrics = candidate.metrics
-    if payload.payload_mode != PAYLOAD_MODE_ASCII:
-        return False
-    if metrics.high_bit_bytes_sent:
-        return False
-    if candidate.bytes_received <= 0:
-        return False
-    high_bit_ratio = metrics.high_bit_bytes_received / max(candidate.bytes_received, 1)
-    enough_high_bits = metrics.high_bit_bytes_received >= max(
-        8,
-        int(candidate.bytes_received * 0.02),
-    )
-    structure_broken = (
-        metrics.line_integrity_ratio < 0.50
-        or metrics.printable_ascii_ratio < 0.95
-    )
-    return enough_high_bits and high_bit_ratio >= 0.02 and structure_broken
-
-
-def memory_test_frame_fix_text(config: MemoryTestConfig) -> str:
-    """Return plain operator guidance for a frame-blocked memory test."""
-    return (
-        "NOT PROVEN BROKEN. FIX SERIAL SETUP FIRST: RUN KNOWN-BAUD DEVICE TEST AT "
-        f"INPUT {config.input_baud} / OUTPUT {config.output_baud}, OR SET THE "
-        "BUFFER INPUT AND OUTPUT TO 8E1, THEN RERUN MEMORY TEST."
-    )
-
-
-def memory_test_diagnosis(result: MemoryTestResult) -> MemoryTestDiagnosis:
-    """Classify one memory-test result for operator interpretation."""
-    candidate = result.candidate
-    payload = result.payload
-    metrics = candidate.metrics
-    trial = memory_test_primary_trial(candidate)
-    received_at_write_done = trial.bytes_received_at_write_done if trial else 0
-    delivered_after_write_done = max(
-        0,
-        candidate.bytes_received - received_at_write_done,
-    )
-    write_pressure = max(0, candidate.bytes_sent - received_at_write_done)
-    content_ratio = memory_test_content_integrity_ratio(candidate, payload)
-    completeness_ratio = memory_test_completeness_ratio(candidate, payload)
-    clean_prefix = content_ratio >= 0.98 and metrics.printable_ascii_ratio >= 0.98
-    target_label = byte_size_label(result.config.target_bytes)
-    post_write_near_target = (
-        delivered_after_write_done >= int(result.config.target_bytes * 0.90)
-    )
-    fill_pressure_seen = (
-        result.config.mode in {MEMORY_TEST_MODE_FILL, MEMORY_TEST_MODE_CUSTOM}
-        and write_pressure >= result.config.target_bytes
-        and post_write_near_target
-    )
-    peak_estimate = estimated_memory_test_peak_fill_bytes(
-        result.config.input_baud,
-        result.config.output_baud,
-        result.config.payload_bytes,
-    )
-
-    def diagnosis(
-        code: str,
-        result_text: str,
-        finding: str,
-        exact_stream: str,
-        data_check: str,
-        capacity_text: str,
-        ram_check: str,
-        operator_guidance: str,
-        *,
-        content: float = content_ratio,
-        completeness: float = completeness_ratio,
-        exact_prefix: int = metrics.exact_prefix_bytes,
-    ) -> MemoryTestDiagnosis:
-        """Build one memory-test diagnosis with shared measured fields."""
-        return MemoryTestDiagnosis(
-            code=code,
-            result=result_text,
-            finding=finding,
-            exact_stream=exact_stream,
-            data_check=data_check,
-            capacity_check=capacity_text,
-            ram_check=ram_check,
-            operator_note=operator_guidance,
-            content_integrity_ratio=content,
-            completeness_ratio=completeness,
-            exact_prefix_bytes=exact_prefix,
-            bytes_received_at_write_done=received_at_write_done,
-            bytes_delivered_after_write_done=delivered_after_write_done,
-            write_pressure_bytes=write_pressure,
-        )
-
-    if memory_test_passed(candidate, payload):
-        capacity_check = (
-            "NOT FILLED"
-            if peak_estimate < result.config.target_bytes
-            else "NO OVERFLOW"
-        )
-        operator_note = (
-            "PATH PASSED. USE FILL OR CUSTOM MODE TO LOAD RAM."
-            if peak_estimate < result.config.target_bytes
-            else "EXACT MEMORY STREAM RETURNED."
-        )
-        return diagnosis(
-            "exact-pass",
-            "EXACT STREAM RETURNED",
-            "ALL BYTES RETURNED IN ORDER.",
-            "YES",
-            "OK",
-            capacity_check,
-            "NO ERROR SEEN",
-            operator_note,
-            content=1.0,
-            completeness=1.0,
-        )
-    if candidate.error:
-        return diagnosis(
-            "serial-error",
-            "SERIAL ERROR",
-            f"PORT ERROR: {candidate.error}",
-            "NOT TESTED",
-            "UNKNOWN",
-            "UNKNOWN",
-            "UNKNOWN",
-            "CHECK PORTS, CABLES, AND SETTINGS.",
-        )
-    if candidate.bytes_sent < payload.byte_count:
-        return diagnosis(
-            "incomplete-send",
-            "PAYLOAD NOT FULLY SENT",
-            "THE PC DID NOT SEND THE FULL PLANNED STREAM.",
-            "NO",
-            "UNKNOWN",
-            "UNKNOWN",
-            "UNKNOWN",
-            "RERUN BEFORE JUDGING THE BUFFER.",
-        )
-    if candidate.bytes_received == 0:
-        return diagnosis(
-            "no-output",
-            "NO OUTPUT",
-            "NO BYTES RETURNED FROM THE BUFFER.",
-            "NO",
-            "UNKNOWN",
-            "UNKNOWN",
-            "UNKNOWN",
-            "CHECK BAUD, FRAME, CABLES, AND BUFFER OUTPUT.",
-            content=0.0,
-            completeness=0.0,
-            exact_prefix=0,
-        )
-    if metrics.extra_bytes:
-        return diagnosis(
-            "extra-output",
-            "CHECK SETTINGS",
-            "EXTRA OUTPUT WAS RECEIVED.",
-            "NO",
-            "UNUSABLE",
-            "UNKNOWN",
-            "UNKNOWN",
-            "CLEAR OLD DATA OR CHECK BAUD/FRAME BEFORE RAM TESTING.",
-        )
-    if memory_test_frame_mismatch_likely(candidate, payload):
-        capacity_text = (
-            "POSSIBLE FILL; FRAME FIRST"
-            if fill_pressure_seen
-            else "NOT JUDGED UNTIL FRAME MATCHES"
-        )
-        return diagnosis(
-            "probable-frame-mismatch",
-            "CHECK SERIAL FRAME",
-            (
-                "NOT PROVEN BROKEN. ASCII RETURNED AS HIGH-BIT/FRAMING-LIKE "
-                "BYTES, SO MEMORY CANNOT BE JUDGED YET."
-            ),
-            "NO",
-            "SERIAL SETUP FIRST",
-            capacity_text,
-            "NOT JUDGED - NOT PROVEN BAD",
-            memory_test_frame_fix_text(result.config),
-        )
-    if (
-        metrics.missing_bytes
-        and clean_prefix
-        and trial is not None
-        and result.config.mode in {MEMORY_TEST_MODE_FILL, MEMORY_TEST_MODE_CUSTOM}
-        and fill_pressure_seen
-    ):
-        return diagnosis(
-            "probable-overflow-clean",
-            "BUFFER FULL OBSERVED",
-            f"ABOUT {target_label} RETURNED AFTER WRITE; EXCESS BYTES DROPPED.",
-            "NO - OVERFILL TEST",
-            "OK FOR RETURNED BYTES",
-            "FULL / OVERFLOW",
-            "NO ERROR SEEN",
-            "USE CUSTOM SIZE BELOW THIS POINT FOR A NON-OVERFLOW RAM CHECK.",
-        )
-    if metrics.missing_bytes and clean_prefix:
-        return diagnosis(
-            "clean-prefix-incomplete",
-            "OUTPUT ENDED EARLY",
-            "START OF STREAM MATCHED; REMAINING BYTES DID NOT ARRIVE.",
-            "NO",
-            "OK FOR RETURNED BYTES",
-            "UNKNOWN",
-            "NO ERROR SEEN IN RETURNED BYTES",
-            "RERUN OR TRY A SMALLER CUSTOM SIZE.",
-        )
-    if metrics.missing_bytes:
-        return diagnosis(
-            "missing-with-content-errors",
-            "CHECK DATA",
-            "OUTPUT IS SHORT AND RETURNED DATA DOES NOT STAY IN ORDER.",
-            "NO",
-            "CHECK",
-            "UNKNOWN",
-            "POSSIBLE IF REPEATABLE",
-            "REPEAT TEST; SAME OFFSET POINTS TO RAM OR DATA PATH.",
-        )
-    if metrics.exact_byte_match_ratio < 1.0:
-        return diagnosis(
-            "possible-content-corruption",
-            "POSSIBLE RAM OR DATA CORRUPTION",
-            "RETURNED CONTENT CHANGED.",
-            "NO",
-            "CHANGED",
-            "UNKNOWN",
-            "SUSPECT IF REPEATABLE",
-            "REPEAT TEST; SAME BYTE OR BIT ERRORS POINT TO RAM.",
-        )
-    return diagnosis(
-        "inconclusive",
-        "INCONCLUSIVE",
-        "RESULT DOES NOT MATCH A CLEAR TEST PATTERN.",
-        "NO",
-        "UNKNOWN",
-        "UNKNOWN",
-        "UNKNOWN",
-        "RERUN WITH A CUSTOM SIZE AND CHECK SETTINGS.",
-    )
-
-
-def write_memory_test_text_report(path: Path, result: MemoryTestResult) -> None:
-    """Write one memory-test block to the text report."""
-    candidate = result.candidate
-    payload = result.payload
-    metrics = candidate.metrics
-    settings = result.settings
-    trial = candidate.trials[0] if candidate.trials else None
-    diagnosis = memory_test_diagnosis(result)
-    status = memory_test_loop_status(diagnosis)
-    expected_text = "YES" if memory_test_result_expected(result) else "CHECK"
-    peak_estimate = estimated_memory_test_peak_fill_bytes(
-        result.config.input_baud,
-        result.config.output_baud,
-        result.config.payload_bytes,
-    )
-    mode_label = memory_test_mode_label(
-        result.config.mode,
-        result.config.target_bytes,
-    )
-    lines = [
-        border_line(REPORT_WIDTH),
-        bordered_text("SERIAL PROBE MEMORY LOOP", REPORT_WIDTH),
-        border_line(REPORT_WIDTH),
-        f"RUN/LOOP:        {result.config.run_id}  {result.loop_index}/{result.loop_total}",
-        f"STARTED UTC:     {result.started_at}",
-        f"COMPLETED UTC:   {result.completed_at}",
-        f"STATUS:          {status}",
-        f"EXPECTED:        {expected_text}",
-        f"MODE:            {mode_label}",
-        f"TARGET:          {byte_size_detail(result.config.target_bytes)}",
-        (
-            "POLICY:          CLEAN FULL PASS="
-            f"{memory_test_clean_full_policy_text(result.config.mode, result.config.payload_bytes, result.config.target_bytes, result.config.accept_full_result)} "
-            f"STOP EARLY={yes_no_text(result.config.stop_on_unexpected)}"
-        ),
-        f"COM PATH:        {result.config.in_port} -> BUFFER -> {result.config.out_port}",
-        f"INPUT:           {settings.input_settings.label()}",
-        f"OUTPUT:          {settings.output_settings.label()}",
-        f"DEVICE NOTE:     {result.config.switch_note or '(NOT ENTERED)'}",
-        f"RESULT:          {diagnosis.result}",
-        f"FINDING:         {diagnosis.finding}",
-        f"DATA CHECK:      {diagnosis.data_check}",
-        f"CAPACITY:        {diagnosis.capacity_check}",
-        f"RAM CHECK:       {diagnosis.ram_check}",
-        f"PAYLOAD:         {payload.byte_count} ASCII BYTES",
-        f"EST. PEAK FILL:  {peak_estimate} BYTES",
-        f"SENT/READ:       {candidate.bytes_sent}/{candidate.bytes_received}",
-        f"MATCH:           {diagnosis.content_integrity_ratio:.3f}",
-        f"COMPLETE:        {diagnosis.completeness_ratio:.3f}",
-        f"MATCHED START:   {diagnosis.exact_prefix_bytes} BYTE(S)",
-        f"LINE CHECKS:     {metrics.valid_probe_line_count}/{payload.line_count}",
-        f"HIGH-BIT TX/RX:  {metrics.high_bit_bytes_sent}/{metrics.high_bit_bytes_received}",
-        f"MISSING/EXTRA:   {metrics.missing_bytes}/{metrics.extra_bytes}",
-        f"READ/POST/PRESS: {diagnosis.bytes_received_at_write_done}/"
-        f"{diagnosis.bytes_delivered_after_write_done}/{diagnosis.write_pressure_bytes}",
-        f"PURGE:           {result.purge.bytes_drained} BYTES, {result.purge.reason.upper()}",
-        f"ELAPSED:         {format_duration(result.elapsed_sec)}",
-    ]
-    lines.extend(wrapped_value_lines("WHAT TO FIX:     ", diagnosis.operator_note, REPORT_WIDTH))
-    if trial and not memory_test_result_expected(result):
-        lines.extend(
-            [
-                f"PREVIEW ASCII:   {trial.received_preview_ascii}",
-                f"PREVIEW HEX:     {trial.received_preview_hex}",
-            ]
-        )
-    lines.append(border_line(REPORT_WIDTH))
-    with open_session_text_report(path) as report_file:
-        report_file.write("\n".join(lines) + "\n")
-
-
-def print_memory_test_report(result: MemoryTestResult, report_path: Path) -> None:
-    """Print the terminal summary for a memory test."""
-    candidate = result.candidate
-    payload = result.payload
-    metrics = candidate.metrics
-    diagnosis = memory_test_diagnosis(result)
-    status = memory_test_loop_status(diagnosis)
-    expected_text = "YES" if memory_test_result_expected(result) else "CHECK"
-    peak_estimate = estimated_memory_test_peak_fill_bytes(
-        result.config.input_baud,
-        result.config.output_baud,
-        result.config.payload_bytes,
-    )
-    mode_label = memory_test_mode_label(
-        result.config.mode,
-        result.config.target_bytes,
-    )
-    print()
-    print_report_title("MEMORY LOOP")
-    print(f"  LOOP:       {result.loop_index}/{result.loop_total}")
-    print(f"  STATUS:     {status}  EXPECTED: {expected_text}")
-    print(f"  RESULT:     {diagnosis.result}")
-    print_wrapped_value("  FINDING:    ", diagnosis.finding)
-    print(f"  DATA:       {diagnosis.data_check}")
-    print(f"  CAPACITY:   {diagnosis.capacity_check}")
-    print(f"  RAM:        {diagnosis.ram_check}")
-    print(f"  TARGET:     {byte_size_label(result.config.target_bytes)}  MODE: {mode_label}")
-    print(f"  SENT/READ:  {candidate.bytes_sent}/{candidate.bytes_received}")
-    print(
-        f"  MATCH:      {diagnosis.content_integrity_ratio:.3f}  "
-        f"COMPLETE: {diagnosis.completeness_ratio:.3f}"
-    )
-    print(f"  MISS/EXTRA: {metrics.missing_bytes}/{metrics.extra_bytes}")
-    if metrics.high_bit_bytes_sent or metrics.high_bit_bytes_received:
-        print(
-            f"  HIGH-BIT:   SENT={metrics.high_bit_bytes_sent} "
-            f"READ={metrics.high_bit_bytes_received}"
-        )
-    print(f"  PEAK EST.:  {peak_estimate} BYTES")
-    print(f"  PURGE:      {result.purge.bytes_drained} BYTES, {result.purge.reason.upper()}")
-    print(f"  ELAPSED:    {format_duration(result.elapsed_sec)}")
-    print_wrapped_value("  FIX:        ", diagnosis.operator_note)
-    print_wrapped_value("  REPORT:     ", f"{report_path} (CURRENT SESSION)")
-    print(border_line(REPORT_WIDTH))
-
-
-def memory_test_summary_status(
-    config: MemoryTestConfig,
-    results: Sequence[MemoryTestResult],
-    stopped_on_unexpected: bool,
-) -> str:
-    """Return the final operator status for a memory-test loop run."""
-    if not results:
-        return "CHECK"
-    all_expected = all(memory_test_result_expected(result) for result in results)
-    if all_expected and len(results) == config.loop_count:
-        return "OK"
-    if stopped_on_unexpected:
-        return "STOPPED"
-    return "CHECK"
-
-
-def memory_test_summary_counts(results: Sequence[MemoryTestResult]) -> dict[str, int]:
-    """Return counts by terse memory-test loop status."""
-    counts = {
-        status: 0
-        for status in (
-            "OK",
-            "FULL",
-            "SHORT",
-            "CHANGED",
-            "FRAME",
-            "STALE",
-            "ERROR",
-            "CHECK",
-        )
-    }
-    for result in results:
-        status = memory_test_loop_status(memory_test_diagnosis(result))
-        counts[status] = counts.get(status, 0) + 1
-    return counts
-
-
-def memory_test_summary_verdict(
-    config: MemoryTestConfig,
-    results: Sequence[MemoryTestResult],
-    stopped_on_unexpected: bool,
-) -> tuple[str, str]:
-    """Return a human-facing verdict and next action for the memory summary."""
-    counts = memory_test_summary_counts(results)
-    target_label = byte_size_label(config.target_bytes)
-    completed = len(results) == config.loop_count
-    all_expected = bool(results) and all(
-        memory_test_result_expected(result) for result in results
-    )
-    stop_note = (
-        " SET STOP EARLY TO NO IF YOU WANT EVERY REQUESTED LOOP RECORDED."
-        if stopped_on_unexpected
-        else ""
-    )
-    if not results:
-        return (
-            "NO MEMORY LOOP RESULT WAS RECORDED.",
-            "RERUN THE MEMORY TEST AFTER CHECKING PORT ACCESS.",
-        )
-    if counts["FRAME"]:
-        return (
-            (
-                "NOT A MEMORY VERDICT. NOTHING IS PROVEN BROKEN YET; THE "
-                "SERIAL SETUP MUST MATCH BEFORE RAM CAN BE JUDGED."
-            ),
-            (
-                "FIX SERIAL SETUP FIRST: RUN KNOWN-BAUD DEVICE TEST AT INPUT "
-                f"{config.input_baud} / OUTPUT {config.output_baud}, OR SET "
-                "THE BUFFER INPUT AND OUTPUT TO 8E1. THEN REPEAT THE "
-                f"{target_label} MEMORY TEST."
-                f"{stop_note}"
-            ),
-        )
-    if counts["ERROR"]:
-        return (
-            "NOT A MEMORY VERDICT. THE PC DID NOT COMPLETE A CLEAN SERIAL SEND/READ.",
-            f"CHECK PORTS, CABLES, AND ACCESS, THEN RERUN.{stop_note}",
-        )
-    if counts["STALE"]:
-        return (
-            "NOT A MEMORY VERDICT. EXTRA OR OLD OUTPUT MIXED INTO THE TEST.",
-            f"CLEAR OR RESET THE BUFFER OUTPUT, THEN RERUN.{stop_note}",
-        )
-    if all_expected and completed:
-        if counts["FULL"]:
-            return (
-                (
-                    f"{target_label} FILL BEHAVIOR LOOKS OK. RETURNED BYTES "
-                    "STAYED IN ORDER AND THE BUFFER REACHED CLEAN FULL/OVERFLOW."
-                ),
-                (
-                    "FOR A STRICT NO-OVERFLOW RAM CHECK, RERUN CUSTOM SIZE JUST "
-                    "BELOW THE FULL POINT."
-                ),
-            )
-        return (
-            (
-                f"{target_label} MEMORY PATH LOOKS OK. EVERY LOOP RETURNED THE "
-                "EXACT ASCII STREAM."
-            ),
-            "NO MEMORY ACTION NEEDED FROM THIS TEST.",
-        )
-    if counts["FULL"]:
-        return (
-            (
-                f"CLEAN FULL WAS OBSERVED AT {target_label}, BUT THE RUN POLICY "
-                "DID NOT COUNT CLEAN FULL AS A PASS."
-            ),
-            (
-                "RETURNED BYTES WERE CLEAN UP TO FULL; USE CUSTOM SIZE BELOW THE "
-                "FULL POINT FOR AN EXACT NO-OVERFLOW RAM CHECK."
-            ),
-        )
-    if counts["CHANGED"]:
-        return (
-            (
-                "MEMORY OR DATA PATH IS SUSPECT IF THIS REPEATS. RETURNED BYTES "
-                "CHANGED INSTEAD OF ONLY ENDING EARLY."
-            ),
-            "REPEAT THE SAME SIZE; REPEATED CHANGES AT THE SAME OFFSET POINT TO RAM.",
-        )
-    if counts["SHORT"]:
-        return (
-            "RETURNED BYTES WERE CLEAN, BUT THE STREAM ENDED EARLY.",
-            "TRY A SMALLER CUSTOM SIZE OR RERUN TO SEE WHETHER THE END POINT REPEATS.",
-        )
-    if counts["CHECK"]:
-        return (
-            "THE MEMORY RESULT NEEDS REVIEW BEFORE CALLING THE BUFFER GOOD.",
-            f"RERUN OR BRACKET WITH CUSTOM SIZE.{stop_note}",
-        )
-    if not completed:
-        return (
-            "THE REQUESTED LOOP COUNT DID NOT COMPLETE.",
-            f"RERUN WITH STOP EARLY SET TO NO TO COLLECT ALL LOOPS.{stop_note}",
-        )
-    return (
-        "THE MEMORY RESULT IS INCONCLUSIVE.",
-        "RERUN WITH A SMALLER CUSTOM SIZE AND VERIFY THE SERIAL SETTINGS.",
-    )
-
-
-def write_memory_test_summary_report(
-    path: Path,
-    config: MemoryTestConfig,
-    results: Sequence[MemoryTestResult],
-    total_elapsed: float,
-    stopped_on_unexpected: bool,
-) -> None:
-    """Write the compact memory-test loop summary to the text report."""
-    counts = memory_test_summary_counts(results)
-    mode_label = memory_test_mode_label(config.mode, config.target_bytes)
-    final_status = memory_test_summary_status(config, results, stopped_on_unexpected)
-    verdict, next_step = memory_test_summary_verdict(
-        config,
-        results,
-        stopped_on_unexpected,
-    )
-    lines = [
-        border_line(REPORT_WIDTH),
-        bordered_text("SERIAL PROBE MEMORY SUMMARY", REPORT_WIDTH),
-        border_line(REPORT_WIDTH),
-        f"RUN ID:          {config.run_id}",
-        f"FINAL:           {final_status}",
-        f"TARGET:          {byte_size_detail(config.target_bytes)}",
-        f"MODE:            {mode_label}",
-        f"LOOPS:           {len(results)}/{config.loop_count}",
-        (
-            "POLICY:          CLEAN FULL PASS="
-            f"{memory_test_clean_full_policy_text(config.mode, config.payload_bytes, config.target_bytes, config.accept_full_result)} "
-            f"STOP EARLY={yes_no_text(config.stop_on_unexpected)}"
-        ),
-        f"OK/FULL:         {counts['OK']}/{counts['FULL']}",
-        f"SHORT/CHANGED:   {counts['SHORT']}/{counts['CHANGED']}",
-        f"FRAME/CHECK:     {counts['FRAME']}/{counts['CHECK']}",
-        f"STALE/ERROR:     {counts['STALE']}/{counts['ERROR']}",
-        f"TOTAL ELAPSED:   {format_duration(total_elapsed)}",
-    ]
-    lines.extend(wrapped_value_lines("VERDICT:         ", verdict, REPORT_WIDTH))
-    lines.extend(wrapped_value_lines("NEXT:            ", next_step, REPORT_WIDTH))
-    lines.append(border_line(REPORT_WIDTH))
-    with open_session_text_report(path) as report_file:
-        report_file.write("\n".join(lines) + "\n")
-
-
-def print_memory_test_summary(
-    config: MemoryTestConfig,
-    results: Sequence[MemoryTestResult],
-    report_path: Path,
-    total_elapsed: float,
-    stopped_on_unexpected: bool,
-) -> None:
-    """Print the compact terminal summary for a memory-test loop run."""
-    counts = memory_test_summary_counts(results)
-    final_status = memory_test_summary_status(config, results, stopped_on_unexpected)
-    verdict, next_step = memory_test_summary_verdict(
-        config,
-        results,
-        stopped_on_unexpected,
-    )
-    print()
-    print_report_title("MEMORY SUMMARY")
-    print(f"  FINAL:      {final_status}")
-    print(f"  LOOPS:      {len(results)}/{config.loop_count}")
-    print(f"  OK/FULL:    {counts['OK']}/{counts['FULL']}")
-    print(f"  SHORT/CHG:  {counts['SHORT']}/{counts['CHANGED']}")
-    print(f"  FRAME/CHK:  {counts['FRAME']}/{counts['CHECK']}")
-    print(f"  STALE/ERR:  {counts['STALE']}/{counts['ERROR']}")
-    print(f"  TOTAL:      {format_duration(total_elapsed)}")
-    print_wrapped_value("  VERDICT:   ", verdict)
-    print_wrapped_value("  NEXT:      ", next_step)
-    print_wrapped_value("  REPORT:     ", f"{report_path} (CURRENT SESSION)")
-    print(border_line(REPORT_WIDTH))
-
-
-def run_memory_test(options: ScanOptions) -> int:
-    """Run the fixed 8E1 DSR/DTR memory test from the main menu."""
-    validate_options(options)
-    config = prompt_memory_test_config(options)
-    if config is None:
-        raise ReturnToMainMenu()
-
-    logger = setup_logging(options.log_file)
-    serial_module = import_pyserial()
-    settings = memory_test_settings(config.input_baud, config.output_baud)
-    transfer_estimate = max(
-        estimated_transmit_seconds(settings.input_settings, config.payload_bytes),
-        estimated_receive_seconds(settings.output_settings, config.payload_bytes),
-    ) + MEMORY_TEST_READ_QUIET_SECONDS
-    total_estimate = transfer_estimate * config.loop_count
-
-    print()
-    print_report_title("MEMORY TEST START")
-    print("FIXED FRAME: INPUT 8E1, OUTPUT 8E1, FLOW=DSR/DTR.")
-    print(
-        f"MODE: {memory_test_mode_label(config.mode, config.target_bytes)}; "
-        f"TARGET={byte_size_label(config.target_bytes)}; "
-        f"PAYLOAD={config.payload_bytes} BYTES."
-    )
-    print(
-        f"LOOPS: {config.loop_count}; "
-        "CLEAN FULL PASS: "
-        f"{memory_test_clean_full_policy_text(config.mode, config.payload_bytes, config.target_bytes, config.accept_full_result)}."
-    )
-    print(f"STOP EARLY: {yes_no_text(config.stop_on_unexpected)}.")
-    if config.accept_full_result:
-        print("CLEAN FULL PASS APPLIES ONLY TO STATUS FULL.")
-        print("FRAME, CHECK, STALE, OR ERROR STILL NEED REVIEW.")
-    print_wrapped_value(
-        "PORTS: ",
-        f"{options.in_port} -> BUFFER -> {options.out_port}.",
-    )
-    print(f"INPUT: {settings.input_settings.label()}.")
-    print(f"OUTPUT: {settings.output_settings.label()}.")
-    print_wrapped_value(
-        "TIME: ",
-        (
-            f"EACH {format_duration(transfer_estimate)}; "
-            f"TOTAL {format_duration(total_estimate)}; "
-            f"FINISH ABOUT {format_finish_clock(total_estimate)}."
-        ),
-    )
-    print_wrapped_value(
-        "REPORT: ",
-        "EXACT STREAM, DATA CHECK, CAPACITY CHECK, AND RAM CHECK.",
-    )
-    if config.mode == MEMORY_TEST_MODE_FILL:
-        print("FILL MODE MAY REPORT CLEAN FULL WHEN EXCESS BYTES ARE DROPPED.")
-    print_progress_legend()
-    print(border_line(REPORT_WIDTH))
-
-    total_started = time.monotonic()
-    results: list[MemoryTestResult] = []
-    stopped_on_unexpected = False
-    for loop_index in range(1, config.loop_count + 1):
-        nonce = ProbeNonce(
-            run_id=config.run_id,
-            candidate_id="MEMORY",
-            trial_id=f"L{loop_index:03d}",
-            switch_note_hash=switch_note_hash(config.switch_note),
-        )
-        payload = generate_probe_payload(
-            config.payload_bytes,
-            PAYLOAD_MODE_ASCII,
-            nonce,
-        )
-        memory_options = dataclasses.replace(
-            options,
-            switch_note=config.switch_note,
-            payload_bytes=payload.byte_count,
-            read_timeout=max(options.read_timeout, MEMORY_TEST_READ_QUIET_SECONDS),
-            bursts=1,
-            no_pre_drain=False,
-            pre_drain_timeout=max(
-                options.pre_drain_timeout,
-                MEMORY_TEST_PRE_DRAIN_TIMEOUT,
-            ),
-            pre_drain_quiet=max(options.pre_drain_quiet, BUFFER_PURGE_QUIET_SECONDS),
-            max_drain_bytes=max(
-                options.max_drain_bytes,
-                payload.byte_count + config.target_bytes,
-            ),
-            turbo_discovery_enabled=False,
-            ask_on_top_match=False,
-            auto_validate_top_matches=False,
-            run_id=config.run_id,
-        )
-
-        print()
-        print_report_title(f"MEMORY LOOP {loop_index}/{config.loop_count}")
-        started = time.monotonic()
-        started_at = dt.datetime.now(dt.timezone.utc).isoformat()
-        purge_max_seconds = max(
-            estimated_buffer_drain_seconds(settings.output_settings, config.target_bytes),
-            MEMORY_TEST_PRE_DRAIN_TIMEOUT,
-        )
-        purge = run_known_baud_purge(
-            serial_module=serial_module,
-            options=memory_options,
-            logger=logger,
-            settings=settings.output_settings,
-            max_seconds=purge_max_seconds,
-            reason="CLEAR OUTPUT BEFORE MEMORY TEST.",
-            capacity_bytes=config.target_bytes,
-        )
-        if not purge.quiet:
-            print()
-            print_report_title("MEMORY PURGE WARNING")
-            print("OUTPUT DID NOT REPORT QUIET BEFORE THE TEST.")
-            print("RESULT MAY BE MARKED STALE OR CHECK SETTINGS.")
-            if purge.error:
-                print_wrapped_value("  DETAIL: ", purge.error)
-            print(border_line(REPORT_WIDTH))
-
-        candidate = run_dual_candidate(
-            serial_module=serial_module,
-            index=loop_index,
-            total=config.loop_count,
-            settings=settings,
-            options=memory_options,
-            payload=payload,
-            logger=logger,
-            progress=console_progress,
-        )
-        elapsed = time.monotonic() - started
-        completed_at = dt.datetime.now(dt.timezone.utc).isoformat()
-        result = MemoryTestResult(
-            config=config,
-            settings=settings,
-            payload=payload,
-            purge=purge,
-            candidate=candidate,
-            loop_index=loop_index,
-            loop_total=config.loop_count,
-            started_at=started_at,
-            completed_at=completed_at,
-            elapsed_sec=elapsed,
-        )
-        results.append(result)
-        write_memory_test_text_report(options.text_report, result)
-        print_memory_test_report(result, options.text_report)
-        if config.stop_on_unexpected and not memory_test_result_expected(result):
-            loop_status = memory_test_loop_status(memory_test_diagnosis(result))
-            stopped_on_unexpected = True
-            if config.accept_full_result and loop_status != "FULL":
-                print("CLEAN FULL PASS APPLIES ONLY TO STATUS FULL.")
-            if loop_status == "FRAME":
-                print("STOPPING: LOOP RESULT NEEDS SERIAL FRAME CHECK.")
-            else:
-                print("STOPPING: LOOP RESULT NEEDS CHECK.")
-            break
-
-    total_elapsed = time.monotonic() - total_started
-    write_memory_test_summary_report(
-        options.text_report,
-        config,
-        results,
-        total_elapsed,
-        stopped_on_unexpected,
-    )
-    print_memory_test_summary(
-        config,
-        results,
-        options.text_report,
-        total_elapsed,
-        stopped_on_unexpected,
-    )
-    return (
-        0
-        if memory_test_summary_status(config, results, stopped_on_unexpected) == "OK"
-        else 1
-    )
-
 
 def print_commands() -> None:
     """Print the main command menu."""
@@ -9548,8 +8179,8 @@ def print_commands() -> None:
     print(border_line(SCREEN_WIDTH))
     menu_line("  1  START SCAN", "  2  SET COM PORTS / BAUD")
     menu_line("  3  SCAN / VALIDATE SETUP", "  4  TIMING / PER-TEST STALE")
-    menu_line("  5  MEMORY TEST", "  6  CURRENT SETTINGS")
-    menu_line("  7  HELP", "  0  QUIT")
+    menu_line("  5  CURRENT SETTINGS", "  6  HELP")
+    menu_line("  0  QUIT")
     print(border_line(SCREEN_WIDTH))
 
 
@@ -9560,7 +8191,7 @@ def interactive_menu(options: ScanOptions | None = None) -> MenuSelection | None
     while prompt_loop_active():
         print_commands()
         try:
-            choice = read_operator_input("COMMAND (0-7): ").lstrip("\ufeff").strip()
+            choice = read_operator_input("COMMAND (0-6): ").lstrip("\ufeff").strip()
         except EOFError:
             return None
 
@@ -9580,7 +8211,7 @@ def interactive_menu(options: ScanOptions | None = None) -> MenuSelection | None
             try:
                 validate_options(scan_options)
             except ValueError as exc:
-                print(f"SETTINGS ERROR: {exc}")
+                print(f"SETTINGS ERROR: {terminal_text(exc)}")
                 continue
             options = scan_options
             return MenuSelection("scan", options, workflow)
@@ -9591,20 +8222,13 @@ def interactive_menu(options: ScanOptions | None = None) -> MenuSelection | None
         elif choice == "4":
             options = configure_timing(options)
         elif choice == "5":
-            try:
-                validate_options(options)
-            except ValueError as exc:
-                print(f"SETTINGS ERROR: {exc}")
-                continue
-            return MenuSelection("memory", options)
-        elif choice == "6":
             print_configuration(options)
-        elif choice == "7":
+        elif choice == "6":
             print_menu_help()
         elif choice == "0":
             return None
         else:
-            print("ENTER A NUMBER FROM 0 THROUGH 7.")
+            print("ENTER A NUMBER FROM 0 THROUGH 6.")
     return None
 
 
@@ -10478,256 +9102,6 @@ def run_self_tests() -> int:
     validate_supported_baud(9600)
     validate_supported_baud(2400)
     expect_value_error(lambda: validate_supported_baud(12345), "unsupported baud accepted")
-    memory_settings = memory_test_settings(38400, 9600)
-    assert memory_settings.input_settings == SerialSettings(
-        38400,
-        8,
-        "even",
-        1,
-        "dsr/dtr",
-    ), "memory-test input frame must be fixed 8E1 DSR/DTR"
-    assert memory_settings.output_settings == SerialSettings(
-        9600,
-        8,
-        "even",
-        1,
-        "dsr/dtr",
-    ), "memory-test output frame must be fixed 8E1 DSR/DTR"
-    assert (
-        memory_test_fill_payload_bytes(38400, 38400) == MEMORY_TEST_TARGET_BYTES
-    ), "same-baud memory fill should not inflate payload"
-    assert (
-        memory_test_fill_payload_bytes(38400, 19200) == MEMORY_TEST_TARGET_BYTES * 2
-    ), "2:1 baud memory fill should send double target"
-    fill_payload = memory_test_fill_payload_bytes(38400, 9600)
-    assert (
-        fill_payload > MEMORY_TEST_TARGET_BYTES
-    ), "fill mode should exceed target when output drains"
-    assert (
-        estimated_memory_test_peak_fill_bytes(38400, 9600, fill_payload)
-        >= MEMORY_TEST_TARGET_BYTES - 1
-    ), "fill mode should estimate a near-target peak"
-    assert byte_size_label(MEMORY_TEST_TARGET_BYTES) == "64K", "default target label changed"
-    assert (
-        parse_memory_test_target_choice("") == MEMORY_TEST_TARGET_BYTES
-    ), "blank memory target should default to 64K"
-    assert (
-        parse_memory_test_target_choice("1") == 16 * KIB_BYTES
-    ), "first memory target preset should be 16K"
-    assert (
-        parse_memory_test_target_choice("64k") == 64 * KIB_BYTES
-    ), "64K memory target alias was not accepted"
-    assert (
-        parse_memory_test_target_choice("5") == "custom"
-    ), "memory target custom menu choice was not accepted"
-    assert (
-        parse_memory_test_mode_choice("", True) == MEMORY_TEST_MODE_FILL
-    ), "blank memory mode should default to fill when available"
-    assert (
-        parse_memory_test_mode_choice("", False) == MEMORY_TEST_MODE_IMAGE
-    ), "blank memory mode should default to image when fill is unavailable"
-    assert (
-        parse_memory_test_mode_choice("3", False) == MEMORY_TEST_MODE_CUSTOM
-    ), "custom memory mode should be available without fill"
-    assert (
-        parse_memory_test_mode_choice("2", False) is None
-    ), "fill mode should be invalid when input baud is not faster"
-    memory_payload = generate_payload(MEMORY_TEST_TARGET_BYTES, nonce_a)
-    memory_candidate = fake_clean_candidate_result(memory_settings, memory_payload)
-    assert memory_test_passed(
-        memory_candidate,
-        memory_payload,
-    ), "exact memory-test candidate did not pass"
-    assert (
-        memory_candidate.metrics.exact_prefix_bytes == memory_payload.byte_count
-    ), "exact memory-test prefix metric was not complete"
-    missing_memory = dataclasses.replace(
-        memory_candidate,
-        bytes_received=memory_payload.byte_count - 1,
-        score=99.0,
-        status="partial",
-        metrics=score_received(memory_payload.data, memory_payload.data[:-1]).metrics,
-    )
-    assert not memory_test_passed(
-        missing_memory,
-        memory_payload,
-    ), "missing memory-test byte incorrectly passed"
-    assert (
-        "MISSING" in memory_test_reason(missing_memory, memory_payload)
-    ), "missing memory-test byte reason was not clear"
-    frame_payload = generate_payload(1024, nonce_a)
-    frame_received = bytes(byte | 0x80 for byte in frame_payload.data[:768])
-    frame_score = score_received(frame_payload.data, frame_received)
-    frame_trial = TrialResult(
-        burst_index=1,
-        bytes_sent=frame_payload.byte_count,
-        bytes_received=len(frame_received),
-        bytes_drained_before=0,
-        drain_status="quiet",
-        score=frame_score.score,
-        metrics=frame_score.metrics,
-        status="weak",
-        error=None,
-        elapsed_sec=0.0,
-        timing=zero_timing_breakdown(),
-        received_preview_ascii="",
-        received_preview_hex="",
-        score_classification=frame_score.classification,
-        evidence=frame_score.evidence,
-        nonce_summary=nonce_a.compact(),
-        payload_mode=frame_payload.payload_mode,
-        bytes_received_at_write_done=100,
-    )
-    frame_candidate = aggregate_candidate_result(
-        index=1,
-        total=1,
-        settings=memory_test_settings(38400, 19200),
-        trials=[frame_trial],
-        elapsed_sec=0.0,
-    )
-    frame_result = MemoryTestResult(
-        config=MemoryTestConfig(
-            in_port="COM1",
-            out_port="COM5",
-            input_baud=38400,
-            output_baud=19200,
-            mode=MEMORY_TEST_MODE_FILL,
-            payload_bytes=frame_payload.byte_count,
-            target_bytes=512,
-            loop_count=1,
-            accept_full_result=True,
-            stop_on_unexpected=True,
-            switch_note="",
-            run_id=nonce_a.run_id,
-        ),
-        settings=memory_test_settings(38400, 19200),
-        payload=frame_payload,
-        purge=DrainResult(0, 0.0, True, "quiet", None),
-        candidate=frame_candidate,
-        loop_index=1,
-        loop_total=1,
-        started_at="",
-        completed_at="",
-        elapsed_sec=0.0,
-    )
-    frame_diagnosis = memory_test_diagnosis(frame_result)
-    assert (
-        frame_diagnosis.code == "probable-frame-mismatch"
-    ), "high-bit ASCII memory output should be treated as a serial frame issue"
-    assert (
-        memory_test_loop_status(frame_diagnosis) == "FRAME"
-    ), "frame-like memory output should use FRAME loop status"
-    assert (
-        frame_diagnosis.ram_check == "NOT JUDGED - NOT PROVEN BAD"
-    ), "frame-like memory output should not imply RAM trouble"
-    assert (
-        "NOT PROVEN BROKEN" in frame_diagnosis.finding
-    ), "frame-like memory output should not imply broken hardware"
-    assert (
-        "FIX SERIAL SETUP FIRST" in frame_diagnosis.operator_note
-    ), "frame-like memory output should tell the operator what to fix"
-    frame_verdict, frame_next = memory_test_summary_verdict(
-        frame_result.config,
-        [frame_result],
-        stopped_on_unexpected=True,
-    )
-    assert (
-        "NOT A MEMORY VERDICT" in frame_verdict
-    ), "frame summary should avoid a RAM verdict"
-    assert (
-        "NOTHING IS PROVEN BROKEN YET" in frame_verdict
-    ), "frame summary should not imply failed memory"
-    assert (
-        "FIX SERIAL SETUP FIRST" in frame_next
-    ), "frame summary should name the next fix"
-    assert (
-        "STOP EARLY TO NO" in frame_next
-    ), "stopped memory summary should explain loop policy"
-    overflow_target = 16 * KIB_BYTES
-    overflow_payload = generate_payload(overflow_target * 2, nonce_a)
-    overflow_received = overflow_payload.data[:26945]
-    overflow_score = score_received(overflow_payload.data, overflow_received)
-    overflow_trial = TrialResult(
-        burst_index=1,
-        bytes_sent=overflow_payload.byte_count,
-        bytes_received=len(overflow_received),
-        bytes_drained_before=0,
-        drain_status="quiet",
-        score=overflow_score.score,
-        metrics=overflow_score.metrics,
-        status="partial",
-        error=None,
-        elapsed_sec=0.0,
-        timing=zero_timing_breakdown(),
-        received_preview_ascii="",
-        received_preview_hex="",
-        score_classification=overflow_score.classification,
-        evidence=overflow_score.evidence,
-        nonce_summary=nonce_a.compact(),
-        payload_mode=overflow_payload.payload_mode,
-        bytes_received_at_write_done=10527,
-    )
-    overflow_candidate = aggregate_candidate_result(
-        index=1,
-        total=1,
-        settings=memory_test_settings(19200, 9600),
-        trials=[overflow_trial],
-        elapsed_sec=0.0,
-    )
-    overflow_result = MemoryTestResult(
-        config=MemoryTestConfig(
-            in_port="COM1",
-            out_port="COM5",
-            input_baud=19200,
-            output_baud=9600,
-            mode=MEMORY_TEST_MODE_FILL,
-            payload_bytes=overflow_payload.byte_count,
-            target_bytes=overflow_target,
-            loop_count=1,
-            accept_full_result=True,
-            stop_on_unexpected=True,
-            switch_note="",
-            run_id=nonce_a.run_id,
-        ),
-        settings=memory_test_settings(19200, 9600),
-        payload=overflow_payload,
-        purge=DrainResult(0, 0.0, True, "quiet", None),
-        candidate=overflow_candidate,
-        loop_index=1,
-        loop_total=1,
-        started_at="",
-        completed_at="",
-        elapsed_sec=0.0,
-    )
-    overflow_diagnosis = memory_test_diagnosis(overflow_result)
-    assert (
-        overflow_diagnosis.code == "probable-overflow-clean"
-    ), "beginning-matched incomplete memory test was not classified as probable overflow"
-    assert (
-        overflow_diagnosis.result == "BUFFER FULL OBSERVED"
-    ), "probable overflow should not present as a generic check"
-    assert (
-        memory_test_loop_status(overflow_diagnosis) == "FULL"
-    ), "probable overflow should use FULL loop status"
-    assert memory_test_result_expected(overflow_result), "accepted full result was not expected"
-    assert "16K" in overflow_diagnosis.finding, "overflow finding should name target size"
-    assert (
-        overflow_diagnosis.ram_check == "NO ERROR SEEN"
-    ), "clean overflow should not imply bad RAM"
-    assert (
-        overflow_diagnosis.bytes_delivered_after_write_done == 16418
-    ), "post-write delivered byte count did not preserve observed fill estimate"
-    overflow_verdict, overflow_next = memory_test_summary_verdict(
-        overflow_result.config,
-        [overflow_result],
-        stopped_on_unexpected=False,
-    )
-    assert (
-        "16K FILL BEHAVIOR LOOKS OK" in overflow_verdict
-    ), "clean overflow summary should read as a useful fill result"
-    assert (
-        "CUSTOM SIZE" in overflow_next
-    ), "clean overflow summary should suggest a custom no-overflow check"
     validate_report_path(Path("serial_probe_report.txt"))
     expect_value_error(lambda: validate_report_path(Path(".")), "directory report path accepted")
     expect_value_error(
@@ -11042,17 +9416,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("PROGRAM ENDED." if scan_started else "NO SCAN STARTED.")
             return last_status
         options = selection.options
-        run_again_label = (
-            "RUN MEMORY TEST AGAIN"
-            if selection.action == "memory"
-            else "START SCAN AGAIN"
-        )
+        run_again_label = "START SCAN AGAIN"
         while True:
             try:
-                if selection.action == "memory":
-                    last_status = run_memory_test(options)
-                else:
-                    last_status = run_scan(options, selection.workflow)
+                last_status = run_scan(options, selection.workflow)
                 scan_started = True
                 action = prompt_after_scan_action(
                     run_again_label=run_again_label,

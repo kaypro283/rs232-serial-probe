@@ -138,10 +138,10 @@ def test_main_menu_uses_numbered_options_only(
 
     output = capsys.readouterr().out
 
-    assert "  5  MEMORY TEST" in output
-    assert "  6  CURRENT SETTINGS" in output
-    assert "  7  HELP" in output
+    assert "  5  CURRENT SETTINGS" in output
+    assert "  6  HELP" in output
     assert "  0  QUIT" in output
+    assert "MEMORY TEST" not in output
     assert "SET REPORT FILES" not in output
     assert "RESET REPORT FILES" not in output
     assert "S  CURRENT SETTINGS" not in output
@@ -158,7 +158,7 @@ def test_main_menu_rejects_letter_shortcuts(
     output = capsys.readouterr().out
 
     assert selection is None
-    assert output.count("ENTER A NUMBER FROM 0 THROUGH 7.") == 2
+    assert output.count("ENTER A NUMBER FROM 0 THROUGH 6.") == 2
     assert "OPTION 2 PORTS" not in output
 
 
@@ -363,211 +363,6 @@ def test_start_scan_bank2_uses_configured_bauds_without_range_prompt(
     assert selection.options.max_baud == 9600
 
 
-def test_memory_test_bauds_use_configured_port_bauds() -> None:
-    options = dataclasses.replace(
-        serial_probe.default_scan_options(),
-        input_baud=38400,
-        output_baud=9600,
-        min_baud=300,
-        max_baud=1200,
-    )
-
-    assert serial_probe.default_memory_test_bauds(options) == (38400, 9600)
-
-
-def test_memory_test_defaults_to_8e1_dsr_dtr() -> None:
-    settings = serial_probe.memory_test_settings(38400, 9600)
-
-    assert settings.input_settings == serial_probe.SerialSettings(
-        38400,
-        8,
-        "even",
-        1,
-        "dsr/dtr",
-    )
-    assert settings.output_settings == serial_probe.SerialSettings(
-        9600,
-        8,
-        "even",
-        1,
-        "dsr/dtr",
-    )
-
-
-def test_memory_target_presets_and_64k_defaults() -> None:
-    assert serial_probe.BUFFER_PURGE_CAPACITY_BYTES == 64 * serial_probe.KIB_BYTES
-    assert (
-        serial_probe.DEFAULT_MAX_DRAIN_BYTES
-        >= serial_probe.BUFFER_PURGE_CAPACITY_BYTES * 2
-    )
-    assert serial_probe.MEMORY_TEST_MAX_TARGET_KIB == 64
-    assert serial_probe.parse_memory_test_target_choice("") == 64 * serial_probe.KIB_BYTES
-    assert serial_probe.parse_memory_test_target_choice("1") == 16 * serial_probe.KIB_BYTES
-    assert serial_probe.parse_memory_test_target_choice("64k") == 64 * serial_probe.KIB_BYTES
-    assert serial_probe.parse_memory_test_target_choice("5") == "custom"
-    assert (
-        serial_probe.memory_test_mode_label(
-            serial_probe.MEMORY_TEST_MODE_FILL,
-            32 * serial_probe.KIB_BYTES,
-        )
-        == "FILL 32K"
-    )
-    assert (
-        serial_probe.memory_test_fill_payload_bytes(
-            38400,
-            19200,
-            64 * serial_probe.KIB_BYTES,
-        )
-        == 128 * serial_probe.KIB_BYTES
-    )
-
-
-def test_memory_test_prompts_explain_full_and_default_to_all_loops(
-    monkeypatch: MonkeyPatch,
-    capsys: CaptureFixture[str],
-) -> None:
-    prompts: list[str] = []
-    values = iter(["", "", "2", "", "", "", ""])
-
-    def fake_read(prompt: str) -> str:
-        prompts.append(prompt)
-        return next(values)
-
-    options = dataclasses.replace(
-        serial_probe.default_scan_options(),
-        input_baud=38400,
-        output_baud=19200,
-    )
-    monkeypatch.setattr(serial_probe, "read_operator_input", fake_read)
-    monkeypatch.setattr(serial_probe, "make_run_id", lambda _prefix: "MTEST")
-
-    config = serial_probe.prompt_memory_test_config(options)
-    output = capsys.readouterr().out
-
-    assert config is not None
-    assert config.loop_count == 2
-    assert config.accept_full_result
-    assert not config.stop_on_unexpected
-    assert "CLEAN FULL MEANS RETURNED BYTES STAYED IN ORDER" in output
-    assert "LOOPS RUN ALL REQUESTED PASSES BY DEFAULT" in output
-    assert any("COUNT CLEAN FULL AS PASS [Y]" in prompt for prompt in prompts)
-    assert any("STOP EARLY ON CHECK RESULT [N]" in prompt for prompt in prompts)
-
-
-def test_memory_loop_status_and_summary_use_neutral_terms() -> None:
-    payload = serial_probe.generate_payload(serial_probe.DEFAULT_PAYLOAD_BYTES)
-    settings = serial_probe.memory_test_settings(38400, 9600)
-    config = serial_probe.MemoryTestConfig(
-        in_port="COM1",
-        out_port="COM5",
-        input_baud=38400,
-        output_baud=9600,
-        mode=serial_probe.MEMORY_TEST_MODE_IMAGE,
-        payload_bytes=payload.byte_count,
-        target_bytes=64 * serial_probe.KIB_BYTES,
-        loop_count=1,
-        accept_full_result=False,
-        stop_on_unexpected=True,
-        switch_note="",
-        run_id="MTEST",
-    )
-    result = serial_probe.MemoryTestResult(
-        config=config,
-        settings=settings,
-        payload=payload,
-        purge=serial_probe.DrainResult(0, 0.0, True, "quiet", None),
-        candidate=serial_probe.fake_clean_candidate_result(settings, payload),
-        loop_index=1,
-        loop_total=1,
-        started_at="",
-        completed_at="",
-        elapsed_sec=0.0,
-    )
-
-    diagnosis = serial_probe.memory_test_diagnosis(result)
-
-    assert serial_probe.memory_test_loop_status(diagnosis) == "OK"
-    assert serial_probe.memory_test_result_expected(result)
-    assert serial_probe.memory_test_summary_status(config, [result], False) == "OK"
-
-
-def test_memory_test_high_bit_ascii_output_reports_frame_issue() -> None:
-    nonce = serial_probe.ProbeNonce("RUNTEST", "MEMORY", "L001", None)
-    payload = serial_probe.generate_payload(1024, nonce)
-    received = bytes(byte | 0x80 for byte in payload.data[:768])
-    score = serial_probe.score_received(payload.data, received)
-    trial = serial_probe.TrialResult(
-        burst_index=1,
-        bytes_sent=payload.byte_count,
-        bytes_received=len(received),
-        bytes_drained_before=0,
-        drain_status="quiet",
-        score=score.score,
-        metrics=score.metrics,
-        status="weak",
-        error=None,
-        elapsed_sec=0.0,
-        timing=serial_probe.zero_timing_breakdown(),
-        received_preview_ascii="",
-        received_preview_hex="",
-        score_classification=score.classification,
-        evidence=score.evidence,
-        nonce_summary=nonce.compact(),
-        payload_mode=payload.payload_mode,
-        bytes_received_at_write_done=100,
-    )
-    settings = serial_probe.memory_test_settings(38400, 19200)
-    candidate = serial_probe.aggregate_candidate_result(
-        index=1,
-        total=1,
-        settings=settings,
-        trials=[trial],
-        elapsed_sec=0.0,
-    )
-    result = serial_probe.MemoryTestResult(
-        config=serial_probe.MemoryTestConfig(
-            in_port="COM1",
-            out_port="COM5",
-            input_baud=38400,
-            output_baud=19200,
-            mode=serial_probe.MEMORY_TEST_MODE_FILL,
-            payload_bytes=payload.byte_count,
-            target_bytes=512,
-            loop_count=1,
-            accept_full_result=True,
-            stop_on_unexpected=True,
-            switch_note="",
-            run_id=nonce.run_id,
-        ),
-        settings=settings,
-        payload=payload,
-        purge=serial_probe.DrainResult(0, 0.0, True, "quiet", None),
-        candidate=candidate,
-        loop_index=1,
-        loop_total=1,
-        started_at="",
-        completed_at="",
-        elapsed_sec=0.0,
-    )
-
-    diagnosis = serial_probe.memory_test_diagnosis(result)
-
-    assert diagnosis.code == "probable-frame-mismatch"
-    assert serial_probe.memory_test_loop_status(diagnosis) == "FRAME"
-    assert diagnosis.ram_check == "NOT JUDGED - NOT PROVEN BAD"
-    assert "NOT PROVEN BROKEN" in diagnosis.finding
-    assert "FIX SERIAL SETUP FIRST" in diagnosis.operator_note
-    verdict, next_step = serial_probe.memory_test_summary_verdict(
-        result.config,
-        [result],
-        stopped_on_unexpected=True,
-    )
-    assert "NOT A MEMORY VERDICT" in verdict
-    assert "NOTHING IS PROVEN BROKEN YET" in verdict
-    assert "FIX SERIAL SETUP FIRST" in next_step
-    assert "STOP EARLY TO NO" in next_step
-
-
 def test_bank2_behavior_payload_classes_cover_control_ranges() -> None:
     payloads = dict(serial_probe.bank2_behavior_probe_payloads("KBRUN", 1, None))
 
@@ -674,6 +469,13 @@ def test_bank2_report_columns_are_fixed_width(
     raw_row = next(line for line in lines if line.strip().startswith("CR_ONLY"))
     assert raw_header == serial_probe.bank2_raw_console_header()
     assert raw_row == serial_probe.bank2_raw_console_row(behavior)
+    output = "\n".join(lines)
+    assert "exact" not in output
+    assert "8-bit clean" not in output
+    assert "serial_probe_report.txt" not in output
+    assert "EXACT" in output
+    assert "8-BIT CLEAN; RAW BYTES EXACT" in output
+    assert "SERIAL_PROBE_REPORT.TXT" in output
     assert len(serial_probe.bank2_raw_report_header()) == serial_probe.REPORT_WIDTH
     assert len(serial_probe.bank2_raw_report_row(behavior)) == serial_probe.REPORT_WIDTH
 
@@ -794,6 +596,29 @@ def test_terminal_progress_rows_fit_80_columns() -> None:
         elapsed_sec=0.0,
         metrics=single.metrics,
     )
+    raw_behavior = serial_probe.Bank2BehaviorProbeResult(
+        name="PRINT_CTRL",
+        settings=serial_probe.DualSerialSettings(
+            serial_probe.SerialSettings(38400, 8, "even", 2, "none"),
+            serial_probe.SerialSettings(38400, 8, "none", 1, "none"),
+        ),
+        bytes_sent=185,
+        bytes_received=185,
+        sent_hash="15A3CFE7",
+        received_hash="15A3CFE7",
+        first_mismatch_offset=None,
+        missing_bytes=0,
+        extra_bytes=0,
+        exact_match=True,
+        form_feed_inserted=False,
+        cr_lf_changed=False,
+        received_preview_ascii="",
+        received_preview_hex="",
+        status="exact",
+        reason="EXACT BYTE MATCH.",
+        error=None,
+        elapsed_sec=0.0,
+    )
     eta = serial_probe.format_scan_eta(
         completed=70,
         total=70,
@@ -806,6 +631,7 @@ def test_terminal_progress_rows_fit_80_columns() -> None:
         serial_probe.format_progress(single),
         serial_probe.format_dual_progress(dual),
         serial_probe.format_dual_phase0_progress(phase0, 70, 70),
+        serial_probe.format_bank2_behavior_progress(raw_behavior, 4, 24),
         serial_probe.format_flow_validation_progress(
             serial_probe.FlowControlValidationResult(
                 flow_control="DSR/XON",
@@ -829,6 +655,13 @@ def test_terminal_progress_rows_fit_80_columns() -> None:
     ]
 
     assert all(len(row) <= serial_probe.TERMINAL_COLUMNS for row in rows)
+    raw_row = serial_probe.format_bank2_behavior_progress(
+        raw_behavior,
+        4,
+        24,
+    )
+    assert "SENT=" not in raw_row
+    assert raw_row.endswith("EXACT BYTE MATCH.")
 
 
 def test_flow_validation_reason_wraps_inside_80_columns() -> None:
