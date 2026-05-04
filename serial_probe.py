@@ -3986,6 +3986,129 @@ def print_dual_phase0_summary(report: DualBaudLivenessReport) -> None:
     print(border_line(REPORT_WIDTH))
 
 
+def phase0_pair_list_label(pairs: Sequence[tuple[int, int]]) -> str:
+    """Return compact input/output baud-pair text."""
+    if not pairs:
+        return "(NONE)"
+    return ", ".join(f"IN {input_baud}/OUT {output_baud}" for input_baud, output_baud in pairs)
+
+
+def dual_phase0_result_row(result: DualBaudLivenessResult) -> str:
+    """Return one compact Phase 0 result row for text reports."""
+    live = "Y" if result.alive else "N"
+    prefix = (
+        f"{result.input_baud:>6} "
+        f"{result.output_baud:>6} "
+        f"{live:<4} "
+        f"{result.score:>5.1f} "
+        f"{result.bytes_sent:>5} "
+        f"{result.bytes_received:>5} "
+        f"{result.bytes_drained_before:>5} "
+        f"{result.status[:10]:<10} "
+    )
+    reason_width = max(1, REPORT_WIDTH - len(prefix))
+    return prefix + fit_terminal_line(result.reason, reason_width)
+
+
+def dual_phase0_report_lines(report: DualBaudLivenessReport) -> list[str]:
+    """Return detailed Phase 0 liveness report lines."""
+    input_bauds = sorted({input_baud for input_baud, _ in report.alive_pairs}, reverse=True)
+    output_bauds = sorted({output_baud for _, output_baud in report.alive_pairs}, reverse=True)
+    lines = [
+        "PHASE 0 BAUD LIVENESS:",
+        f"RUN TIME:        {format_duration(report.elapsed_sec)}",
+        f"BAUD PAIRS:      {len(report.tested_pairs)}/{report.total_pairs} TESTED",
+        f"ALIVE PAIRS:     {len(report.alive_pairs)}",
+    ]
+    lines.extend(
+        wrapped_value_lines(
+            "INPUT BAUDS:     ",
+            ", ".join(str(baud) for baud in input_bauds) if input_bauds else "(NONE)",
+            REPORT_WIDTH,
+        )
+    )
+    lines.extend(
+        wrapped_value_lines(
+            "OUTPUT BAUDS:    ",
+            ", ".join(str(baud) for baud in output_bauds) if output_bauds else "(NONE)",
+            REPORT_WIDTH,
+        )
+    )
+    lines.extend(
+        wrapped_value_lines(
+            "SELECTED PAIRS:  ",
+            phase0_pair_list_label(report.selected_pairs),
+            REPORT_WIDTH,
+        )
+    )
+    if report.fallback_reason:
+        lines.extend(
+            wrapped_value_lines(
+                "NOTE:            ",
+                report.fallback_reason,
+                REPORT_WIDTH,
+            )
+        )
+    lines.extend(
+        [
+            "",
+            "INBAUD OUTBAUD LIVE SCORE  SENT  READ   CLR STATUS     REASON",
+            border_line(REPORT_WIDTH),
+        ]
+    )
+    if not report.results:
+        lines.append("(NOT RUN)")
+    for result in report.results:
+        lines.append(dual_phase0_result_row(result))
+    lines.append(border_line(REPORT_WIDTH))
+    return lines
+
+
+def write_phase0_text_report(
+    path: Path,
+    metadata: dict[str, Any],
+    phase0: DualBaudLivenessReport,
+) -> None:
+    """Write a Phase 0 or early-exit report block to the text report."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    created = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    switch_note = str(metadata.get("switch_note") or "").strip()
+    lines = [
+        "",
+        border_line(REPORT_WIDTH),
+        bordered_text("SERIAL PROBE PHASE 0 REPORT", REPORT_WIDTH),
+        border_line(REPORT_WIDTH),
+        f"WRITTEN:         {created}",
+        f"STARTED UTC:     {metadata.get('started_at', '')}",
+        f"COMPLETED UTC:   {metadata.get('completed_at', '')}",
+        f"RUN ID:          {metadata.get('run_id', '')}",
+        f"WORKFLOW:        {metadata.get('workflow', '')}",
+        f"COM PATH:        {metadata.get('in_port')} -> BUFFER -> {metadata.get('out_port')}",
+        f"DEVICE NOTE:     {switch_note if switch_note else '(NOT ENTERED)'}",
+    ]
+    lines.extend(
+        wrapped_value_lines(
+            "OUTCOME:         ",
+            metadata.get("outcome", ""),
+            REPORT_WIDTH,
+        )
+    )
+    lines.extend(["", *dual_phase0_report_lines(phase0)])
+    lines.extend(
+        [
+            "",
+            "INTERPRETATION NOTES:",
+            "  PHASE 0 IS A BAUD-LIVENESS GATE USING FIXED 8E1 FLOW=NONE.",
+            "  ALIVE PAIRS SHOW BASIC CHECKED PROBE STRUCTURE AT THAT BAUD PAIR.",
+            "  A NON-ALIVE ROW DOES NOT PROVE THE BAUD IS IMPOSSIBLE WITH ANOTHER FRAME.",
+            "  FRAME, FLOW, RAW BYTE, ETX/ACK, AND MEMORY TESTS NEED LATER WORKFLOWS.",
+            border_line(REPORT_WIDTH),
+        ]
+    )
+    with open_session_text_report(path) as report_file:
+        report_file.write("\n".join(lines) + "\n")
+
+
 def run_dual_phase0_baud_matrix(
     serial_module: Any,
     options: ScanOptions,
@@ -9602,6 +9725,7 @@ def run_dual_bank_scan(
     phase0_only: bool = False,
 ) -> int:
     """Run a dual-bank scan where input and output settings may differ."""
+    workflow_started_at = dt.datetime.now(dt.timezone.utc).isoformat()
     if not phase0_only:
         turbo_enabled = prompt_yes_no_question(
             "Turbo discovery mode?",
@@ -9631,6 +9755,21 @@ def run_dual_bank_scan(
         print()
         print_report_title("DUAL PHASE 0 COMPLETE")
         print("FULL DUAL-BANK SCAN WAS NOT RUN.")
+        write_phase0_text_report(
+            options.text_report,
+            {
+                "workflow": "PHASE 0 BAUD LIVENESS ONLY",
+                "started_at": workflow_started_at,
+                "completed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "run_id": options.run_id,
+                "in_port": options.in_port,
+                "out_port": options.out_port,
+                "switch_note": options.switch_note,
+                "outcome": "FULL DUAL-BANK SCAN WAS NOT RUN.",
+            },
+            phase0_report,
+        )
+        print_wrapped_value("  TEXT REPORT: ", f"{options.text_report} (CURRENT SESSION)")
         print_wrapped_value("  DEBUG LOG:   ", options.log_file)
         print(border_line(REPORT_WIDTH))
         return 0
@@ -9652,6 +9791,21 @@ def run_dual_bank_scan(
         print("NO BAUD PAIRS WERE SELECTED FOR FRAME TESTING.")
         if phase0_report.fallback_reason:
             print_wrapped_value("  DETAIL:               ", phase0_report.fallback_reason)
+        write_phase0_text_report(
+            options.text_report,
+            {
+                "workflow": "AUTOMATED DISCOVERY",
+                "started_at": workflow_started_at,
+                "completed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "run_id": options.run_id,
+                "in_port": options.in_port,
+                "out_port": options.out_port,
+                "switch_note": options.switch_note,
+                "outcome": "NO BAUD PAIRS WERE SELECTED FOR FRAME TESTING.",
+            },
+            phase0_report,
+        )
+        print_wrapped_value("  TEXT REPORT:          ", f"{options.text_report} (CURRENT SESSION)")
         print(border_line(REPORT_WIDTH))
         return 1
 

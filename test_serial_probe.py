@@ -181,6 +181,70 @@ def test_session_text_report_replaces_prior_session_then_appends(
     assert report_path.read_text(encoding="utf-8") == "FIRST BLOCK\nSECOND BLOCK\n"
 
 
+def test_phase0_text_report_replaces_old_report(tmp_path: Path) -> None:
+    report_path = tmp_path / "serial_probe_report.txt"
+    report_path.write_text("OLD SESSION\n", encoding="utf-8")
+    metrics = serial_probe.score_received(b"abc", b"abc").metrics
+    phase0 = serial_probe.DualBaudLivenessReport(
+        ran=True,
+        tested_pairs=[(38400, 38400)],
+        total_pairs=1,
+        alive_pairs=[(38400, 38400)],
+        selected_pairs=[(38400, 38400)],
+        fallback_reason=None,
+        elapsed_sec=0.25,
+        results=[
+            serial_probe.DualBaudLivenessResult(
+                input_baud=38400,
+                output_baud=38400,
+                alive=True,
+                reason="VALID PHASE 0 PROBE",
+                settings=serial_probe.dual_phase0_settings(38400, 38400),
+                score=100.0,
+                status="exact",
+                error=None,
+                bytes_sent=128,
+                bytes_received=128,
+                bytes_drained_before=0,
+                elapsed_sec=0.25,
+                metrics=metrics,
+            )
+        ],
+    )
+    original_paths = set(serial_probe.SESSION_TEXT_REPORT_PATHS)
+    serial_probe.SESSION_TEXT_REPORT_PATHS.clear()
+    try:
+        serial_probe.write_phase0_text_report(
+            report_path,
+            {
+                "workflow": "PHASE 0 BAUD LIVENESS ONLY",
+                "started_at": "2026-05-04T00:00:00+00:00",
+                "completed_at": "2026-05-04T00:00:01+00:00",
+                "run_id": "DTEST",
+                "in_port": "COM1",
+                "out_port": "COM5",
+                "switch_note": "00000000",
+                "outcome": "FULL DUAL-BANK SCAN WAS NOT RUN.",
+            },
+            phase0,
+        )
+    finally:
+        serial_probe.SESSION_TEXT_REPORT_PATHS.clear()
+        serial_probe.SESSION_TEXT_REPORT_PATHS.update(original_paths)
+
+    output = report_path.read_text(encoding="utf-8")
+
+    assert "OLD SESSION" not in output
+    assert "SERIAL PROBE PHASE 0 REPORT" in output
+    assert "PHASE 0 BAUD LIVENESS" in output
+    assert "INBAUD OUTBAUD" in output
+    assert "38400" in output
+    assert all(
+        len(line) <= serial_probe.REPORT_WIDTH
+        for line in serial_probe.dual_phase0_report_lines(phase0)
+    )
+
+
 def test_session_log_replaces_prior_session_then_appends(tmp_path: Path) -> None:
     log_path = tmp_path / "serial_probe_debug.log"
     log_path.write_text("OLD SESSION\n", encoding="utf-8")
