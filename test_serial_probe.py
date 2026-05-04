@@ -622,6 +622,119 @@ def test_bank2_report_columns_are_fixed_width(
     assert len(serial_probe.bank2_raw_report_row(behavior)) == serial_probe.REPORT_WIDTH
 
 
+def test_bank2_report_summarizes_ambiguous_7_bit_frame(
+    capsys: CaptureFixture[str],
+) -> None:
+    payload = serial_probe.generate_payload(serial_probe.DEFAULT_PAYLOAD_BYTES)
+
+    def settings(
+        input_frame: serial_probe.SerialSettings,
+        output_frame: serial_probe.SerialSettings,
+    ):
+        return serial_probe.DualSerialSettings(input_frame, output_frame)
+
+    def frame(
+        data_bits: int,
+        parity: str,
+        stop_bits: int,
+    ) -> serial_probe.SerialSettings:
+        return serial_probe.SerialSettings(38400, data_bits, parity, stop_bits, "none")
+
+    def clean_result(
+        index: int,
+        input_frame: serial_probe.SerialSettings,
+        output_frame: serial_probe.SerialSettings,
+    ) -> serial_probe.CandidateResult:
+        return dataclasses.replace(
+            serial_probe.fake_clean_candidate_result(
+                settings(input_frame, output_frame),
+                payload,
+            ),
+            index=index,
+            total=4,
+        )
+
+    seven_even_one = frame(7, "even", 1)
+    ascii_results = [
+        clean_result(1, seven_even_one, seven_even_one),
+        clean_result(2, seven_even_one, frame(7, "odd", 1)),
+        clean_result(3, seven_even_one, frame(7, "none", 1)),
+        clean_result(4, seven_even_one, frame(7, "even", 2)),
+    ]
+
+    eight_payload = serial_probe.generate_eight_bit_payload(
+        serial_probe.DEFAULT_EIGHT_BIT_PAYLOAD_BYTES,
+    )
+    masked_bytes = bytes(byte & 0x7F for byte in eight_payload.data)
+    masked_score = serial_probe.score_received(eight_payload.data, masked_bytes)
+    masked_trial = serial_probe.TrialResult(
+        burst_index=1,
+        bytes_sent=eight_payload.byte_count,
+        bytes_received=len(masked_bytes),
+        bytes_drained_before=0,
+        drain_status="quiet",
+        score=masked_score.score,
+        metrics=masked_score.metrics,
+        status="eight-bit-not-clean",
+        error=None,
+        elapsed_sec=0.0,
+        timing=serial_probe.zero_timing_breakdown(),
+        received_preview_ascii="",
+        received_preview_hex="",
+        score_classification=masked_score.classification,
+        evidence=masked_score.evidence,
+        payload_mode=eight_payload.payload_mode,
+    )
+    eight_result = serial_probe.aggregate_candidate_result(
+        index=1,
+        total=1,
+        settings=settings(seven_even_one, seven_even_one),
+        trials=[masked_trial],
+        elapsed_sec=0.0,
+    )
+    result = serial_probe.Bank2CharacterizationResult(
+        switch_note="00010000",
+        known_baud_text="38400",
+        ascii_results=ascii_results,
+        eight_bit_results=[eight_result],
+        flow_results=[],
+        behavior_results=[],
+        etx_ack_results=[],
+        stale_data_seen=False,
+        conclusion=serial_probe.bank2_conclusion(
+            ascii_results,
+            [eight_result],
+            [],
+            [],
+            [],
+        ),
+        run_id="KBTEST",
+        flow_skip_reason=None,
+    )
+
+    assert (
+        serial_probe.bank2_data_width_summary(ascii_results, [eight_result])
+        == "7-BIT/MASKED DATA PATH; HIGH-BIT BYTES WERE STRIPPED."
+    )
+    assert (
+        serial_probe.bank2_parity_proof_summary(ascii_results, [eight_result])
+        == "NOT UNIQUE; OUTPUT 7E1, 7O1, 7N1 PASSED ASCII."
+    )
+    assert (
+        serial_probe.bank2_stop_bits_proof_summary(ascii_results, [eight_result])
+        == "NOT UNIQUE; OUTPUT 7E1, 7E2 PASSED ASCII."
+    )
+
+    serial_probe.print_bank2_report(result, Path("serial_probe_report.txt"))
+    output = capsys.readouterr().out
+
+    assert "DATA WIDTH:      7-BIT/MASKED DATA PATH" in output
+    assert "USABLE FRAME:    IN 7E1 >> OUT 7E1 FOR PRINTABLE 7-BIT ASCII ONLY" in output
+    assert "NOT UNIQUE; OUTPUT 7E1, 7O1, 7N1 PASSED ASCII" in output
+    assert "NOT UNIQUE; OUTPUT 7E1, 7E2 PASSED ASCII" in output
+    assert "CONCLUSION:      7-BIT ASCII TRANSFER PASSES; HIGH-BIT DATA MASKED" in output
+
+
 def test_bank2_report_does_not_recommend_unclean_followup_frame(
     capsys: CaptureFixture[str],
 ) -> None:

@@ -7084,7 +7084,7 @@ def eight_bit_result_summary(results: Sequence[CandidateResult]) -> str:
         result for result in results if result.metrics.high_bit_stripped_count > 0
     ]
     if masked:
-        return "8-BIT NOT CLEAN; 7-BIT/MASKED DATA DETECTED"
+        return "8-BIT NOT CLEAN; 7-BIT/MASKED PATH, HIGH-BIT BYTES STRIPPED"
     if any(result.bytes_received > 0 for result in results):
         return "8-BIT NOT CLEAN OR INCONCLUSIVE"
     return "NO 8-BIT DATA RECEIVED"
@@ -7332,12 +7332,119 @@ def bank2_ascii_pass_summary(results: Sequence[CandidateResult]) -> str:
     return bank2_compact_result_summary(clean)
 
 
+def bank2_masked_eight_bit_results(
+    results: Sequence[CandidateResult],
+) -> list[CandidateResult]:
+    """Return high-bit challenge rows where high bits were stripped or masked."""
+    return [
+        result
+        for result in results
+        if result.metrics.high_bit_bytes_sent > 0
+        and result.metrics.high_bit_stripped_count > 0
+    ]
+
+
 def bank2_eight_bit_detail_summary(results: Sequence[CandidateResult]) -> str:
     """Return a compact summary of high-bit known-baud transfer candidates."""
     clean = bank2_eight_bit_clean_results(results)
     if clean:
         return "8-BIT CLEAN; " + bank2_compact_result_summary(clean, label_limit=8)
     return eight_bit_result_summary(results)
+
+
+def bank2_data_width_summary(
+    ascii_results: Sequence[CandidateResult],
+    eight_bit_results: Sequence[CandidateResult],
+) -> str:
+    """Return the clearest report row for observed data width."""
+    if bank2_eight_bit_clean_results(eight_bit_results):
+        return "8-BIT CLEAN; HIGH-BIT BYTES SURVIVED."
+    if bank2_masked_eight_bit_results(eight_bit_results):
+        return "7-BIT/MASKED DATA PATH; HIGH-BIT BYTES WERE STRIPPED."
+    if ascii_pass_frame_labels(ascii_results):
+        if eight_bit_results:
+            return "ASCII ONLY; RAW 8-BIT DATA WIDTH IS NOT PROVEN."
+        return "ASCII ONLY; 8-BIT CHALLENGE WAS NOT RUN."
+    if any(result.bytes_received > 0 for result in eight_bit_results):
+        return "INCONCLUSIVE; BYTES RETURNED BUT NO CLEAN FRAME MATCHED."
+    return "NOT PROVEN; NO CLEAN ASCII OR 8-BIT TRANSFER."
+
+
+def bank2_usable_frame_summary(
+    ascii_results: Sequence[CandidateResult],
+    eight_bit_results: Sequence[CandidateResult],
+) -> str:
+    """Return the selected setting plus its limitation in one actionable row."""
+    target = best_bank2_followup_target(ascii_results, eight_bit_results)
+    if target is None:
+        return "(NONE)"
+    target_label = frame_or_pair_label(target.settings)
+    if bank2_eight_bit_clean_results(eight_bit_results):
+        return f"{target_label} FOR BYTE TRANSFER."
+    return f"{target_label} FOR PRINTABLE 7-BIT ASCII ONLY."
+
+
+def bank2_target_output_variant_labels(
+    ascii_results: Sequence[CandidateResult],
+    eight_bit_results: Sequence[CandidateResult],
+    *,
+    same_parity: bool = False,
+    same_stop: bool = False,
+) -> list[str]:
+    """Return clean receive-side frame labels comparable to the selected target."""
+    target = best_bank2_followup_target(ascii_results, eight_bit_results)
+    if target is None:
+        return []
+    target_output = receive_side_settings(target.settings)
+    labels: list[str] = []
+    for result in ascii_results:
+        if not clean_ascii_transfer(result):
+            continue
+        output = receive_side_settings(result.settings)
+        if output.data_bits != target_output.data_bits:
+            continue
+        if same_parity and output.parity != target_output.parity:
+            continue
+        if same_stop and output.stop_bits != target_output.stop_bits:
+            continue
+        label = frame_label(output)
+        if label not in labels:
+            labels.append(label)
+    return labels
+
+
+def bank2_parity_proof_summary(
+    ascii_results: Sequence[CandidateResult],
+    eight_bit_results: Sequence[CandidateResult],
+) -> str:
+    """Return whether the byte results uniquely proved receive-side parity."""
+    labels = bank2_target_output_variant_labels(
+        ascii_results,
+        eight_bit_results,
+        same_stop=True,
+    )
+    if not labels:
+        return "NOT PROVEN; NO CLEAN ASCII FRAME."
+    if len(labels) > 1:
+        return f"NOT UNIQUE; OUTPUT {compact_label_list(labels, 8)} PASSED ASCII."
+    return f"ONLY OUTPUT {labels[0]} PASSED ASCII; BYTE TEST ONLY."
+
+
+def bank2_stop_bits_proof_summary(
+    ascii_results: Sequence[CandidateResult],
+    eight_bit_results: Sequence[CandidateResult],
+) -> str:
+    """Return whether the byte results uniquely proved receive-side stop bits."""
+    labels = bank2_target_output_variant_labels(
+        ascii_results,
+        eight_bit_results,
+        same_parity=True,
+    )
+    if not labels:
+        return "NOT PROVEN; NO CLEAN ASCII FRAME."
+    if len(labels) > 1:
+        return f"NOT UNIQUE; OUTPUT {compact_label_list(labels, 8)} PASSED ASCII."
+    return f"ONLY OUTPUT {labels[0]} PASSED ASCII; BYTE TEST ONLY."
 
 
 def bank2_target_sort_key(result: CandidateResult) -> tuple[bool, bool, bool, bool, bool, bool, bool, float, float, float, int]:
@@ -8389,8 +8496,14 @@ def bank2_conclusion(
     if not pass_frames:
         return with_stale_warning("No working frame found for selected known bauds")
     eight_summary = eight_bit_result_summary(eight_bit_results)
+    if "7-BIT/MASKED" in eight_summary:
+        return with_stale_warning(
+            "7-bit ASCII transfer passes; high-bit data masked; parity/stop not proven"
+        )
     if "NOT CLEAN" in eight_summary or "MASKED" in eight_summary:
-        return with_stale_warning("ASCII transfer passes, but 8-bit path is not clean")
+        return with_stale_warning(
+            "ASCII transfer passes, but 8-bit path is not clean; parity/stop not proven"
+        )
     if any(result.form_feed_inserted for result in behavior_results):
         return with_stale_warning(
             "Form feed observed after timeout window; compare prior blocks"
@@ -8444,7 +8557,8 @@ def bank2_setup_verdict(result: Bank2CharacterizationResult) -> str:
         )
     if not bank2_eight_bit_clean_results(result.eight_bit_results):
         return (
-            "ASCII TRANSFER WAS FOUND, BUT RAW 8-BIT TRANSFER IS NOT PROVEN CLEAN."
+            "ASCII TRANSFER WAS FOUND; RAW 8-BIT TRANSFER IS NOT PROVEN CLEAN. "
+            "DATA WIDTH/PARITY/STOP ROWS SHOW WHAT IS AND IS NOT PROVEN."
         )
     return "WORKING BYTE TRANSFER FOUND FOR THIS DEVICE/SWITCH STATE."
 
@@ -8461,8 +8575,9 @@ def bank2_next_action(result: Bank2CharacterizationResult) -> str:
         )
     if not bank2_eight_bit_clean_results(result.eight_bit_results):
         return (
-            "USE THE ASCII FRAME ONLY FOR PRINTABLE 7-BIT TRAFFIC; FOR RAW DATA "
-            "OR PRINTER CONTROL BYTES, FIND AN 8-BIT CLEAN SETTING."
+            "USE THE USABLE FRAME ABOVE ONLY FOR PRINTABLE 7-BIT TRAFFIC. "
+            "PARITY/STOP ARE NOT PROVEN WHEN THE PROOF ROWS SAY NOT UNIQUE. "
+            "FOR RAW DATA OR PRINTER CONTROL BYTES, FIND AN 8-BIT CLEAN SETTING."
         )
     if result.flow_skip_reason:
         return "COMPARE THIS BLOCK TO OTHER DEVICE/SWITCH STATES; FLOW WAS NOT PROVEN HERE."
@@ -8493,6 +8608,22 @@ def write_bank2_text_report(
         result.ascii_results,
         result.eight_bit_results,
     )
+    data_width = bank2_data_width_summary(
+        result.ascii_results,
+        result.eight_bit_results,
+    )
+    usable_frame = bank2_usable_frame_summary(
+        result.ascii_results,
+        result.eight_bit_results,
+    )
+    parity_proof = bank2_parity_proof_summary(
+        result.ascii_results,
+        result.eight_bit_results,
+    )
+    stop_proof = bank2_stop_bits_proof_summary(
+        result.ascii_results,
+        result.eight_bit_results,
+    )
     verdict = bank2_setup_verdict(result)
     next_action = bank2_next_action(result)
     lines = [
@@ -8508,6 +8639,10 @@ def write_bank2_text_report(
             indent="",
         ),
         *bank2_value_lines("KNOWN BAUD/PAIR:", result.known_baud_text, indent=""),
+        *bank2_value_lines("DATA WIDTH:", data_width, indent=""),
+        *bank2_value_lines("USABLE FRAME:", usable_frame, indent=""),
+        *bank2_value_lines("PARITY PROOF:", parity_proof, indent=""),
+        *bank2_value_lines("STOP PROOF:", stop_proof, indent=""),
         *bank2_value_lines("ASCII PASS:", ascii_summary, indent=""),
         *bank2_value_lines("8-BIT RESULT:", eight_detail, indent=""),
         *bank2_value_lines("FOLLOW-UP FRAME:", target_label, indent=""),
@@ -8534,6 +8669,10 @@ def write_bank2_text_report(
             indent="  ",
         ),
         *bank2_value_lines("KNOWN:", result.known_baud_text, indent="  "),
+        *bank2_value_lines("DATA WIDTH:", data_width, indent="  "),
+        *bank2_value_lines("USABLE:", usable_frame, indent="  "),
+        *bank2_value_lines("PARITY:", parity_proof, indent="  "),
+        *bank2_value_lines("STOP:", stop_proof, indent="  "),
         *bank2_value_lines("ASCII:", ascii_summary, indent="  "),
         *bank2_value_lines("8-BIT:", eight_detail, indent="  "),
         *bank2_value_lines("RAW:", behavior_summary, indent="  "),
@@ -8552,6 +8691,10 @@ def write_bank2_text_report(
         border_line(REPORT_WIDTH),
         "",
         "EVIDENCE:",
+        *bank2_value_lines("DATA WIDTH:", data_width),
+        *bank2_value_lines("USABLE FRAME:", usable_frame),
+        *bank2_value_lines("PARITY PROOF:", parity_proof),
+        *bank2_value_lines("STOP PROOF:", stop_proof),
         *bank2_value_lines("ASCII:", ascii_summary),
         *bank2_value_lines("8-BIT:", eight_detail),
         *bank2_value_lines("FOLLOW-UP FRAME:", target_label),
@@ -8574,6 +8717,8 @@ def write_bank2_text_report(
         "",
         "INTERPRETATION:",
         "  FRAME PASS HERE MEANS CLEAN ASCII BYTE TRANSFER, NOT UNIQUE PARITY/STOP PROOF.",
+        "  THE DATA WIDTH, PARITY PROOF, AND STOP PROOF ROWS ARE THE SHORT ANSWER.",
+        "  FOLLOW-UP FRAME IS THE TEST FRAME CHOSEN FOR MORE PROBES, NOT A UNIQUE PROOF.",
         "  8-BIT CLEAN IS STRONGER EVIDENCE FOR AN 8-BIT DATA PATH.",
         "  ETX/ACK REQUIRES A REVERSE ACK PATH; XON/XOFF DOES NOT PROVE THAT PATH.",
         "  FLOW MATRIX SHOWS WHICH IN/OUT FLOW PAIRS MOVE BYTES CLEANLY.",
@@ -8600,6 +8745,22 @@ def print_bank2_report(
     target_label = bank2_followup_target_label(
         result.ascii_results,
         result.eight_bit_results,
+    )
+    print_bank2_value(
+        "DATA WIDTH:",
+        bank2_data_width_summary(result.ascii_results, result.eight_bit_results),
+    )
+    print_bank2_value(
+        "USABLE FRAME:",
+        bank2_usable_frame_summary(result.ascii_results, result.eight_bit_results),
+    )
+    print_bank2_value(
+        "PARITY PROOF:",
+        bank2_parity_proof_summary(result.ascii_results, result.eight_bit_results),
+    )
+    print_bank2_value(
+        "STOP PROOF:",
+        bank2_stop_bits_proof_summary(result.ascii_results, result.eight_bit_results),
     )
     print_bank2_value("ASCII PASS:", bank2_ascii_pass_summary(result.ascii_results))
     print_bank2_value(
