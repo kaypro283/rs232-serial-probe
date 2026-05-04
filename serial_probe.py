@@ -3503,6 +3503,15 @@ def run_known_baud_purge(
     return result
 
 
+def known_output_purge_settings(
+    settings_list: Sequence[SerialSettings | DualSerialSettings],
+) -> list[SerialSettings]:
+    """Return unique output-side settings for known-baud purge passes."""
+    return unique_serial_settings(
+        [receive_side_settings(settings) for settings in settings_list]
+    )
+
+
 def run_known_output_purges(
     serial_module: Any,
     options: ScanOptions,
@@ -3512,9 +3521,7 @@ def run_known_output_purges(
     capacity_bytes: int = BUFFER_PURGE_CAPACITY_BYTES,
 ) -> list[DrainResult]:
     """Run long-limit purges for known output-side serial settings."""
-    output_settings = unique_serial_settings(
-        [receive_side_settings(settings) for settings in settings_list]
-    )
+    output_settings = known_output_purge_settings(settings_list)
     results: list[DrainResult] = []
     for index, settings in enumerate(output_settings, start=1):
         indexed_reason = reason
@@ -7979,24 +7986,21 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
         if input_baud != output_baud
         else str(input_baud)
     )
-    purge_setting = phase0_baseline_settings(output_baud)
-    purge_limit = estimated_buffer_drain_seconds(purge_setting)
-    run_known_baud_purge(
-        serial_module=serial_module,
-        options=bank_options,
-        logger=logger,
-        settings=purge_setting,
-        max_seconds=purge_limit,
-        reason="KNOWN-BAUD DEVICE PRE-TEST PURGE.",
-    )
-
-    ascii_results: list[CandidateResult] = []
-    ascii_payload = generate_payload(payload_bytes)
     frames = bank2_frame_candidates(
         input_baud,
         output_baud,
         independent_frames=independent_frames,
     )
+    run_known_output_purges(
+        serial_module=serial_module,
+        options=bank_options,
+        logger=logger,
+        settings_list=known_output_purge_settings(frames),
+        reason="KNOWN-BAUD DEVICE PRE-TEST PURGE.",
+    )
+
+    ascii_results: list[CandidateResult] = []
+    ascii_payload = generate_payload(payload_bytes)
     print()
     print_report_title("KNOWN-BAUD ASCII FRAME TEST")
     print(f"KNOWN BAUD/PAIR: {known_text}")

@@ -363,6 +363,73 @@ def test_start_scan_bank2_uses_configured_bauds_without_range_prompt(
     assert selection.options.max_baud == 9600
 
 
+def test_known_baud_output_purge_settings_cover_candidate_output_frames() -> None:
+    candidates = serial_probe.bank2_frame_candidates(
+        1200,
+        4800,
+        independent_frames=True,
+    )
+
+    purge_settings = serial_probe.known_output_purge_settings(candidates)
+
+    assert [
+        serial_probe.frame_label(settings) for settings in purge_settings
+    ] == [
+        serial_probe.frame_label(settings)
+        for settings in serial_probe.bank2_frame_serial_settings(4800)
+    ]
+    assert all(settings.baud == 4800 for settings in purge_settings)
+
+
+def test_known_baud_pretest_purge_uses_candidate_output_frames(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    class StopAfterPurge(RuntimeError):
+        pass
+
+    captured_settings: list[serial_probe.SerialSettings] = []
+
+    def capture_known_output_purges(
+        serial_module: object,
+        options: serial_probe.ScanOptions,
+        logger: logging.Logger,
+        settings_list: list[serial_probe.SerialSettings],
+        reason: str,
+        capacity_bytes: int = serial_probe.BUFFER_PURGE_CAPACITY_BYTES,
+    ) -> list[serial_probe.DrainResult]:
+        nonlocal captured_settings
+        captured_settings = list(settings_list)
+        raise StopAfterPurge
+
+    def reject_single_frame_purge(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("known-baud pre-test purge used only one frame")
+
+    options = dataclasses.replace(
+        serial_probe.default_scan_options(),
+        input_baud=1200,
+        output_baud=4800,
+    )
+    monkeypatch.setattr(builtins, "input", fake_input_from(["SW2", "y", "n", "n"]))
+    monkeypatch.setattr(
+        serial_probe,
+        "setup_logging",
+        lambda _path: logging.getLogger("test"),
+    )
+    monkeypatch.setattr(serial_probe, "import_pyserial", lambda: object())
+    monkeypatch.setattr(serial_probe, "run_known_baud_purge", reject_single_frame_purge)
+    monkeypatch.setattr(serial_probe, "run_known_output_purges", capture_known_output_purges)
+
+    with pytest.raises(StopAfterPurge):
+        serial_probe.run_second_bank_characterization(options)
+
+    assert [
+        serial_probe.frame_label(settings) for settings in captured_settings
+    ] == [
+        serial_probe.frame_label(settings)
+        for settings in serial_probe.bank2_frame_serial_settings(4800)
+    ]
+
+
 def test_bank2_behavior_payload_classes_cover_control_ranges() -> None:
     payloads = dict(serial_probe.bank2_behavior_probe_payloads("KBRUN", 1, None))
 
