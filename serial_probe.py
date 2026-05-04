@@ -62,6 +62,7 @@ MEMORY_TEST_TARGET_BYTES = BUFFER_PURGE_CAPACITY_BYTES
 MEMORY_TEST_TARGET_KIB_PRESETS: tuple[int, ...] = (16, 32, 48, 64)
 MEMORY_TEST_MAX_TARGET_KIB = max(MEMORY_TEST_TARGET_KIB_PRESETS)
 MEMORY_TEST_MAX_PAYLOAD_FACTOR = 8
+MEMORY_TEST_MAX_LOOPS = 999
 MEMORY_TEST_READ_QUIET_SECONDS = 2.0
 MEMORY_TEST_PRE_DRAIN_TIMEOUT = 2.5
 MEMORY_TEST_MODE_IMAGE = "image"
@@ -120,10 +121,11 @@ ANSI_GREEN = "\033[92m"
 ANSI_RESET = "\033[0m"
 STD_OUTPUT_HANDLE = -11
 ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-SCREEN_WIDTH = 72
-REPORT_WIDTH = 78
-PROGRESS_WIDTH = 70
 TERMINAL_COLUMNS = 80
+SCREEN_WIDTH = TERMINAL_COLUMNS
+REPORT_WIDTH = TERMINAL_COLUMNS
+PROGRESS_TIMESTAMP_WIDTH = len("00:00:00 ")
+PROGRESS_WIDTH = TERMINAL_COLUMNS - PROGRESS_TIMESTAMP_WIDTH
 PAGE_BODY_LINES = 22
 HELP_BODY_LINES = 20
 RECOMMENDATION_MIN_SCORE = 90.0
@@ -451,6 +453,9 @@ class MemoryTestConfig:
     mode: str
     payload_bytes: int
     target_bytes: int
+    loop_count: int
+    accept_full_result: bool
+    stop_on_unexpected: bool
     switch_note: str
     run_id: str
 
@@ -464,6 +469,8 @@ class MemoryTestResult:
     payload: ProbePayload
     purge: DrainResult
     candidate: CandidateResult
+    loop_index: int
+    loop_total: int
     started_at: str
     completed_at: str
     elapsed_sec: float
@@ -568,6 +575,11 @@ class Bank2BehaviorProbeResult:
     settings: SerialSettings | DualSerialSettings
     bytes_sent: int
     bytes_received: int
+    sent_hash: str
+    received_hash: str
+    first_mismatch_offset: int | None
+    missing_bytes: int
+    extra_bytes: int
     exact_match: bool
     form_feed_inserted: bool
     cr_lf_changed: bool
@@ -1470,6 +1482,16 @@ def bordered_text(text: str, width: int = SCREEN_WIDTH) -> str:
     inner_width = max(width - 4, 1)
     cleaned = text[:inner_width]
     return f"* {cleaned.center(inner_width)} *"
+
+
+def fit_terminal_line(text: object, width: int = TERMINAL_COLUMNS) -> str:
+    """Return one printable line that fits the fixed terminal width."""
+    cleaned = str(text).replace("\t", " ")
+    if len(cleaned) <= width:
+        return cleaned
+    if width <= 3:
+        return cleaned[:width]
+    return cleaned[: width - 3] + "..."
 
 
 def banner_lines() -> list[str]:
@@ -2851,6 +2873,50 @@ def frame_or_pair_label(settings: SerialSettings | DualSerialSettings) -> str:
     return frame_label(settings)
 
 
+def progress_count_label(value: int) -> str:
+    """Return a compact byte count for 80-column live result rows."""
+    if value > 0 and value % KIB_BYTES == 0:
+        return f"{value // KIB_BYTES}K"
+    return str(value)
+
+
+def progress_serial_label(settings: SerialSettings) -> str:
+    """Return short baud/frame/flow text for 80-column progress rows."""
+    return (
+        f"{settings.baud} "
+        f"{settings.data_bits}{settings.parity_code()}{settings.stop_bits} "
+        f"{flow_control_code(settings.flow_control)}"
+    )
+
+
+def progress_settings_label(settings: SerialSettings | DualSerialSettings) -> str:
+    """Return compact settings text for one live progress row."""
+    if isinstance(settings, DualSerialSettings):
+        return (
+            f"I{progress_serial_label(settings.input_settings)}/"
+            f"O{progress_serial_label(settings.output_settings)}"
+        )
+    return progress_serial_label(settings)
+
+
+def progress_status_text(status: str, error: str | None) -> str:
+    """Return compact status text for one live progress row."""
+    text = status.upper().replace("-", " ")
+    if error:
+        text = f"{text}: {error}"
+    return " ".join(text.split())
+
+
+def append_status_to_progress(base: str, status: str) -> str:
+    """Append status text without exceeding the fixed terminal width."""
+    if not status:
+        return fit_terminal_line(base)
+    available = TERMINAL_COLUMNS - len(base) - 1
+    if available <= 0:
+        return fit_terminal_line(base)
+    return f"{base} {status[:available]}"
+
+
 def clean_ascii_transfer(result: CandidateResult) -> bool:
     """Return True when a result proves byte transfer but not necessarily frame."""
     if result.error or result.status in STALE_STATUSES:
@@ -2900,14 +2966,18 @@ def stale_nonce_seen(results: Sequence[CandidateResult]) -> bool:
 
 def format_progress(result: CandidateResult) -> str:
     """Return one console progress line for a candidate result."""
-    status = result.status.upper() if not result.error else f"{result.status.upper()}: {result.error[:60]}"
     indicator = result_indicator(result.score, result.status, result.error)
-    return (
-        f"[{result.index:04d}/{result.total:04d}] RESULT {indicator} "
-        f"{result.settings.label():32s} "
-        f"SENT={result.bytes_sent:7d} READ={result.bytes_received:7d} "
-        f"CLR={result.bytes_drained_before:7d} "
-        f"SCORE={result.score:6.2f} {status}"
+    base = (
+        f"[{result.index:04d}/{result.total:04d}] {indicator} "
+        f"{progress_settings_label(result.settings)} "
+        f"S={progress_count_label(result.bytes_sent)} "
+        f"R={progress_count_label(result.bytes_received)} "
+        f"C={progress_count_label(result.bytes_drained_before)} "
+        f"Q={result.score:03.0f}"
+    )
+    return append_status_to_progress(
+        base,
+        progress_status_text(result.status, result.error),
     )
 
 
@@ -2924,20 +2994,20 @@ def format_scan_eta(
     completed = max(0, min(completed, total))
     remaining_count = max(total - completed, 0)
     if completed <= 0:
-        return (
-            f"SCAN TIME {completed:04d}/{total:04d}: "
-            f"ELAPSED={format_duration(elapsed)} LEFT=? FINISH=?"
+        return fit_terminal_line(
+            f"SCAN {completed:04d}/{total:04d}: "
+            f"EL={format_duration(elapsed)} LEFT=? FIN=?"
         )
 
     average = elapsed / completed
     remaining_seconds = average * remaining_count
     finish = format_finish_clock(remaining_seconds, clock_now)
-    return (
-        f"SCAN TIME {completed:04d}/{total:04d}: "
-        f"ELAPSED={format_duration(elapsed)} "
+    return fit_terminal_line(
+        f"SCAN {completed:04d}/{total:04d}: "
+        f"EL={format_duration(elapsed)} "
         f"AVG={format_duration(average)}/SET "
         f"LEFT={format_duration(remaining_seconds)} "
-        f"FINISH={finish}"
+        f"FIN={finish}"
     )
 
 
@@ -3277,13 +3347,13 @@ def buffer_purge_banner(reason: str, settings_count: int) -> None:
     print("  DEVICE TYPE:          SERIAL FIFO/RAM PRINTER BUFFER")
     print(f"  ASSUMED CAPACITY:     {byte_size_detail(BUFFER_PURGE_CAPACITY_BYTES)}")
     print(f"  OUTPUT BAUD TRIES:    {settings_count}")
-    print(
-        "  METHOD:               READ BUFFER OUTPUT UNTIL QUIET "
-        "BEFORE SENDING NEW TEST DATA."
+    print_wrapped_value(
+        "  METHOD:              ",
+        "READ BUFFER OUTPUT UNTIL QUIET BEFORE SENDING NEW TEST DATA.",
     )
-    print(
-        "  NOTE:                 SHORT QUIET TIME DOES NOT PROVE "
-        "A FULL BUFFER IS EMPTY."
+    print_wrapped_value(
+        "  NOTE:                ",
+        "SHORT QUIET TIME DOES NOT PROVE A FULL BUFFER IS EMPTY.",
     )
     print(border_line(REPORT_WIDTH))
 
@@ -3650,13 +3720,15 @@ def format_dual_phase0_progress(
     total: int,
 ) -> str:
     """Return one dual-bank Phase 0 console progress line."""
-    state = "ALIVE" if result.alive else "NOT ALIVE"
-    return (
-        f"D-PHASE0 [{index:04d}/{total:04d}] {state:<9} "
-        f"IN={result.input_baud:>6} OUT={result.output_baud:>6} "
-        f"READ={result.bytes_received:6d} CLR={result.bytes_drained_before:6d} "
-        f"SCORE={result.score:6.2f} {result.reason}"
+    state = "YES" if result.alive else "NO"
+    base = (
+        f"PH0 [{index:04d}/{total:04d}] LIVE={state:<3} "
+        f"I={result.input_baud:>5} O={result.output_baud:>5} "
+        f"R={progress_count_label(result.bytes_received)} "
+        f"C={progress_count_label(result.bytes_drained_before)} "
+        f"Q={result.score:03.0f}"
     )
+    return append_status_to_progress(base, result.reason)
 
 
 def select_dual_phase0_pairs(
@@ -3820,9 +3892,12 @@ def run_dual_phase0_baud_matrix(
     print()
     print_report_title("DUAL PHASE 0 BAUD MATRIX")
     print("MODE: INPUT AND OUTPUT PORT BAUDS ARE TESTED INDEPENDENTLY.")
-    print(
-        f"PORTS: IN {options.in_port} -> BUFFER -> OUT {options.out_port}; "
-        f"TEST={phase0_payload.byte_count} BYTES X {phase0_options.bursts}"
+    print_wrapped_value(
+        "PORTS: ",
+        (
+            f"IN {options.in_port} -> BUFFER -> OUT {options.out_port}; "
+            f"TEST={phase0_payload.byte_count} BYTES X {phase0_options.bursts}"
+        ),
     )
     print("FIXED FRAME: 8E1 FLOW=NONE ON BOTH SIDES.")
     print(f"BAUD PAIRS: {len(pairs)} INPUT X OUTPUT COMBINATIONS.")
@@ -3926,18 +4001,18 @@ def dual_side_table_label(settings: SerialSettings) -> str:
 def format_dual_progress(result: CandidateResult) -> str:
     """Return one console progress line for a dual-bank candidate."""
     settings = dual_result_settings(result)
-    status = (
-        result.status.upper()
-        if not result.error
-        else f"{result.status.upper()}: {result.error[:60]}"
-    )
     indicator = result_indicator(result.score, result.status, result.error)
-    return (
-        f"[{result.index:04d}/{result.total:04d}] RESULT {indicator} "
-        f"{settings.label():48s} "
-        f"SENT={result.bytes_sent:7d} READ={result.bytes_received:7d} "
-        f"CLR={result.bytes_drained_before:7d} "
-        f"SCORE={result.score:6.2f} {status}"
+    base = (
+        f"[{result.index:04d}/{result.total:04d}] {indicator} "
+        f"{progress_settings_label(settings)} "
+        f"S={progress_count_label(result.bytes_sent)} "
+        f"R={progress_count_label(result.bytes_received)} "
+        f"C={progress_count_label(result.bytes_drained_before)} "
+        f"Q={result.score:03.0f}"
+    )
+    return append_status_to_progress(
+        base,
+        progress_status_text(result.status, result.error),
     )
 
 
@@ -4731,6 +4806,17 @@ def prompt_memory_test_config(options: ScanOptions) -> MemoryTestConfig | None:
     else:
         payload_bytes = target_bytes
     payload_bytes = max(payload_bytes, minimum_payload_size())
+    loop_count = prompt_int(
+        "TEST LOOPS",
+        1,
+        minimum=1,
+        maximum=MEMORY_TEST_MAX_LOOPS,
+    )
+    accept_full_result = prompt_yes_no(
+        "FULL COUNTS AS OK",
+        mode == MEMORY_TEST_MODE_FILL,
+    )
+    stop_on_unexpected = prompt_yes_no("STOP ON UNEXPECTED", True)
     switch_note = prompt_memory_test_note(options.switch_note)
     if switch_note is None:
         return None
@@ -4747,6 +4833,7 @@ def prompt_memory_test_config(options: ScanOptions) -> MemoryTestConfig | None:
     transfer_estimate = (
         max(send_estimate, receive_estimate) + MEMORY_TEST_READ_QUIET_SECONDS
     )
+    total_estimate = transfer_estimate * loop_count
     peak_estimate = estimated_memory_test_peak_fill_bytes(
         input_baud,
         output_baud,
@@ -4758,13 +4845,15 @@ def prompt_memory_test_config(options: ScanOptions) -> MemoryTestConfig | None:
     print(f"  MODE:                {memory_test_mode_label(mode, target_bytes)}")
     print(f"  TARGET:              {byte_size_detail(target_bytes)}")
     print(f"  PAYLOAD:             {payload_bytes} ASCII BYTES")
+    print(f"  LOOPS:               {loop_count}")
+    print(f"  FULL COUNTS OK:      {yes_no_text(accept_full_result)}")
+    print(f"  STOP UNEXPECTED:     {yes_no_text(stop_on_unexpected)}")
     print(f"  EST. PEAK BUFFER:    {peak_estimate} BYTES")
     print(f"  INPUT:               {input_baud} 8E1 NONE")
     print(f"  OUTPUT:              {output_baud} 8E1 NONE")
-    print(f"  SEND ESTIMATE:       {format_duration(send_estimate)}")
-    print(f"  OUTPUT ESTIMATE:     {format_duration(receive_estimate)}")
-    print(f"  TRANSFER ESTIMATE:   {format_duration(transfer_estimate)}")
-    print(f"  FINISH ABOUT:        {format_finish_clock(transfer_estimate)}")
+    print(f"  EACH ESTIMATE:       {format_duration(transfer_estimate)}")
+    print(f"  TOTAL ESTIMATE:      {format_duration(total_estimate)}")
+    print(f"  FINISH ABOUT:        {format_finish_clock(total_estimate)}")
     if peak_estimate < target_bytes:
         print(
             f"  NOTE:                THIS BAUD PAIR MAY NOT FILL "
@@ -4789,6 +4878,9 @@ def prompt_memory_test_config(options: ScanOptions) -> MemoryTestConfig | None:
         mode=mode,
         payload_bytes=payload_bytes,
         target_bytes=target_bytes,
+        loop_count=loop_count,
+        accept_full_result=accept_full_result,
+        stop_on_unexpected=stop_on_unexpected,
         switch_note=switch_note,
         run_id=run_id,
     )
@@ -6506,7 +6598,7 @@ def bank2_behavior_probe_payloads(
     target_index: int,
     switch_hash: str | None,
 ) -> list[tuple[str, bytes]]:
-    """Return the small raw byte payload set for Bank 2 behavior probing."""
+    """Return raw byte payload classes for Bank 2 behavior probing."""
     payloads: list[tuple[str, bytes]] = []
     for name, separator in (
         ("CR_ONLY", b"\r"),
@@ -6528,6 +6620,55 @@ def bank2_behavior_probe_payloads(
                 + separator,
             )
         )
+
+    marker = bank2_behavior_marker(run_id, target_index, "PRINT_CTRL", switch_hash)
+    payloads.append(
+        (
+            "PRINT_CTRL",
+            b"\r\n".join(
+                [
+                    marker,
+                    b"START",
+                    b"Line 1",
+                    b"Line 2\tTabbed text",
+                    b"Line 3 before form feed",
+                    b"\x0c",
+                    b"AFTER FORM FEED",
+                    b"\x1b@",
+                    b"\x1bE",
+                    b"\x1bF",
+                    b"END",
+                ]
+            )
+            + b"\r\n",
+        )
+    )
+
+    marker = bank2_behavior_marker(run_id, target_index, "ASCII_SWEEP", switch_hash)
+    payloads.append(("ASCII_SWEEP", marker + b"\r\n" + bytes(range(0x20, 0x7F)) + b"\r\n"))
+
+    marker = bank2_behavior_marker(run_id, target_index, "CTL7_SAFE", switch_hash)
+    payloads.append(
+        (
+            "CTL7_SAFE",
+            marker
+            + b"\r\nCTL7_SAFE_BEGIN\r\n"
+            + bytes(byte for byte in range(0x00, 0x80) if byte not in {0x11, 0x13})
+            + b"\r\nCTL7_SAFE_END\r\n",
+        )
+    )
+
+    marker = bank2_behavior_marker(run_id, target_index, "CTL7_FULL", switch_hash)
+    payloads.append(
+        (
+            "CTL7_FULL",
+            marker
+            + b"\r\nCTL7_FULL_BEGIN\r\n"
+            + bytes(range(0x00, 0x80))
+            + b"\r\nCTL7_FULL_END\r\n",
+        )
+    )
+
     marker = bank2_behavior_marker(run_id, target_index, "TIMEOUT_FF", switch_hash)
     payloads.append(
         (
@@ -6551,6 +6692,14 @@ def cr_lf_change_observed(sent: bytes, received: bytes) -> bool:
         return True
     normalize = lambda data: data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
     return normalize(sent) == normalize(received)
+
+
+def first_mismatch_offset(sent: bytes, received: bytes) -> int | None:
+    """Return the first differing byte offset, or None for exact byte equality."""
+    prefix_bytes = exact_prefix_byte_count(sent, received)
+    if prefix_bytes == len(sent) == len(received):
+        return None
+    return prefix_bytes
 
 
 def classify_bank2_behavior_bytes(
@@ -6744,6 +6893,11 @@ def run_bank2_behavior_probe(
         settings=settings,
         bytes_sent=bytes_sent,
         bytes_received=len(received),
+        sent_hash=f"{fnv1a32(payload):08X}",
+        received_hash=f"{fnv1a32(received):08X}",
+        first_mismatch_offset=first_mismatch_offset(payload, received),
+        missing_bytes=max(len(payload) - len(received), 0),
+        extra_bytes=max(len(received) - len(payload), 0),
         exact_match=exact,
         form_feed_inserted=form_feed,
         cr_lf_changed=cr_lf,
@@ -6755,12 +6909,14 @@ def run_bank2_behavior_probe(
         elapsed_sec=time.monotonic() - started,
     )
     logger.info(
-        "Bank 2 behavior %s %s: status=%s sent=%s read=%s exact=%s ff=%s crlf=%s reason=%s error=%s",
+        "Bank 2 behavior %s %s: status=%s sent=%s read=%s "
+        "first_diff=%s exact=%s ff=%s crlf=%s reason=%s error=%s",
         name,
         settings.label(),
         result.status,
         result.bytes_sent,
         result.bytes_received,
+        result.first_mismatch_offset,
         result.exact_match,
         result.form_feed_inserted,
         result.cr_lf_changed,
@@ -6791,11 +6947,16 @@ def format_bank2_behavior_progress(
     if result.cr_lf_changed:
         flags.append("CRLF")
     flag_text = ",".join(flags) if flags else "-"
+    diff_text = (
+        "-"
+        if result.first_mismatch_offset is None
+        else str(result.first_mismatch_offset)
+    )
     return (
         f"RAW [{index:02d}/{total:02d}] {result.status.upper():<11} "
         f"{frame_text:24s} "
         f"SENT={result.bytes_sent:4d} READ={result.bytes_received:4d} "
-        f"FLAGS={flag_text:<10} {result.reason}"
+        f"DIFF={diff_text:<5} FLAGS={flag_text:<10} {result.reason}"
     )
 
 
@@ -6810,7 +6971,7 @@ def run_bank2_behavior_probes(
     if not targets:
         return []
     print()
-    print_report_title("BANK 2 RAW JOB-BEHAVIOR PROBES")
+    print_report_title("BANK 2 RAW BYTE-BEHAVIOR PROBES")
     print(f"TARGETS: {len(targets)} PROBE FRAME(S).")
     print(f"TIMEOUT OBSERVE WINDOW: {observe_seconds:.1f}S.")
     print("BYTE-LEVEL OBSERVATIONS ONLY; COMPARE SWITCH-STATE REPORT BLOCKS.")
@@ -6848,6 +7009,11 @@ def bank2_behavior_summary(
     """Return a concise summary of raw Bank 2 behavior observations."""
     if not results:
         return "NOT RUN"
+    by_name = {result.name: result for result in results}
+    safe = by_name.get("CTL7_SAFE")
+    full = by_name.get("CTL7_FULL")
+    if safe and full and safe.exact_match and not full.exact_match:
+        return "XON/XOFF CONTROL BYTES AFFECT RAW PATH"
     if any(result.form_feed_inserted for result in results):
         return "FORM FEED OBSERVED"
     if any(result.cr_lf_changed for result in results):
@@ -6855,12 +7021,112 @@ def bank2_behavior_summary(
     if any(result.status == "transformed" for result in results):
         return "RAW BYTE TRANSFORMATION OBSERVED"
     if all(result.status == "exact" for result in results):
-        return "RAW BYTES EXACT"
+        return "RAW BYTE CLASSES EXACT"
     if any(result.status == "no-data" for result in results):
         return "RAW PROBE NO DATA OR PARTIAL"
     if any(result.status == "error" for result in results):
         return "RAW PROBE ERROR"
     return "RAW BYTE BEHAVIOR INCONCLUSIVE"
+
+
+BANK2_SUMMARY_LABEL_WIDTH = 16
+
+
+def bank2_value_lines(
+    label: str,
+    value: object,
+    indent: str = "  ",
+    width: int = REPORT_WIDTH,
+) -> list[str]:
+    """Return Bank 2 key/value lines with one fixed value column."""
+    return wrapped_value_lines(
+        f"{indent}{label:<{BANK2_SUMMARY_LABEL_WIDTH}} ",
+        value,
+        width,
+    )
+
+
+def print_bank2_value(label: str, value: object) -> None:
+    """Print one aligned Bank 2 key/value row."""
+    for line in bank2_value_lines(label, value):
+        print(line)
+
+
+def yn_flag(value: bool) -> str:
+    """Return a one-character yes/no table flag."""
+    return "Y" if value else "N"
+
+
+def bank2_raw_diff_text(result: Bank2BehaviorProbeResult) -> str:
+    """Return raw-probe first-difference text."""
+    if result.first_mismatch_offset is None:
+        return "-"
+    return str(result.first_mismatch_offset)
+
+
+def bank2_raw_sr_text(sent: int, received: int) -> str:
+    """Return compact sent/received text for raw-probe tables."""
+    return f"{sent}/{received}"
+
+
+def bank2_raw_console_header() -> str:
+    """Return the console raw-probe table header."""
+    return (
+        f"  {'RAW PROBE':<12} "
+        f"{'STATUS':<11} "
+        f"{'S/R':>9} "
+        f"{'DIFF':>5} "
+        f"{'EX':>2} "
+        f"{'FF':>2} "
+        f"{'CRLF':>4}"
+    )
+
+
+def bank2_raw_console_row(result: Bank2BehaviorProbeResult) -> str:
+    """Return one console raw-probe table row."""
+    return (
+        f"  {result.name:<12} "
+        f"{result.status:<11} "
+        f"{bank2_raw_sr_text(result.bytes_sent, result.bytes_received):>9} "
+        f"{bank2_raw_diff_text(result):>5} "
+        f"{yn_flag(result.exact_match):>2} "
+        f"{yn_flag(result.form_feed_inserted):>2} "
+        f"{yn_flag(result.cr_lf_changed):>4}"
+    )
+
+
+def bank2_raw_report_header() -> str:
+    """Return the text-report raw-probe table header."""
+    return (
+        f"{'PROBE':<12} "
+        f"{'STATUS':<11} "
+        f"{'S/R':>9} "
+        f"{'MISS':>4} "
+        f"{'EXTRA':>5} "
+        f"{'DIFF':>5} "
+        f"{'EX':>2} "
+        f"{'FF':>2} "
+        f"{'CRLF':>4} "
+        f"{'HASH-S':>8} "
+        f"{'HASH-R':>8}"
+    )
+
+
+def bank2_raw_report_row(result: Bank2BehaviorProbeResult) -> str:
+    """Return one text-report raw-probe table row."""
+    return (
+        f"{result.name:<12} "
+        f"{result.status:<11} "
+        f"{bank2_raw_sr_text(result.bytes_sent, result.bytes_received):>9} "
+        f"{result.missing_bytes:>4} "
+        f"{result.extra_bytes:>5} "
+        f"{bank2_raw_diff_text(result):>5} "
+        f"{yn_flag(result.exact_match):>2} "
+        f"{yn_flag(result.form_feed_inserted):>2} "
+        f"{yn_flag(result.cr_lf_changed):>4} "
+        f"{result.sent_hash:>8} "
+        f"{result.received_hash:>8}"
+    )
 
 
 def bank2_behavior_report_lines(
@@ -6869,28 +7135,21 @@ def bank2_behavior_report_lines(
     """Return compact raw behavior lines for reports."""
     lines = [
         "BEHAVIOR RESULT:",
-        f"SUMMARY:         {bank2_behavior_summary(results)}",
+        *bank2_value_lines("SUMMARY:", bank2_behavior_summary(results), indent=""),
         "",
-        "PROBE       STATUS      SENT  READ  EX FF CRLF FRAME/PAIR              REASON",
+        bank2_raw_report_header(),
         border_line(REPORT_WIDTH),
     ]
     if not results:
         lines.append("(NOT RUN)")
     for result in results:
-        lines.append(
-            f"{result.name:<11} "
-            f"{result.status:<11} "
-            f"{result.bytes_sent:>4} "
-            f"{result.bytes_received:>5} "
-            f"{'Y' if result.exact_match else 'N':>2} "
-            f"{'Y' if result.form_feed_inserted else 'N':>2} "
-            f"{'Y' if result.cr_lf_changed else 'N':>4} "
-            f"{frame_or_pair_label(result.settings)[:23]:<23} "
-            f"{result.reason[:24]}"
-        )
+        lines.append(bank2_raw_report_row(result))
+        lines.extend(wrapped_value_lines("  SETTING: ", result.settings.label(), REPORT_WIDTH))
+        lines.extend(wrapped_value_lines("  WHY: ", result.reason, REPORT_WIDTH))
     lines.extend(
         [
             "NOTE: RAW BEHAVIOR PROBES ARE BYTE-LEVEL OBSERVATIONS ONLY.",
+            "NOTE: HASH VALUES ARE FNV-1A 32-BIT OVER SENT AND RECEIVED BYTES.",
             "NOTE: SWITCH MEANING REQUIRES COMPARING MULTIPLE SWITCH-STATE BLOCKS.",
             border_line(REPORT_WIDTH),
         ]
@@ -7307,43 +7566,59 @@ def write_bank2_text_report(
         border_line(REPORT_WIDTH),
         bordered_text("SECOND BANK CHARACTERIZATION", REPORT_WIDTH),
         border_line(REPORT_WIDTH),
-        f"APPENDED:        {created}",
-        f"RUN ID:          {result.run_id}",
-        f"DIP NOTE:        {result.switch_note or '(NOT ENTERED)'}",
-        f"KNOWN BAUD/PAIR: {result.known_baud_text}",
-        f"ASCII PASS:      {ascii_summary}",
-        f"8-BIT RESULT:    {eight_detail}",
-        f"PROBE FRAME:     {target_label}",
-        f"FLOW RESULT:     {flow_summary}",
-        f"BEHAVIOR RESULT: {behavior_summary}",
-        f"ETX/ACK RESULT:  {etx_ack_summary}",
-        f"STALE DATA SEEN: {'YES' if result.stale_data_seen else 'NO'}",
-        f"CONCLUSION:      {result.conclusion}",
-        "",
-        "TABLE:",
-        "DIP NOTE | KNOWN | ASCII SUMMARY | 8-BIT SUMMARY | RAW | ETX/ACK | FLOW | STALE | CONCLUSION",
-        border_line(REPORT_WIDTH),
-        (
-            f"{result.switch_note or '(NOT ENTERED)'} | "
-            f"{result.known_baud_text} | "
-            f"{ascii_summary} | "
-            f"{eight_detail} | "
-            f"{behavior_summary} | "
-            f"{etx_ack_summary} | "
-            f"{flow_summary} | "
-            f"{'YES' if result.stale_data_seen else 'NO'} | "
-            f"{result.conclusion}"
+        *bank2_value_lines("APPENDED:", created, indent=""),
+        *bank2_value_lines("RUN ID:", result.run_id, indent=""),
+        *bank2_value_lines(
+            "DIP NOTE:",
+            result.switch_note or "(NOT ENTERED)",
+            indent="",
         ),
+        *bank2_value_lines("KNOWN BAUD/PAIR:", result.known_baud_text, indent=""),
+        *bank2_value_lines("ASCII PASS:", ascii_summary, indent=""),
+        *bank2_value_lines("8-BIT RESULT:", eight_detail, indent=""),
+        *bank2_value_lines("PROBE FRAME:", target_label, indent=""),
+        *bank2_value_lines("FLOW RESULT:", flow_summary, indent=""),
+        *bank2_value_lines("BEHAVIOR RESULT:", behavior_summary, indent=""),
+        *bank2_value_lines("ETX/ACK RESULT:", etx_ack_summary, indent=""),
+        *bank2_value_lines(
+            "STALE DATA SEEN:",
+            "YES" if result.stale_data_seen else "NO",
+            indent="",
+        ),
+        *bank2_value_lines("CONCLUSION:", result.conclusion, indent=""),
+        "",
+        "SUMMARY TABLE:",
+        border_line(REPORT_WIDTH),
+        *bank2_value_lines(
+            "DIP NOTE:",
+            result.switch_note or "(NOT ENTERED)",
+            indent="  ",
+        ),
+        *bank2_value_lines("KNOWN:", result.known_baud_text, indent="  "),
+        *bank2_value_lines("ASCII:", ascii_summary, indent="  "),
+        *bank2_value_lines("8-BIT:", eight_detail, indent="  "),
+        *bank2_value_lines("RAW:", behavior_summary, indent="  "),
+        *bank2_value_lines("ETX/ACK:", etx_ack_summary, indent="  "),
+        *bank2_value_lines("FLOW:", flow_summary, indent="  "),
+        *bank2_value_lines(
+            "STALE:",
+            "YES" if result.stale_data_seen else "NO",
+            indent="  ",
+        ),
+        *bank2_value_lines("CONCLUSION:", result.conclusion, indent="  "),
         border_line(REPORT_WIDTH),
         "",
         "EVIDENCE:",
-        f"  ASCII:          {ascii_summary}",
-        f"  8-BIT:          {eight_detail}",
-        f"  PROBE FRAME:    {target_label}",
-        f"  RAW BYTES:      {behavior_summary}",
-        f"  ETX/ACK:        {etx_ack_summary}",
-        f"  FLOW:           {flow_summary}",
-        f"  STALE WARNING:  {'YES' if result.stale_data_seen else 'NO'}",
+        *bank2_value_lines("ASCII:", ascii_summary),
+        *bank2_value_lines("8-BIT:", eight_detail),
+        *bank2_value_lines("PROBE FRAME:", target_label),
+        *bank2_value_lines("RAW BYTES:", behavior_summary),
+        *bank2_value_lines("ETX/ACK:", etx_ack_summary),
+        *bank2_value_lines("FLOW:", flow_summary),
+        *bank2_value_lines(
+            "STALE WARNING:",
+            "YES" if result.stale_data_seen else "NO",
+        ),
         "",
         *bank2_behavior_report_lines(result.behavior_results),
         "",
@@ -7370,46 +7645,38 @@ def print_bank2_report(
     """Print the second-bank characterization conclusion."""
     print()
     print_report_title("SECOND BANK CHARACTERIZATION")
-    print_wrapped_value("  DIP NOTE:          ", result.switch_note or "(NOT ENTERED)")
-    print(f"  KNOWN BAUD/PAIR:    {result.known_baud_text}")
+    print_bank2_value("DIP NOTE:", result.switch_note or "(NOT ENTERED)")
+    print_bank2_value("KNOWN BAUD/PAIR:", result.known_baud_text)
     target = best_bank2_followup_target(
         result.ascii_results,
         result.eight_bit_results,
     )
-    print_wrapped_value("  ASCII PASS:        ", bank2_ascii_pass_summary(result.ascii_results))
-    print_wrapped_value(
-        "  8-BIT RESULT:      ",
+    print_bank2_value("ASCII PASS:", bank2_ascii_pass_summary(result.ascii_results))
+    print_bank2_value(
+        "8-BIT RESULT:",
         bank2_eight_bit_detail_summary(result.eight_bit_results),
     )
-    print_wrapped_value(
-        "  PROBE FRAME:     ",
+    print_bank2_value(
+        "PROBE FRAME:",
         frame_or_pair_label(target.settings) if target else "(NONE)",
     )
     flow_summary = bank2_flow_summary(result.flow_results)
     if result.flow_skip_reason:
         flow_summary = f"SKIPPED: {result.flow_skip_reason}"
-    print_wrapped_value("  FLOW RESULT:       ", flow_summary)
-    print_wrapped_value(
-        "  BEHAVIOR RESULT:   ",
+    print_bank2_value("FLOW RESULT:", flow_summary)
+    print_bank2_value(
+        "BEHAVIOR RESULT:",
         bank2_behavior_summary(result.behavior_results),
     )
-    print_wrapped_value(
-        "  ETX/ACK RESULT:    ",
+    print_bank2_value(
+        "ETX/ACK RESULT:",
         bank2_etx_ack_summary(result.etx_ack_results),
     )
     if result.behavior_results:
         print(border_line(REPORT_WIDTH))
-        print("  RAW PROBE     STATUS       SENT  READ  EX FF CRLF")
+        print(bank2_raw_console_header())
         for probe in result.behavior_results:
-            print(
-                f"  {probe.name:<12} "
-                f"{probe.status:<11} "
-                f"{probe.bytes_sent:>5} "
-                f"{probe.bytes_received:>5} "
-                f"{'Y' if probe.exact_match else 'N':>2} "
-                f"{'Y' if probe.form_feed_inserted else 'N':>2} "
-                f"{'Y' if probe.cr_lf_changed else 'N':>4}"
-            )
+            print(bank2_raw_console_row(probe))
     if result.etx_ack_results:
         print(border_line(REPORT_WIDTH))
         print("  ETX/ACK      STATUS       ETX ACK  FWD-S/R  REV-S/R")
@@ -7422,9 +7689,9 @@ def print_bank2_report(
                 f"{probe.forward_bytes_sent:>3}/{probe.forward_bytes_received:<4} "
                 f"{probe.reverse_bytes_sent:>3}/{probe.reverse_bytes_received:<4}"
             )
-    print(f"  STALE DATA SEEN:    {'YES' if result.stale_data_seen else 'NO'}")
-    print_wrapped_value("  CONCLUSION:         ", result.conclusion)
-    print_wrapped_value("  TEXT REPORT:        ", f"{report_path} (APPENDED)")
+    print_bank2_value("STALE DATA SEEN:", "YES" if result.stale_data_seen else "NO")
+    print_bank2_value("CONCLUSION:", result.conclusion)
+    print_bank2_value("TEXT REPORT:", f"{report_path} (APPENDED)")
     print(border_line(REPORT_WIDTH))
 
 
@@ -7442,10 +7709,16 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
     print()
     print_report_title("SECOND BANK CHARACTERIZATION")
     print("AUTOMATED TEST FOR THE CURRENT SECOND-BANK DIP SETTING.")
-    print(f"PORTS: {options.in_port} -> BUFFER -> {options.out_port}")
-    print(
-        "SEQUENCE: PURGE, ASCII FRAME TEST, 8-BIT CHALLENGE, "
-        "RAW BEHAVIOR, ETX/ACK PATH, FLOW VALIDATION."
+    print_wrapped_value(
+        "PORTS: ",
+        f"{options.in_port} -> BUFFER -> {options.out_port}",
+    )
+    print_wrapped_value(
+        "SEQUENCE: ",
+        (
+            "PURGE, ASCII FRAME TEST, 8-BIT CHALLENGE, RAW BEHAVIOR, "
+            "ETX/ACK PATH, FLOW VALIDATION."
+        ),
     )
     print(border_line(REPORT_WIDTH))
     default_baud = options.min_baud if options.min_baud == options.max_baud else 1200
@@ -7455,7 +7728,7 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
     if input_baud != output_baud:
         print("INPUT/OUTPUT BAUD DIFFER; INDEPENDENT FRAME TESTING FORCED ON.")
         independent_frames = True
-    run_behavior = prompt_yes_no("RUN RAW JOB-BEHAVIOR PROBES", True)
+    run_behavior = prompt_yes_no("RUN RAW BYTE-BEHAVIOR PROBES", True)
     job_timeout_observe = DEFAULT_BANK2_JOB_TIMEOUT_OBSERVE_SECONDS
     if run_behavior:
         job_timeout_observe = prompt_float(
@@ -7595,7 +7868,7 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
             )
         else:
             print()
-            print_report_title("BANK 2 RAW JOB-BEHAVIOR PROBES")
+            print_report_title("BANK 2 RAW BYTE-BEHAVIOR PROBES")
             print("SKIPPED: NO CLEAN ASCII TARGET WAS FOUND.")
             print(border_line(REPORT_WIDTH))
 
@@ -7692,7 +7965,33 @@ def memory_test_reason(candidate: CandidateResult, payload: ProbePayload) -> str
 
 def memory_test_status_text(candidate: CandidateResult, payload: ProbePayload) -> str:
     """Return the exact-stream check status for compatibility with old reports."""
-    return "PASS" if memory_test_passed(candidate, payload) else "FAIL"
+    return "OK" if memory_test_passed(candidate, payload) else "CHECK"
+
+
+def memory_test_loop_status(diagnosis: MemoryTestDiagnosis) -> str:
+    """Return a terse operator status for one memory-test loop."""
+    if diagnosis.code == "exact-pass":
+        return "OK"
+    if diagnosis.code == "probable-overflow-clean":
+        return "FULL"
+    if diagnosis.code == "clean-prefix-incomplete":
+        return "SHORT"
+    if diagnosis.code in {"missing-with-content-errors", "possible-content-corruption"}:
+        return "CHANGED"
+    if diagnosis.code == "extra-output":
+        return "STALE"
+    if diagnosis.code in {"serial-error", "incomplete-send"}:
+        return "ERROR"
+    return "CHECK"
+
+
+def memory_test_result_expected(result: MemoryTestResult) -> bool:
+    """Return whether one memory-test loop met the selected operator policy."""
+    diagnosis = memory_test_diagnosis(result)
+    status = memory_test_loop_status(diagnosis)
+    return status == "OK" or (
+        status == "FULL" and result.config.accept_full_result
+    )
 
 
 def memory_test_primary_trial(candidate: CandidateResult) -> TrialResult | None:
@@ -7793,8 +8092,8 @@ def memory_test_diagnosis(result: MemoryTestResult) -> MemoryTestDiagnosis:
             "exact-pass",
             "EXACT STREAM RETURNED",
             "ALL BYTES RETURNED IN ORDER.",
-            "PASS",
-            "PASS",
+            "YES",
+            "OK",
             capacity_check,
             "NO ERROR SEEN",
             operator_note,
@@ -7861,7 +8160,7 @@ def memory_test_diagnosis(result: MemoryTestResult) -> MemoryTestDiagnosis:
             "BUFFER FULL OBSERVED",
             f"ABOUT {target_label} RETURNED AFTER WRITE; EXCESS BYTES DROPPED.",
             "NO - OVERFILL TEST",
-            "PASS FOR RETURNED BYTES",
+            "OK FOR RETURNED BYTES",
             "FULL / OVERFLOW",
             "NO ERROR SEEN",
             "USE CUSTOM SIZE BELOW THIS POINT FOR A NON-OVERFLOW RAM CHECK.",
@@ -7872,7 +8171,7 @@ def memory_test_diagnosis(result: MemoryTestResult) -> MemoryTestDiagnosis:
             "OUTPUT ENDED EARLY",
             "START OF STREAM MATCHED; REMAINING BYTES DID NOT ARRIVE.",
             "NO",
-            "PASS FOR RETURNED BYTES",
+            "OK FOR RETURNED BYTES",
             "UNKNOWN",
             "NO ERROR SEEN IN RETURNED BYTES",
             "RERUN OR TRY A SMALLER CUSTOM SIZE.",
@@ -7883,7 +8182,7 @@ def memory_test_diagnosis(result: MemoryTestResult) -> MemoryTestDiagnosis:
             "CHECK DATA",
             "OUTPUT IS SHORT AND RETURNED DATA DOES NOT STAY IN ORDER.",
             "NO",
-            "FAIL",
+            "CHECK",
             "UNKNOWN",
             "POSSIBLE IF REPEATABLE",
             "REPEAT TEST; SAME OFFSET POINTS TO RAM OR DATA PATH.",
@@ -7894,7 +8193,7 @@ def memory_test_diagnosis(result: MemoryTestResult) -> MemoryTestDiagnosis:
             "POSSIBLE RAM OR DATA CORRUPTION",
             "RETURNED CONTENT CHANGED.",
             "NO",
-            "FAIL",
+            "CHANGED",
             "UNKNOWN",
             "SUSPECT IF REPEATABLE",
             "REPEAT TEST; SAME BYTE OR BIT ERRORS POINT TO RAM.",
@@ -7919,6 +8218,8 @@ def write_memory_test_text_report(path: Path, result: MemoryTestResult) -> None:
     settings = result.settings
     trial = candidate.trials[0] if candidate.trials else None
     diagnosis = memory_test_diagnosis(result)
+    status = memory_test_loop_status(diagnosis)
+    expected_text = "YES" if memory_test_result_expected(result) else "CHECK"
     peak_estimate = estimated_memory_test_peak_fill_bytes(
         result.config.input_baud,
         result.config.output_baud,
@@ -7930,40 +8231,43 @@ def write_memory_test_text_report(path: Path, result: MemoryTestResult) -> None:
     )
     lines = [
         border_line(REPORT_WIDTH),
-        bordered_text("SERIAL PROBE MEMORY TEST", REPORT_WIDTH),
+        bordered_text("SERIAL PROBE MEMORY LOOP", REPORT_WIDTH),
         border_line(REPORT_WIDTH),
+        f"RUN/LOOP:        {result.config.run_id}  {result.loop_index}/{result.loop_total}",
         f"STARTED UTC:     {result.started_at}",
         f"COMPLETED UTC:   {result.completed_at}",
-        f"RUN ID:          {result.config.run_id}",
+        f"STATUS:          {status}",
+        f"EXPECTED:        {expected_text}",
         f"MODE:            {mode_label}",
+        f"TARGET:          {byte_size_detail(result.config.target_bytes)}",
+        (
+            f"POLICY:          FULL OK={yes_no_text(result.config.accept_full_result)} "
+            f"STOP={yes_no_text(result.config.stop_on_unexpected)}"
+        ),
+        f"COM PATH:        {result.config.in_port} -> BUFFER -> {result.config.out_port}",
+        f"INPUT:           {settings.input_settings.label()}",
+        f"OUTPUT:          {settings.output_settings.label()}",
+        f"DIP NOTE:        {result.config.switch_note or '(NOT ENTERED)'}",
         f"RESULT:          {diagnosis.result}",
         f"FINDING:         {diagnosis.finding}",
-        f"EXACT STREAM:    {diagnosis.exact_stream}",
         f"DATA CHECK:      {diagnosis.data_check}",
-        f"CAPACITY CHECK:  {diagnosis.capacity_check}",
+        f"CAPACITY:        {diagnosis.capacity_check}",
         f"RAM CHECK:       {diagnosis.ram_check}",
-        f"COM PATH:        {result.config.in_port} -> BUFFER -> {result.config.out_port}",
-        f"INPUT SETTING:   {settings.input_settings.label()}",
-        f"OUTPUT SETTING:  {settings.output_settings.label()}",
-        f"DIP NOTE:        {result.config.switch_note or '(NOT ENTERED)'}",
-        f"BUFFER TARGET:   {byte_size_detail(result.config.target_bytes)}",
         f"PAYLOAD:         {payload.byte_count} ASCII BYTES",
         f"EST. PEAK FILL:  {peak_estimate} BYTES",
-        f"SENT:            {candidate.bytes_sent} BYTES",
-        f"RECEIVED:        {candidate.bytes_received} BYTES",
-        f"RETURNED MATCH:  {diagnosis.content_integrity_ratio:.3f}",
-        f"COMPLETENESS:    {diagnosis.completeness_ratio:.3f}",
+        f"SENT/READ:       {candidate.bytes_sent}/{candidate.bytes_received}",
+        f"MATCH:           {diagnosis.content_integrity_ratio:.3f}",
+        f"COMPLETE:        {diagnosis.completeness_ratio:.3f}",
         f"MATCHED START:   {diagnosis.exact_prefix_bytes} BYTE(S)",
         f"LINE CHECKS:     {metrics.valid_probe_line_count}/{payload.line_count}",
         f"MISSING/EXTRA:   {metrics.missing_bytes}/{metrics.extra_bytes}",
-        f"READ BY WRITE:   {diagnosis.bytes_received_at_write_done} BYTE(S)",
-        f"POST-WRITE READ: {diagnosis.bytes_delivered_after_write_done} BYTE(S)",
-        f"WRITE PRESSURE:  {diagnosis.write_pressure_bytes} BYTE(S)",
+        f"READ/POST/PRESS: {diagnosis.bytes_received_at_write_done}/"
+        f"{diagnosis.bytes_delivered_after_write_done}/{diagnosis.write_pressure_bytes}",
         f"PURGE:           {result.purge.bytes_drained} BYTES, {result.purge.reason.upper()}",
         f"ELAPSED:         {format_duration(result.elapsed_sec)}",
     ]
     lines.extend(wrapped_value_lines("NOTE:            ", diagnosis.operator_note, REPORT_WIDTH))
-    if trial:
+    if trial and not memory_test_result_expected(result):
         lines.extend(
             [
                 f"PREVIEW ASCII:   {trial.received_preview_ascii}",
@@ -7981,6 +8285,8 @@ def print_memory_test_report(result: MemoryTestResult, report_path: Path) -> Non
     payload = result.payload
     metrics = candidate.metrics
     diagnosis = memory_test_diagnosis(result)
+    status = memory_test_loop_status(diagnosis)
+    expected_text = "YES" if memory_test_result_expected(result) else "CHECK"
     peak_estimate = estimated_memory_test_peak_fill_bytes(
         result.config.input_baud,
         result.config.output_baud,
@@ -7991,32 +8297,105 @@ def print_memory_test_report(result: MemoryTestResult, report_path: Path) -> Non
         result.config.target_bytes,
     )
     print()
-    print_report_title("MEMORY TEST RESULT")
-    print(f"  RESULT:              {diagnosis.result}")
-    print_wrapped_value("  FINDING:             ", diagnosis.finding)
-    print(f"  EXACT STREAM:        {diagnosis.exact_stream}")
-    print(f"  DATA CHECK:          {diagnosis.data_check}")
-    print(f"  CAPACITY CHECK:      {diagnosis.capacity_check}")
-    print(f"  RAM CHECK:           {diagnosis.ram_check}")
-    print(f"  MODE:                {mode_label}")
-    print(f"  TARGET:              {byte_size_detail(result.config.target_bytes)}")
-    print(f"  PAYLOAD:             {payload.byte_count} ASCII BYTES")
-    print(f"  EST. PEAK BUFFER:    {peak_estimate} BYTES")
-    print(f"  INPUT:               {result.settings.input_settings.label()}")
-    print(f"  OUTPUT:              {result.settings.output_settings.label()}")
-    print(f"  SENT/RECEIVED:       {candidate.bytes_sent}/{candidate.bytes_received}")
-    print(f"  RETURNED MATCH:      {diagnosis.content_integrity_ratio:.3f}")
-    print(f"  COMPLETENESS:        {diagnosis.completeness_ratio:.3f}")
-    print(f"  MATCHED FROM START:  {diagnosis.exact_prefix_bytes} BYTE(S)")
-    print(f"  LINE CHECKS:         {metrics.valid_probe_line_count}/{payload.line_count}")
-    print(f"  MISSING/EXTRA:       {metrics.missing_bytes}/{metrics.extra_bytes}")
-    print(f"  READ BY WRITE DONE:  {diagnosis.bytes_received_at_write_done} BYTE(S)")
-    print(f"  POST-WRITE DELIVER:  {diagnosis.bytes_delivered_after_write_done} BYTE(S)")
-    print(f"  WRITE PRESSURE:      {diagnosis.write_pressure_bytes} BYTE(S)")
-    print(f"  PURGE:               {result.purge.bytes_drained} BYTES, {result.purge.reason.upper()}")
-    print(f"  RUN TIME:            {format_duration(result.elapsed_sec)}")
-    print_wrapped_value("  NOTE:                ", diagnosis.operator_note)
-    print_wrapped_value("  TEXT REPORT:         ", f"{report_path} (APPENDED)")
+    print_report_title("MEMORY LOOP")
+    print(f"  LOOP:       {result.loop_index}/{result.loop_total}")
+    print(f"  STATUS:     {status}  EXPECTED: {expected_text}")
+    print(f"  RESULT:     {diagnosis.result}")
+    print(f"  TARGET:     {byte_size_label(result.config.target_bytes)}  MODE: {mode_label}")
+    print(f"  SENT/READ:  {candidate.bytes_sent}/{candidate.bytes_received}")
+    print(
+        f"  MATCH:      {diagnosis.content_integrity_ratio:.3f}  "
+        f"COMPLETE: {diagnosis.completeness_ratio:.3f}"
+    )
+    print(f"  MISS/EXTRA: {metrics.missing_bytes}/{metrics.extra_bytes}")
+    print(f"  PEAK EST.:  {peak_estimate} BYTES")
+    print(f"  PURGE:      {result.purge.bytes_drained} BYTES, {result.purge.reason.upper()}")
+    print(f"  ELAPSED:    {format_duration(result.elapsed_sec)}")
+    print_wrapped_value("  NOTE:       ", diagnosis.operator_note)
+    print_wrapped_value("  REPORT:     ", f"{report_path} (APPENDED)")
+    print(border_line(REPORT_WIDTH))
+
+
+def memory_test_summary_status(
+    config: MemoryTestConfig,
+    results: Sequence[MemoryTestResult],
+    stopped_on_unexpected: bool,
+) -> str:
+    """Return the final operator status for a memory-test loop run."""
+    if not results:
+        return "CHECK"
+    all_expected = all(memory_test_result_expected(result) for result in results)
+    if all_expected and len(results) == config.loop_count:
+        return "OK"
+    if stopped_on_unexpected:
+        return "STOPPED"
+    return "CHECK"
+
+
+def memory_test_summary_counts(results: Sequence[MemoryTestResult]) -> dict[str, int]:
+    """Return counts by terse memory-test loop status."""
+    counts = {status: 0 for status in ("OK", "FULL", "SHORT", "CHANGED", "STALE", "ERROR", "CHECK")}
+    for result in results:
+        status = memory_test_loop_status(memory_test_diagnosis(result))
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def write_memory_test_summary_report(
+    path: Path,
+    config: MemoryTestConfig,
+    results: Sequence[MemoryTestResult],
+    total_elapsed: float,
+    stopped_on_unexpected: bool,
+) -> None:
+    """Append the compact memory-test loop summary to the text report."""
+    counts = memory_test_summary_counts(results)
+    mode_label = memory_test_mode_label(config.mode, config.target_bytes)
+    final_status = memory_test_summary_status(config, results, stopped_on_unexpected)
+    lines = [
+        border_line(REPORT_WIDTH),
+        bordered_text("SERIAL PROBE MEMORY SUMMARY", REPORT_WIDTH),
+        border_line(REPORT_WIDTH),
+        f"RUN ID:          {config.run_id}",
+        f"FINAL:           {final_status}",
+        f"TARGET:          {byte_size_detail(config.target_bytes)}",
+        f"MODE:            {mode_label}",
+        f"LOOPS:           {len(results)}/{config.loop_count}",
+        (
+            f"POLICY:          FULL OK={yes_no_text(config.accept_full_result)} "
+            f"STOP={yes_no_text(config.stop_on_unexpected)}"
+        ),
+        f"OK/FULL:         {counts['OK']}/{counts['FULL']}",
+        f"SHORT/CHANGED:   {counts['SHORT']}/{counts['CHANGED']}",
+        f"STALE/ERROR:     {counts['STALE']}/{counts['ERROR']}",
+        f"CHECK:           {counts['CHECK']}",
+        f"TOTAL ELAPSED:   {format_duration(total_elapsed)}",
+        border_line(REPORT_WIDTH),
+    ]
+    with path.open("a", encoding="utf-8") as report_file:
+        report_file.write("\n".join(lines) + "\n")
+
+
+def print_memory_test_summary(
+    config: MemoryTestConfig,
+    results: Sequence[MemoryTestResult],
+    report_path: Path,
+    total_elapsed: float,
+    stopped_on_unexpected: bool,
+) -> None:
+    """Print the compact terminal summary for a memory-test loop run."""
+    counts = memory_test_summary_counts(results)
+    final_status = memory_test_summary_status(config, results, stopped_on_unexpected)
+    print()
+    print_report_title("MEMORY SUMMARY")
+    print(f"  FINAL:      {final_status}")
+    print(f"  LOOPS:      {len(results)}/{config.loop_count}")
+    print(f"  OK/FULL:    {counts['OK']}/{counts['FULL']}")
+    print(f"  SHORT/CHG:  {counts['SHORT']}/{counts['CHANGED']}")
+    print(f"  STALE/ERR:  {counts['STALE']}/{counts['ERROR']}")
+    print(f"  CHECK:      {counts['CHECK']}")
+    print(f"  TOTAL:      {format_duration(total_elapsed)}")
+    print_wrapped_value("  REPORT:     ", f"{report_path} (APPENDED)")
     print(border_line(REPORT_WIDTH))
 
 
@@ -8030,36 +8409,11 @@ def run_memory_test(options: ScanOptions) -> int:
     logger = setup_logging(options.log_file)
     serial_module = import_pyserial()
     settings = memory_test_settings(config.input_baud, config.output_baud)
-    nonce = ProbeNonce(
-        run_id=config.run_id,
-        candidate_id="MEMORY",
-        trial_id="T01",
-        switch_note_hash=switch_note_hash(config.switch_note),
-    )
-    payload = generate_probe_payload(
-        config.payload_bytes,
-        PAYLOAD_MODE_ASCII,
-        nonce,
-    )
-    memory_options = dataclasses.replace(
-        options,
-        switch_note=config.switch_note,
-        payload_bytes=payload.byte_count,
-        read_timeout=max(options.read_timeout, MEMORY_TEST_READ_QUIET_SECONDS),
-        bursts=1,
-        no_pre_drain=False,
-        pre_drain_timeout=max(options.pre_drain_timeout, MEMORY_TEST_PRE_DRAIN_TIMEOUT),
-        pre_drain_quiet=max(options.pre_drain_quiet, BUFFER_PURGE_QUIET_SECONDS),
-        max_drain_bytes=max(options.max_drain_bytes, payload.byte_count + config.target_bytes),
-        turbo_discovery_enabled=False,
-        ask_on_top_match=False,
-        auto_validate_top_matches=False,
-        run_id=config.run_id,
-    )
     transfer_estimate = max(
-        estimated_transmit_seconds(settings.input_settings, payload.byte_count),
-        estimated_receive_seconds(settings.output_settings, payload.byte_count),
+        estimated_transmit_seconds(settings.input_settings, config.payload_bytes),
+        estimated_receive_seconds(settings.output_settings, config.payload_bytes),
     ) + MEMORY_TEST_READ_QUIET_SECONDS
+    total_estimate = transfer_estimate * config.loop_count
 
     print()
     print_report_title("MEMORY TEST START")
@@ -8067,68 +8421,151 @@ def run_memory_test(options: ScanOptions) -> int:
     print(
         f"MODE: {memory_test_mode_label(config.mode, config.target_bytes)}; "
         f"TARGET={byte_size_label(config.target_bytes)}; "
-        f"PAYLOAD={payload.byte_count} BYTES."
+        f"PAYLOAD={config.payload_bytes} BYTES."
     )
-    print(f"PORTS: {options.in_port} -> BUFFER -> {options.out_port}.")
+    print(
+        f"LOOPS: {config.loop_count}; "
+        f"FULL COUNTS OK: {yes_no_text(config.accept_full_result)}."
+    )
+    print(f"STOP ON UNEXPECTED: {yes_no_text(config.stop_on_unexpected)}.")
+    print_wrapped_value(
+        "PORTS: ",
+        f"{options.in_port} -> BUFFER -> {options.out_port}.",
+    )
     print(f"INPUT: {settings.input_settings.label()}.")
     print(f"OUTPUT: {settings.output_settings.label()}.")
-    print(f"ESTIMATE: {format_duration(transfer_estimate)}; FINISH ABOUT {format_finish_clock(transfer_estimate)}.")
-    print("REPORT SEPARATES EXACT STREAM, DATA CHECK, CAPACITY CHECK, AND RAM CHECK.")
+    print_wrapped_value(
+        "TIME: ",
+        (
+            f"EACH {format_duration(transfer_estimate)}; "
+            f"TOTAL {format_duration(total_estimate)}; "
+            f"FINISH ABOUT {format_finish_clock(total_estimate)}."
+        ),
+    )
+    print_wrapped_value(
+        "REPORT: ",
+        "EXACT STREAM, DATA CHECK, CAPACITY CHECK, AND RAM CHECK.",
+    )
     if config.mode == MEMORY_TEST_MODE_FILL:
         print("FILL MODE MAY REPORT BUFFER FULL WHEN EXCESS BYTES ARE DROPPED.")
     print_progress_legend()
     print(border_line(REPORT_WIDTH))
 
-    started = time.monotonic()
-    started_at = dt.datetime.now(dt.timezone.utc).isoformat()
-    purge_max_seconds = max(
-        estimated_buffer_drain_seconds(settings.output_settings, config.target_bytes),
-        MEMORY_TEST_PRE_DRAIN_TIMEOUT,
-    )
-    purge = run_known_baud_purge(
-        serial_module=serial_module,
-        options=memory_options,
-        logger=logger,
-        settings=settings.output_settings,
-        max_seconds=purge_max_seconds,
-        reason="CLEAR OUTPUT BEFORE MEMORY TEST.",
-        capacity_bytes=config.target_bytes,
-    )
-    if not purge.quiet:
-        print()
-        print_report_title("MEMORY TEST PURGE WARNING")
-        print("OUTPUT DID NOT REPORT QUIET BEFORE THE TEST.")
-        print("RESULT MAY BE MARKED STALE OR CHECK SETTINGS.")
-        if purge.error:
-            print_wrapped_value("  DETAIL: ", purge.error)
-        print(border_line(REPORT_WIDTH))
+    total_started = time.monotonic()
+    results: list[MemoryTestResult] = []
+    stopped_on_unexpected = False
+    for loop_index in range(1, config.loop_count + 1):
+        nonce = ProbeNonce(
+            run_id=config.run_id,
+            candidate_id="MEMORY",
+            trial_id=f"L{loop_index:03d}",
+            switch_note_hash=switch_note_hash(config.switch_note),
+        )
+        payload = generate_probe_payload(
+            config.payload_bytes,
+            PAYLOAD_MODE_ASCII,
+            nonce,
+        )
+        memory_options = dataclasses.replace(
+            options,
+            switch_note=config.switch_note,
+            payload_bytes=payload.byte_count,
+            read_timeout=max(options.read_timeout, MEMORY_TEST_READ_QUIET_SECONDS),
+            bursts=1,
+            no_pre_drain=False,
+            pre_drain_timeout=max(
+                options.pre_drain_timeout,
+                MEMORY_TEST_PRE_DRAIN_TIMEOUT,
+            ),
+            pre_drain_quiet=max(options.pre_drain_quiet, BUFFER_PURGE_QUIET_SECONDS),
+            max_drain_bytes=max(
+                options.max_drain_bytes,
+                payload.byte_count + config.target_bytes,
+            ),
+            turbo_discovery_enabled=False,
+            ask_on_top_match=False,
+            auto_validate_top_matches=False,
+            run_id=config.run_id,
+        )
 
-    candidate = run_dual_candidate(
-        serial_module=serial_module,
-        index=1,
-        total=1,
-        settings=settings,
-        options=memory_options,
-        payload=payload,
-        logger=logger,
-        progress=console_progress,
+        print()
+        print_report_title(f"MEMORY LOOP {loop_index}/{config.loop_count}")
+        started = time.monotonic()
+        started_at = dt.datetime.now(dt.timezone.utc).isoformat()
+        purge_max_seconds = max(
+            estimated_buffer_drain_seconds(settings.output_settings, config.target_bytes),
+            MEMORY_TEST_PRE_DRAIN_TIMEOUT,
+        )
+        purge = run_known_baud_purge(
+            serial_module=serial_module,
+            options=memory_options,
+            logger=logger,
+            settings=settings.output_settings,
+            max_seconds=purge_max_seconds,
+            reason="CLEAR OUTPUT BEFORE MEMORY TEST.",
+            capacity_bytes=config.target_bytes,
+        )
+        if not purge.quiet:
+            print()
+            print_report_title("MEMORY PURGE WARNING")
+            print("OUTPUT DID NOT REPORT QUIET BEFORE THE TEST.")
+            print("RESULT MAY BE MARKED STALE OR CHECK SETTINGS.")
+            if purge.error:
+                print_wrapped_value("  DETAIL: ", purge.error)
+            print(border_line(REPORT_WIDTH))
+
+        candidate = run_dual_candidate(
+            serial_module=serial_module,
+            index=loop_index,
+            total=config.loop_count,
+            settings=settings,
+            options=memory_options,
+            payload=payload,
+            logger=logger,
+            progress=console_progress,
+        )
+        elapsed = time.monotonic() - started
+        completed_at = dt.datetime.now(dt.timezone.utc).isoformat()
+        result = MemoryTestResult(
+            config=config,
+            settings=settings,
+            payload=payload,
+            purge=purge,
+            candidate=candidate,
+            loop_index=loop_index,
+            loop_total=config.loop_count,
+            started_at=started_at,
+            completed_at=completed_at,
+            elapsed_sec=elapsed,
+        )
+        results.append(result)
+        write_memory_test_text_report(options.text_report, result)
+        print_memory_test_report(result, options.text_report)
+        if config.stop_on_unexpected and not memory_test_result_expected(result):
+            stopped_on_unexpected = True
+            print("STOPPING: LOOP RESULT NEEDS CHECK.")
+            break
+
+    total_elapsed = time.monotonic() - total_started
+    write_memory_test_summary_report(
+        options.text_report,
+        config,
+        results,
+        total_elapsed,
+        stopped_on_unexpected,
     )
-    elapsed = time.monotonic() - started
-    completed_at = dt.datetime.now(dt.timezone.utc).isoformat()
-    result = MemoryTestResult(
-        config=config,
-        settings=settings,
-        payload=payload,
-        purge=purge,
-        candidate=candidate,
-        started_at=started_at,
-        completed_at=completed_at,
-        elapsed_sec=elapsed,
+    print_memory_test_summary(
+        config,
+        results,
+        options.text_report,
+        total_elapsed,
+        stopped_on_unexpected,
     )
-    write_memory_test_text_report(options.text_report, result)
-    print_memory_test_report(result, options.text_report)
-    final_code = memory_test_diagnosis(result).code
-    return 0 if final_code in {"exact-pass", "probable-overflow-clean"} else 1
+    return (
+        0
+        if memory_test_summary_status(config, results, stopped_on_unexpected) == "OK"
+        else 1
+    )
 
 
 def print_commands() -> None:
@@ -8424,9 +8861,12 @@ def run_dual_bank_scan(
         f"BEFORE FULL MATRIX FALLBACK."
     )
     print(f"FULL MATRIX: {len(full_candidates)} INPUT/OUTPUT FRAME PAIRS IF NEEDED.")
-    print(
-        f"PORTS: {options.in_port} -> BUFFER -> {options.out_port}; "
-        f"TEST={payload.byte_count} BYTES X {options.bursts}"
+    print_wrapped_value(
+        "PORTS: ",
+        (
+            f"{options.in_port} -> BUFFER -> {options.out_port}; "
+            f"TEST={payload.byte_count} BYTES X {options.bursts}"
+        ),
     )
     print("DISCOVERY ORDER: PHASE 0 FRAME, OUTPUT SWEEP, INPUT SWEEP.")
     if dual_flow_discovery_enabled:
@@ -8440,8 +8880,8 @@ def run_dual_bank_scan(
     else:
         print("VALIDATION: OFF.")
     print_progress_legend()
-    print(f"REPORT: {options.text_report} (APPEND)")
-    print(f"DEBUG LOG: {options.log_file}")
+    print_wrapped_value("REPORT: ", f"{options.text_report} (APPEND)")
+    print_wrapped_value("DEBUG LOG: ", options.log_file)
     staged_rough_total = 0.0
     staged_estimate_candidates = list(staged_preview_candidates)
     if dual_flow_discovery_enabled:
@@ -9146,6 +9586,9 @@ def run_self_tests() -> int:
             mode=MEMORY_TEST_MODE_FILL,
             payload_bytes=overflow_payload.byte_count,
             target_bytes=overflow_target,
+            loop_count=1,
+            accept_full_result=True,
+            stop_on_unexpected=True,
             switch_note="",
             run_id=nonce_a.run_id,
         ),
@@ -9153,6 +9596,8 @@ def run_self_tests() -> int:
         payload=overflow_payload,
         purge=DrainResult(0, 0.0, True, "quiet", None),
         candidate=overflow_candidate,
+        loop_index=1,
+        loop_total=1,
         started_at="",
         completed_at="",
         elapsed_sec=0.0,
@@ -9163,7 +9608,11 @@ def run_self_tests() -> int:
     ), "beginning-matched incomplete memory test was not classified as probable overflow"
     assert (
         overflow_diagnosis.result == "BUFFER FULL OBSERVED"
-    ), "probable overflow should not present as a generic fail"
+    ), "probable overflow should not present as a generic check"
+    assert (
+        memory_test_loop_status(overflow_diagnosis) == "FULL"
+    ), "probable overflow should use FULL loop status"
+    assert memory_test_result_expected(overflow_result), "accepted full result was not expected"
     assert "16K" in overflow_diagnosis.finding, "overflow finding should name target size"
     assert (
         overflow_diagnosis.ram_check == "NO ERROR SEEN"
@@ -9297,6 +9746,18 @@ def run_self_tests() -> int:
         b"RAW\r\n",
     )
     assert exact and not form_feed and not cr_lf and status == "exact", "raw exact classification failed"
+    behavior_payloads = dict(bank2_behavior_probe_payloads("B2RUN", 1, None))
+    assert b"\x1b@" in behavior_payloads["PRINT_CTRL"], "printer ESC reset missing"
+    assert b"\x1bE" in behavior_payloads["PRINT_CTRL"], "printer ESC bold missing"
+    assert b"\x1bF" in behavior_payloads["PRINT_CTRL"], "printer ESC cancel missing"
+    assert (
+        bytes(range(0x20, 0x7F)) in behavior_payloads["ASCII_SWEEP"]
+    ), "printable ASCII sweep missing"
+    assert b"\x11" not in behavior_payloads["CTL7_SAFE"], "safe control sweep included XON"
+    assert b"\x13" not in behavior_payloads["CTL7_SAFE"], "safe control sweep included XOFF"
+    assert b"\x11" in behavior_payloads["CTL7_FULL"], "full control sweep omitted XON"
+    assert b"\x13" in behavior_payloads["CTL7_FULL"], "full control sweep omitted XOFF"
+    assert first_mismatch_offset(b"ABCD", b"ABX") == 2, "first mismatch offset was wrong"
     exact, form_feed, cr_lf, status, _reason = classify_bank2_behavior_bytes(
         b"RAW\r\n",
         b"RAW\r\n\x0c",
@@ -9341,6 +9802,11 @@ def run_self_tests() -> int:
         settings=same_followup,
         bytes_sent=5,
         bytes_received=5,
+        sent_hash=f"{fnv1a32(b'ABCDE'):08X}",
+        received_hash=f"{fnv1a32(b'ABCDE'):08X}",
+        first_mismatch_offset=None,
+        missing_bytes=0,
+        extra_bytes=0,
         exact_match=True,
         form_feed_inserted=False,
         cr_lf_changed=False,

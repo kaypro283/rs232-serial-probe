@@ -52,9 +52,9 @@ The memory test is deliberately separate from scan discovery:
 - Fixed frame: `8E1`.
 - Flow control: `none`.
 - User-selected input baud and output baud from the supported baud table.
-- Append-only result block in the normal text report.
+- Append-only loop blocks and a final summary in the normal text report.
 - Result fields separate exact stream return, returned-data integrity, capacity behavior, and RAM suspicion.
-- In `FILL` mode, dropped excess bytes can be a useful `BUFFER FULL OBSERVED` result rather than a generic failure.
+- In `FILL` mode, dropped excess bytes can be a useful `BUFFER FULL OBSERVED` result rather than a generic problem.
 
 The memory test first asks for a target size. Presets cover 16K, 32K, 48K, and 64K, and the custom choice accepts a K-sized target. The size menu then uses that target:
 
@@ -68,18 +68,21 @@ The memory test first asks for a target size. Presets cover 16K, 32K, 48K, and 6
 
 `CUSTOM` is useful after an overflow-like result: lower the payload and rerun to bracket the largest clean near-fill transfer without forcing another overflow-stress run.
 
+Before starting, the memory test asks for a finite loop count, whether `FULL` counts as `OK`, and whether to stop on the first unexpected result. The default is one loop, counting `FULL` as `OK` for fill-mode tests, and stopping when a loop needs operator review.
+
 At low output baud rates this test can take a long time. A full 64K stream at `300` baud with `8E1` framing takes more than 35 minutes to drain, before any safety margin.
 
 Interpretation is part of the memory-test report:
 
 - `RESULT` gives the operator-level outcome, such as `EXACT STREAM RETURNED`, `BUFFER FULL OBSERVED`, or `CHECK DATA`.
+- `STATUS` is terse: `OK`, `FULL`, `SHORT`, `CHANGED`, `STALE`, `ERROR`, or `CHECK`.
 - `DATA CHECK` says whether returned bytes matched.
 - `CAPACITY CHECK` says whether the run observed full/overflow behavior.
 - `RAM CHECK` says whether the returned bytes suggest a RAM/data-path fault.
 - `RETURNED MATCH` shows whether the bytes that came back matched the expected stream.
 - `COMPLETENESS` shows how much of the planned stream returned.
 - `READ BY WRITE DONE`, `POST-WRITE READ`, and `WRITE PRESSURE` help distinguish a full-buffer drop from stored-data corruption.
-- Bad RAM is more likely when byte counts are near correct but content changes, especially if repeated tests fail at the same offsets or bit positions.
+- Bad RAM is more likely when byte counts are near correct but content changes, especially if repeated tests change at the same offsets or bit positions.
 
 ## Start Scan Workflow
 
@@ -94,7 +97,9 @@ Select `1 START SCAN` from the main menu to choose one of the scan workflows:
 
 `AUTOMATED DISCOVERY` starts with Phase 0 baud liveness, then runs staged input/output frame sweeps and a full matrix fallback only when needed. It can validate the top match afterward, depending on `4 SCAN / VALIDATE SETUP`.
 
-`BANK 2 SWITCH-STATE TEST USING KNOWN BAUD` is for a switch bank or buffer mode where you already know the input and output baud. It runs targeted ASCII, 8-bit, raw job behavior, ETX/ACK, and flow validation checks.
+`BANK 2 SWITCH-STATE TEST USING KNOWN BAUD` is for a switch bank or buffer mode where you already know the input and output baud. It runs targeted ASCII, 8-bit, raw byte behavior, ETX/ACK, and flow validation checks.
+
+The raw byte behavior phase runs several payload classes after a likely frame is found: CR-only, LF-only, CR/LF, printer-control bytes with TAB/FF/ESC, printable ASCII `0x20..0x7E`, 7-bit controls excluding XON/XOFF, and 7-bit controls including XON/XOFF. Its report compares bytes exactly and records sent/read counts, sent and received hashes, first mismatch offset, and missing/extra byte counts. If the XON/XOFF-free control sweep is exact but the full control sweep changes, the report calls out that XON/XOFF control bytes affected the raw path.
 
 `PHASE 0 BAUD LIVENESS ONLY` only tests whether selected input/output baud pairs show a basic signal. It does not use the scan/validate message-size settings.
 
