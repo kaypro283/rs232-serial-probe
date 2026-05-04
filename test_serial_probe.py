@@ -265,6 +265,25 @@ def test_memory_test_bauds_use_configured_port_bauds() -> None:
     assert serial_probe.default_memory_test_bauds(options) == (38400, 9600)
 
 
+def test_memory_test_defaults_to_8e1_dsr_dtr() -> None:
+    settings = serial_probe.memory_test_settings(38400, 9600)
+
+    assert settings.input_settings == serial_probe.SerialSettings(
+        38400,
+        8,
+        "even",
+        1,
+        "dsr/dtr",
+    )
+    assert settings.output_settings == serial_probe.SerialSettings(
+        9600,
+        8,
+        "even",
+        1,
+        "dsr/dtr",
+    )
+
+
 def test_memory_target_presets_and_64k_defaults() -> None:
     assert serial_probe.BUFFER_PURGE_CAPACITY_BYTES == 64 * serial_probe.KIB_BYTES
     assert (
@@ -677,6 +696,25 @@ def test_terminal_progress_rows_fit_80_columns() -> None:
         serial_probe.format_progress(single),
         serial_probe.format_dual_progress(dual),
         serial_probe.format_dual_phase0_progress(phase0, 70, 70),
+        serial_probe.format_flow_validation_progress(
+            serial_probe.FlowControlValidationResult(
+                flow_control="DSR/XON",
+                method="dual-transfer",
+                settings=dual.settings,
+                bytes_sent=1024,
+                bytes_received=1024,
+                bytes_seen_while_held=0,
+                score=100.0,
+                indicator="GOOD",
+                status="transfer-good",
+                reason="OK",
+                error=None,
+                elapsed_sec=0.0,
+                metrics=single.metrics,
+            ),
+            16,
+            16,
+        ),
         eta,
     ]
 
@@ -709,3 +747,37 @@ def test_flow_validation_reason_wraps_inside_80_columns() -> None:
 
     report_lines = serial_probe.flow_validation_report_lines([result])
     assert all(len(line) <= serial_probe.REPORT_WIDTH for line in report_lines)
+
+
+def test_known_baud_asymmetric_followup_uses_dual_flow_summary() -> None:
+    payload = serial_probe.generate_payload(512)
+    base_pair = serial_probe.DualSerialSettings(
+        serial_probe.SerialSettings(38400, 8, "none", 2, "none"),
+        serial_probe.SerialSettings(38400, 7, "none", 1, "none"),
+    )
+    target = serial_probe.fake_clean_candidate_result(base_pair, payload)
+
+    assert serial_probe.bank2_flow_skip_reason(target, 38400, 38400) is None
+
+    flow_pair = serial_probe.DualSerialSettings(
+        dataclasses.replace(base_pair.input_settings, flow_control="dsr/dtr"),
+        dataclasses.replace(base_pair.output_settings, flow_control="none"),
+    )
+    clean_flow = serial_probe.fake_clean_candidate_result(flow_pair, payload)
+    flow_row = serial_probe.flow_validation_result_from_candidate(
+        serial_probe.dual_flow_control_code(flow_pair),
+        "dual-transfer",
+        clean_flow,
+        payload,
+    )
+
+    assert flow_row.flow_control == "DSR/OFF"
+    assert flow_row.status == "transfer-good"
+    assert "DUAL-FLOW TRANSFER" in flow_row.reason
+    summary = serial_probe.flow_control_validation_recommendation([flow_row])
+    assert "CLEAN DUAL FLOW TRANSFER" in summary
+    assert "IN DSR/DTR -> OUT NONE" in summary
+    assert all(
+        len(line) <= serial_probe.REPORT_WIDTH
+        for line in serial_probe.flow_validation_report_lines([flow_row])
+    )

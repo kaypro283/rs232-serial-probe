@@ -50,7 +50,7 @@ Select `7 MEMORY TEST` from the main menu to send a checked ASCII printer-style 
 The memory test is deliberately separate from scan discovery:
 
 - Fixed frame: `8E1`.
-- Flow control: `none`.
+- Flow control: `DSR/DTR`.
 - Input baud and output baud from `2 SET COM PORTS / BAUD`.
 - Append-only loop blocks and a final summary in the normal text report.
 - Result fields separate exact stream return, returned-data integrity, capacity behavior, and RAM suspicion.
@@ -104,6 +104,8 @@ Select `1 START SCAN` from the main menu to choose one of the scan workflows:
 After choosing `AUTOMATED DISCOVERY` or `PHASE 0 BAUD LIVENESS ONLY`, the workflow asks for the baud range for that run.
 
 `KNOWN-BAUD DEVICE TEST` is for any serial device or switch mode where you already know the input and output baud. It uses the fixed input/output bauds configured in `2 SET COM PORTS / BAUD`, then runs targeted ASCII frame checks, an 8-bit challenge, raw byte behavior probes, ETX/ACK probing, and flow validation checks.
+
+When known-baud independent frame testing finds an asymmetric follow-up frame, flow validation keeps that input/output frame pair and sweeps the 16 input/output flow-control combinations as transfer checks. Same-frame flow validation can additionally run hold/release handshake checks.
 
 The raw byte behavior phase runs several payload classes after a likely frame is found: CR-only, LF-only, CR/LF, printer-control bytes with TAB/FF/ESC, printable ASCII `0x20..0x7E`, 7-bit controls excluding XON/XOFF, and 7-bit controls including XON/XOFF. Its report compares bytes exactly and records sent/read counts, sent and received hashes, first mismatch offset, and missing/extra byte counts. If the XON/XOFF-free control sweep is exact but the full control sweep changes, the report calls out that XON/XOFF control bytes affected the raw path.
 

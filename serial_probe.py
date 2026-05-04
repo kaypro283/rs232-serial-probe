@@ -68,6 +68,7 @@ MEMORY_TEST_PRE_DRAIN_TIMEOUT = 2.5
 MEMORY_TEST_MODE_IMAGE = "image"
 MEMORY_TEST_MODE_FILL = "fill"
 MEMORY_TEST_MODE_CUSTOM = "custom"
+MEMORY_TEST_FLOW_CONTROL = "dsr/dtr"
 FLOW_VALIDATE_PAYLOAD_BYTES = 1024
 FLOW_VALIDATE_READ_TIMEOUT = 2.0
 FLOW_VALIDATE_HOLD_SECONDS = 1.0
@@ -470,7 +471,7 @@ class MemoryTestConfig:
 
 @dataclass(frozen=True)
 class MemoryTestResult:
-    """Result block for one fixed 8E1 no-flow memory test."""
+    """Result block for one fixed 8E1 DSR/DTR memory test."""
 
     config: MemoryTestConfig
     settings: DualSerialSettings
@@ -562,7 +563,7 @@ class FlowControlValidationResult:
 
     flow_control: str
     method: str
-    settings: SerialSettings
+    settings: SerialSettings | DualSerialSettings
     bytes_sent: int
     bytes_received: int
     bytes_seen_while_held: int
@@ -4541,12 +4542,24 @@ def prompt_yes_no_question(question: str, current: bool) -> bool:
 
 
 def memory_test_settings(input_baud: int, output_baud: int) -> DualSerialSettings:
-    """Return fixed 8E1/no-flow settings for the memory test."""
+    """Return fixed 8E1 DSR/DTR settings for the memory test."""
     validate_supported_baud(input_baud)
     validate_supported_baud(output_baud)
     return DualSerialSettings(
-        input_settings=SerialSettings(input_baud, 8, "even", 1, "none"),
-        output_settings=SerialSettings(output_baud, 8, "even", 1, "none"),
+        input_settings=SerialSettings(
+            input_baud,
+            8,
+            "even",
+            1,
+            MEMORY_TEST_FLOW_CONTROL,
+        ),
+        output_settings=SerialSettings(
+            output_baud,
+            8,
+            "even",
+            1,
+            MEMORY_TEST_FLOW_CONTROL,
+        ),
     )
 
 
@@ -4883,7 +4896,7 @@ def prompt_memory_test_config(options: ScanOptions) -> MemoryTestConfig | None:
     input_baud, output_baud = default_memory_test_bauds(options)
     print()
     print_report_title("MEMORY TEST")
-    print("FIXED FRAME: INPUT 8E1, OUTPUT 8E1, FLOW=NONE.")
+    print("FIXED FRAME: INPUT 8E1, OUTPUT 8E1, FLOW=DSR/DTR.")
     print("STREAM TYPE: PRINTABLE ASCII WITH CHECKSUMS.")
     print(f"DEFAULT BUFFER TARGET: {byte_size_detail(MEMORY_TEST_TARGET_BYTES)}.")
     print("TARGET CAN BE SELECTED IN K-SIZED STEPS.")
@@ -4972,8 +4985,8 @@ def prompt_memory_test_config(options: ScanOptions) -> MemoryTestConfig | None:
     )
     print(f"  STOP EARLY:          {yes_no_text(stop_on_unexpected)}")
     print(f"  EST. PEAK BUFFER:    {peak_estimate} BYTES")
-    print(f"  INPUT:               {input_baud} 8E1 NONE")
-    print(f"  OUTPUT:              {output_baud} 8E1 NONE")
+    print(f"  INPUT:               {input_baud} 8E1 DSR/DTR")
+    print(f"  OUTPUT:              {output_baud} 8E1 DSR/DTR")
     print(f"  EACH ESTIMATE:       {format_duration(transfer_estimate)}")
     print(f"  TOTAL ESTIMATE:      {format_duration(total_estimate)}")
     print(f"  FINISH ABOUT:        {format_finish_clock(total_estimate)}")
@@ -5070,7 +5083,7 @@ def print_menu_help(paged: bool = True) -> None:
             "  4 TIMING/STALE:    PER-TEST READ WAITS AND QUICK OLD-OUTPUT CLEARING.",
             "  5 REPORT FILES:    TEXT REPORT AND DEBUG LOG PATHS.",
             "  6 RESET REPORTS:   RESTORE DEFAULT REPORT FILE NAMES.",
-            "  7 MEMORY TEST:     SELECT 16K..64K ASCII STREAM, 8E1, NO FLOW.",
+            "  7 MEMORY TEST:     SELECT 16K..64K ASCII STREAM, 8E1, DSR/DTR.",
             "  8 CURRENT SETTINGS: SHOW ACTIVE SETUP.",
             "  9 HELP:            THIS SCREEN.",
             "  0 QUIT:            END PROGRAM.",
@@ -5092,7 +5105,7 @@ def print_menu_help(paged: bool = True) -> None:
             "  START 1 SETUP:     OPTION 3 ITEMS 1-6 CAN AFFECT DISCOVERY.",
             "  START 2 SETUP:     OPTION 3 ITEMS 1, 6, AND 7 CAN AFFECT KNOWN-BAUD.",
             "  START 3 SETUP:     OPTION 3 DOES NOT AFFECT PHASE 0 ONLY.",
-            "  MEMORY TEST:       MAIN MENU 7; FIXED 8E1, NO FLOW, ASCII CHECK.",
+            "  MEMORY TEST:       MAIN MENU 7; FIXED 8E1, DSR/DTR, ASCII CHECK.",
             "  STALE DATA:        QUICK PER-TEST CLEARING REJECTS OLD OUTPUT.",
             "  KNOWN-BAUD PURGE:  KNOWN-BAUD, MEMORY, AND VALIDATION USE LONG ESTIMATES.",
             "  NONCES:            EACH TEST PAYLOAD HAS RUN/CANDIDATE/TRIAL IDS.",
@@ -5150,7 +5163,7 @@ def print_configuration(options: ScanOptions) -> None:
             "MEMORY TEST:",
             (
                 "MAIN MENU 7; USES OPTION 2 PORTS AND BAUDS; "
-                "SELECT 16K..64K ASCII; FIXED 8E1 FLOW=NONE"
+                "SELECT 16K..64K ASCII; FIXED 8E1 FLOW=DSR/DTR"
             ),
         )
     )
@@ -5787,6 +5800,38 @@ def flow_validation_indicator(status: str, score: float, error: str | None) -> s
     return "FAIL"
 
 
+def dual_flow_control_code(settings: DualSerialSettings) -> str:
+    """Return a compact input/output flow-control code for validation tables."""
+    def side_code(flow_control: str) -> str:
+        if flow_control == "none":
+            return "OFF"
+        return flow_control_code(flow_control)
+
+    return (
+        f"{side_code(settings.input_settings.flow_control)}/"
+        f"{side_code(settings.output_settings.flow_control)}"
+    )
+
+
+def flow_control_setting_label(settings: SerialSettings | DualSerialSettings) -> str:
+    """Return a report label for one same-frame or dual flow setting."""
+    if isinstance(settings, DualSerialSettings):
+        return (
+            f"IN {flow_control_name(settings.input_settings.flow_control)} -> "
+            f"OUT {flow_control_name(settings.output_settings.flow_control)}"
+        )
+    return flow_control_name(settings.flow_control)
+
+
+def flow_validation_frame_setting_label(
+    settings: SerialSettings | DualSerialSettings,
+) -> str:
+    """Return the tested frame/pair label for flow-validation summaries."""
+    if isinstance(settings, DualSerialSettings):
+        return settings.label()
+    return f"{settings.baud} {frame_label(settings)}"
+
+
 def flow_validation_result_from_candidate(
     flow_control: str,
     method: str,
@@ -5809,13 +5854,18 @@ def flow_validation_result_from_candidate(
         reason = "PAYLOAD WAS NOT FULLY SENT."
     elif clean:
         status = "transfer-good"
-        if flow_control == "none":
+        if isinstance(result.settings, DualSerialSettings):
+            reason = "CLEAN DUAL-FLOW TRANSFER; HANDSHAKE HOLD/RELEASE NOT PROVEN."
+        elif flow_control == "none":
             reason = "CLEAN TRANSFER; NO FLOW HANDSHAKE WAS REQUESTED."
         else:
             reason = "CLEAN TRANSFER ONLY; FLOW NOT OBSERVED OR PROVEN."
     elif result.score >= 90.0:
         status = "transfer-good"
-        reason = "TRANSFER WAS GOOD BUT NOT BYTE-PERFECT."
+        if isinstance(result.settings, DualSerialSettings):
+            reason = "DUAL-FLOW TRANSFER WAS GOOD BUT NOT BYTE-PERFECT."
+        else:
+            reason = "TRANSFER WAS GOOD BUT NOT BYTE-PERFECT."
     elif result.bytes_received > 0:
         status = "transfer-partial"
         reason = "TRANSFER PRODUCED ONLY A PARTIAL MATCH."
@@ -5872,7 +5922,7 @@ def release_flow_control_hold(control_serial: Any, flow_control: str) -> None:
 def flow_validation_error_result(
     flow_control: str,
     method: str,
-    settings: SerialSettings,
+    settings: SerialSettings | DualSerialSettings,
     payload: ProbePayload,
     error: str,
     elapsed_sec: float,
@@ -5929,6 +5979,44 @@ def run_flow_control_transfer_validation(
     return flow_validation_result_from_candidate(
         settings.flow_control,
         "large-transfer",
+        result,
+        payload,
+    )
+
+
+def run_dual_flow_control_transfer_validation(
+    serial_module: Any,
+    index: int,
+    total: int,
+    settings: DualSerialSettings,
+    options: ScanOptions,
+    payload: ProbePayload,
+    logger: logging.Logger,
+) -> FlowControlValidationResult:
+    """Validate one dual input/output flow pair with a clean transfer check."""
+    validation_options = dataclasses.replace(
+        options,
+        payload_bytes=payload.byte_count,
+        read_timeout=max(options.read_timeout, FLOW_VALIDATE_READ_TIMEOUT),
+        bursts=1,
+        turbo_discovery_enabled=False,
+        ask_on_top_match=False,
+        no_pre_drain=False,
+        pre_drain_timeout=max(options.pre_drain_timeout, 2.0),
+    )
+    result = run_dual_candidate(
+        serial_module=serial_module,
+        index=index,
+        total=total,
+        settings=settings,
+        options=validation_options,
+        payload=payload,
+        logger=logger,
+        progress=console_progress,
+    )
+    return flow_validation_result_from_candidate(
+        dual_flow_control_code(settings),
+        "dual-transfer",
         result,
         payload,
     )
@@ -6223,12 +6311,14 @@ def format_flow_validation_progress(
     total: int,
 ) -> str:
     """Return one console line for a flow-control validation result."""
-    return (
+    setting_label = fit_terminal_line(result.settings.label(), 32)
+    return fit_terminal_line(
         f"FLOW [{index:02d}/{total:02d}] {result.indicator:<7} "
-        f"{result.settings.label():32s} "
+        f"{setting_label:32s} "
         f"SENT={result.bytes_sent:6d} READ={result.bytes_received:6d} "
         f"HELD={result.bytes_seen_while_held:5d} "
-        f"SCORE={result.score:6.2f} {result.reason}"
+        f"SCORE={result.score:6.2f} {result.reason}",
+        TERMINAL_COLUMNS,
     )
 
 
@@ -6247,6 +6337,28 @@ def flow_control_validation_recommendation(
         return f"MULTIPLE HANDSHAKES VALIDATED: {flows}."
     if any(result.flow_control == "none" for result in proven):
         return "CLEAN TRANSFER WITHOUT HANDSHAKE; NO HANDSHAKE MODE PROVEN."
+    clean_dual = [
+        result
+        for result in results
+        if isinstance(result.settings, DualSerialSettings)
+        and result.status == "transfer-good"
+        and result.score >= 99.0
+        and result.bytes_sent == result.bytes_received
+        and result.metrics.missing_bytes == 0
+        and result.metrics.extra_bytes == 0
+    ]
+    if len(clean_dual) == 1:
+        return (
+            "CLEAN DUAL FLOW TRANSFER: "
+            f"{flow_control_setting_label(clean_dual[0].settings)}; "
+            "HANDSHAKE NOT PROVEN."
+        )
+    if len(clean_dual) > 1:
+        flows = compact_label_list(
+            [flow_control_setting_label(result.settings) for result in clean_dual],
+            limit=4,
+        )
+        return f"MULTIPLE CLEAN DUAL FLOW TRANSFERS: {flows}; HANDSHAKE NOT PROVEN."
     if any(
         result.flow_control == "none" and result.status == "transfer-good"
         for result in results
@@ -6269,8 +6381,9 @@ def flow_validation_table_row_lines(
 ) -> list[str]:
     """Return one flow-validation table row, wrapping reason text at 80 columns."""
     method = fit_terminal_line(result.method, FLOW_VALIDATION_METHOD_WIDTH)
+    flow_label = fit_terminal_line(result.flow_control.upper(), 8)
     prefix = (
-        f"{result.flow_control.upper():<8} "
+        f"{flow_label:<8} "
         f"{result.indicator:<7} "
         f"{result.score:>5.1f} "
         f"{result.bytes_sent:>6} "
@@ -6290,37 +6403,54 @@ def flow_validation_table_row_lines(
     ]
 
 
+def flow_validation_note_lines(
+    results: Sequence[FlowControlValidationResult],
+) -> list[str]:
+    """Return explanatory report notes for the flow-validation method used."""
+    if any(result.method == "dual-transfer" for result in results):
+        return [
+            "NOTE: DUAL-FLOW SWEEP PROVES TRANSFER COMPATIBILITY ONLY.",
+            "NOTE: HOLD/RELEASE HANDSHAKE IS NOT PROVEN FOR DUAL FRAME PAIRS.",
+        ]
+    return [
+        "NOTE: OUTPUT-SIDE HOLD/RELEASE PROVES ONLY OBSERVED PAUSE/RESUME.",
+        "NOTE: INPUT-SIDE BACKPRESSURE IS NOT PROVEN BY THIS FLOW VALIDATION.",
+    ]
+
+
 def flow_validation_report_lines(
     results: Sequence[FlowControlValidationResult],
 ) -> list[str]:
     """Return compact flow-control validation lines for the text report."""
     lines = [
         "FLOW CONTROL VALIDATION:",
-        f"FINDING:         {flow_control_validation_recommendation(results)}",
-        "",
-        FLOW_VALIDATION_TABLE_HEADER,
-        border_line(REPORT_WIDTH),
     ]
+    lines.extend(
+        wrapped_value_lines(
+            "FINDING:         ",
+            flow_control_validation_recommendation(results),
+            REPORT_WIDTH,
+        )
+    )
+    lines.extend(["", FLOW_VALIDATION_TABLE_HEADER, border_line(REPORT_WIDTH)])
     for result in results:
         lines.extend(flow_validation_table_row_lines(result))
-    lines.extend(
-        [
-            "NOTE: OUTPUT-SIDE HOLD/RELEASE PROVES ONLY OBSERVED PAUSE/RESUME.",
-            "NOTE: INPUT-SIDE BACKPRESSURE IS NOT PROVEN BY THIS FLOW VALIDATION.",
-        ]
-    )
+    lines.extend(flow_validation_note_lines(results))
     lines.append(border_line(REPORT_WIDTH))
     return lines
 
 
 def print_flow_control_validation_report(
-    frame: SerialSettings,
+    frame: SerialSettings | DualSerialSettings,
     results: Sequence[FlowControlValidationResult],
 ) -> None:
     """Print the final flow-control validation report."""
     print()
     print_report_title("FLOW CONTROL VALIDATION RESULTS")
-    print(f"  FRAME SETTING:        {frame.baud} {frame.data_bits}{frame.parity_code()}{frame.stop_bits}")
+    print_wrapped_value(
+        "  FRAME SETTING:        ",
+        flow_validation_frame_setting_label(frame),
+    )
     print(f"  TEST BYTES:           {max((result.bytes_sent for result in results), default=0)}")
     print_wrapped_value(
         "  FINDING:              ",
@@ -6332,8 +6462,8 @@ def print_flow_control_validation_report(
     for result in results:
         for line in flow_validation_table_row_lines(result):
             print(line)
-    print("NOTE: OUTPUT-SIDE HOLD/RELEASE PROVES ONLY OBSERVED PAUSE/RESUME.")
-    print("NOTE: INPUT-SIDE BACKPRESSURE IS NOT PROVEN BY THIS FLOW VALIDATION.")
+    for note in flow_validation_note_lines(results):
+        print(note)
     print(border_line(REPORT_WIDTH))
 
 
@@ -6436,6 +6566,102 @@ def run_flow_control_validation(
     print_flow_control_validation_report(frame, flow_results)
     logger.info(
         "flow control validation completed: %s",
+        flow_control_validation_recommendation(flow_results),
+    )
+    return flow_results, None
+
+
+def run_dual_flow_control_validation(
+    serial_module: Any,
+    options: ScanOptions,
+    target: CandidateResult,
+    logger: logging.Logger,
+) -> tuple[list[FlowControlValidationResult], str | None]:
+    """Run known-baud flow validation for an independent input/output frame pair."""
+    if not isinstance(target.settings, DualSerialSettings):
+        raise ValueError("dual flow validation requires dual serial settings")
+
+    frame = DualSerialSettings(
+        input_settings=dataclasses.replace(
+            target.settings.input_settings,
+            flow_control="none",
+        ),
+        output_settings=dataclasses.replace(
+            target.settings.output_settings,
+            flow_control="none",
+        ),
+    )
+    run_known_output_purges(
+        serial_module=serial_module,
+        options=options,
+        logger=logger,
+        settings_list=[frame.output_settings],
+        reason="CLEAR VALIDATION DATA BEFORE DUAL FLOW-CONTROL TESTS.",
+    )
+    payload = generate_payload(options.flow_validate_size_bytes)
+    settings_list = dual_flow_candidates_for_frame(frame)
+    print()
+    print_report_title("DUAL FLOW CONTROL VALIDATION")
+    print_wrapped_value("FRAME PAIR: ", frame.label())
+    print(f"TEST: {payload.byte_count} BYTES; INPUT/OUTPUT FLOW COMBINATIONS.")
+    print("THIS SWEEP PROVES TRANSFER COMPATIBILITY, NOT HOLD/RELEASE HANDSHAKE.")
+    print(border_line(REPORT_WIDTH))
+    logger.info(
+        "dual flow control validation started frame=%s payload=%s candidates=%s",
+        frame.label(),
+        payload.byte_count,
+        len(settings_list),
+    )
+
+    flow_results: list[FlowControlValidationResult] = []
+    for index, settings in enumerate(settings_list, start=1):
+        while True:
+            try:
+                result = run_dual_flow_control_transfer_validation(
+                    serial_module=serial_module,
+                    index=index,
+                    total=len(settings_list),
+                    settings=settings,
+                    options=options,
+                    payload=payload,
+                    logger=logger,
+                )
+            except KeyboardInterrupt:
+                action = prompt_operator_break_action("DUAL FLOW VALIDATION")
+                if action == "resume":
+                    logger.info(
+                        "operator resumed dual flow validation at %s/%s %s",
+                        index,
+                        len(settings_list),
+                        settings.label(),
+                    )
+                    continue
+                logger.info(
+                    "operator break during dual flow validation; action=%s completed=%s/%s",
+                    action,
+                    len(flow_results),
+                    len(settings_list),
+                )
+                print_flow_control_validation_report(frame, flow_results)
+                return flow_results, action
+            flow_results.append(result)
+            print(format_flow_validation_progress(result, index, len(settings_list)))
+            logger.info(
+                "dual flow validation %s: indicator=%s status=%s score=%.2f sent=%s read=%s reason=%s error=%s",
+                settings.label(),
+                result.indicator,
+                result.status,
+                result.score,
+                result.bytes_sent,
+                result.bytes_received,
+                result.reason,
+                result.error,
+            )
+            break
+
+    print_flow_control_validation_report(frame, flow_results)
+    logger.info(
+        "dual flow control validation completed: %s",
         flow_control_validation_recommendation(flow_results),
     )
     return flow_results, None
@@ -6773,22 +6999,9 @@ def bank2_flow_skip_reason(
     """Return a conservative known-baud flow-validation skip reason, if any."""
     if target is None:
         return "No clean follow-up frame was found"
-    if input_baud != output_baud:
-        return (
-            "Known input/output baud differs and current flow "
-            "validation supports same-frame settings only"
-        )
-    if not isinstance(target.settings, DualSerialSettings):
-        return None
-    if same_baud_frame(
-        target.settings.input_settings,
-        target.settings.output_settings,
-    ):
-        return None
-    return (
-        "Best observed frame is dual/asymmetric and current "
-        "flow validation supports same-frame settings only"
-    )
+    if input_baud != output_baud and not isinstance(target.settings, DualSerialSettings):
+        return "Known baud pair needs an independent input/output follow-up frame"
+    return None
 
 
 def bank2_flow_validation_seed(
@@ -8166,6 +8379,17 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
         print("RESULT: NOT OBSERVABLE IN THIS KNOWN-BAUD RUN.")
         print(border_line(REPORT_WIDTH))
         logger.info("Known-baud flow validation skipped: %s", flow_skip_reason)
+    elif (
+        followup_target is not None
+        and isinstance(followup_target.settings, DualSerialSettings)
+        and not bank2_settings_same_frame(followup_target.settings)
+    ):
+        flow_results, _break_action = run_dual_flow_control_validation(
+            serial_module=serial_module,
+            options=bank_options,
+            target=followup_target,
+            logger=logger,
+        )
     else:
         flow_results, _break_action = run_flow_control_validation(
             serial_module=serial_module,
@@ -8869,7 +9093,7 @@ def print_memory_test_summary(
 
 
 def run_memory_test(options: ScanOptions) -> int:
-    """Run the fixed 8E1/no-flow memory test from the main menu."""
+    """Run the fixed 8E1 DSR/DTR memory test from the main menu."""
     validate_options(options)
     config = prompt_memory_test_config(options)
     if config is None:
@@ -8886,7 +9110,7 @@ def run_memory_test(options: ScanOptions) -> int:
 
     print()
     print_report_title("MEMORY TEST START")
-    print("FIXED FRAME: INPUT 8E1, OUTPUT 8E1, FLOW=NONE.")
+    print("FIXED FRAME: INPUT 8E1, OUTPUT 8E1, FLOW=DSR/DTR.")
     print(
         f"MODE: {memory_test_mode_label(config.mode, config.target_bytes)}; "
         f"TARGET={byte_size_label(config.target_bytes)}; "
@@ -9979,15 +10203,15 @@ def run_self_tests() -> int:
         8,
         "even",
         1,
-        "none",
-    ), "memory-test input frame must be fixed 8E1 no-flow"
+        "dsr/dtr",
+    ), "memory-test input frame must be fixed 8E1 DSR/DTR"
     assert memory_settings.output_settings == SerialSettings(
         9600,
         8,
         "even",
         1,
-        "none",
-    ), "memory-test output frame must be fixed 8E1 no-flow"
+        "dsr/dtr",
+    ), "memory-test output frame must be fixed 8E1 DSR/DTR"
     assert (
         memory_test_fill_payload_bytes(38400, 38400) == MEMORY_TEST_TARGET_BYTES
     ), "same-baud memory fill should not inflate payload"
@@ -10341,6 +10565,26 @@ def run_self_tests() -> int:
     assert (
         bank2_flow_skip_reason(preferred, 38400, 38400) is None
     ), "same-frame known-baud target incorrectly skipped flow validation"
+    assert (
+        bank2_flow_skip_reason(asym_eight, 38400, 38400) is None
+    ), "asymmetric known-baud target should use dual flow validation"
+    dual_flow_settings = DualSerialSettings(
+        dataclasses.replace(asym_followup.input_settings, flow_control="dsr/dtr"),
+        dataclasses.replace(asym_followup.output_settings, flow_control="none"),
+    )
+    dual_flow_row = flow_validation_result_from_candidate(
+        dual_flow_control_code(dual_flow_settings),
+        "dual-transfer",
+        fake_clean_candidate_result(dual_flow_settings, payload_a),
+        payload_a,
+    )
+    assert (
+        dual_flow_row.flow_control == "DSR/OFF"
+    ), "dual flow table code should show input/output flow controls"
+    assert (
+        "CLEAN DUAL FLOW TRANSFER"
+        in flow_control_validation_recommendation([dual_flow_row])
+    ), "dual flow transfer summary should not be reported as skipped"
     weak_followup = dataclasses.replace(
         fake_clean_candidate_result(same_followup, payload_a),
         status="weak",
