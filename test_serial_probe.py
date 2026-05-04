@@ -29,6 +29,22 @@ class OSErrorWriter:
         raise OSError("serial device unavailable")
 
 
+class ValueErrorSerialModule:
+    SEVENBITS = 7
+    EIGHTBITS = 8
+    PARITY_NONE = "N"
+    PARITY_EVEN = "E"
+    PARITY_ODD = "O"
+    PARITY_MARK = "M"
+    PARITY_SPACE = "S"
+    STOPBITS_ONE = 1
+    STOPBITS_TWO = 2
+
+    @staticmethod
+    def Serial(**_kwargs: object) -> object:
+        raise ValueError("unsupported parity mode")
+
+
 def test_receive_completion_detects_complete_eight_bit_payload() -> None:
     nonce = serial_probe.representative_nonce()
     payload = serial_probe.generate_eight_bit_payload(
@@ -55,6 +71,21 @@ def test_serial_write_os_error_is_reported_as_io_error() -> None:
     assert bytes_sent == 0
     assert error == "serial device unavailable"
     assert elapsed >= 0.0
+
+
+def test_serial_open_value_error_is_reported_as_configuration_error() -> None:
+    settings = serial_probe.SerialSettings(9600, 8, "mark", 1, "none")
+
+    with pytest.raises(serial_probe.SerialConfigurationError) as exc_info:
+        serial_probe.open_serial_port(
+            ValueErrorSerialModule,
+            "COM1",
+            settings,
+            1.0,
+        )
+
+    assert "COM1 9600 8M1 FLOW=NONE" in str(exc_info.value)
+    assert "unsupported parity mode" in str(exc_info.value)
 
 
 def test_serial_write_type_error_is_not_hidden_as_io_error() -> None:

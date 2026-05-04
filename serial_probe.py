@@ -161,6 +161,10 @@ class ReturnToMainMenuAfterReport(Exception):
     """Signal that the operator asked for the main menu after report writing."""
 
 
+class SerialConfigurationError(RuntimeError):
+    """Serial driver rejected one of the requested port settings."""
+
+
 class ReturnToMainMenu(Exception):
     """Signal that the operator asked for the main menu without starting a scan."""
 
@@ -1386,13 +1390,18 @@ def open_serial_port(
 ) -> Any:
     """Open a serial port for one candidate setting."""
     constants = serial_constants(serial_module, settings)
-    return serial_module.Serial(
-        port=port,
-        timeout=min(0.05, max(read_timeout, 0.001)),
-        write_timeout=max(3.0, read_timeout),
-        inter_byte_timeout=0.05,
-        **constants,
-    )
+    try:
+        return serial_module.Serial(
+            port=port,
+            timeout=min(0.05, max(read_timeout, 0.001)),
+            write_timeout=max(3.0, read_timeout),
+            inter_byte_timeout=0.05,
+            **constants,
+        )
+    except ValueError as exc:
+        raise SerialConfigurationError(
+            f"{port} {settings.label()}: {exc}"
+        ) from exc
 
 
 def reset_serial_buffers(serial_port: Any) -> None:
@@ -3500,6 +3509,39 @@ def run_known_baud_purge(
     return result
 
 
+def run_known_output_purges(
+    serial_module: Any,
+    options: ScanOptions,
+    logger: logging.Logger,
+    settings_list: Sequence[SerialSettings | DualSerialSettings],
+    reason: str,
+    capacity_bytes: int = BUFFER_PURGE_CAPACITY_BYTES,
+) -> list[DrainResult]:
+    """Run long-limit purges for known output-side serial settings."""
+    output_settings = unique_serial_settings(
+        [receive_side_settings(settings) for settings in settings_list]
+    )
+    results: list[DrainResult] = []
+    for index, settings in enumerate(output_settings, start=1):
+        indexed_reason = reason
+        if len(output_settings) > 1:
+            indexed_reason = (
+                f"{reason} OUTPUT SETTING {index}/{len(output_settings)}."
+            )
+        results.append(
+            run_known_baud_purge(
+                serial_module=serial_module,
+                options=options,
+                logger=logger,
+                settings=settings,
+                max_seconds=estimated_buffer_drain_seconds(settings, capacity_bytes),
+                reason=indexed_reason,
+                capacity_bytes=capacity_bytes,
+            )
+        )
+    return results
+
+
 def phase0_extra_byte_limit(expected_byte_count: int) -> int:
     """Return the tolerated extra-byte limit for Phase 0 liveness."""
     ratio_limit = int(expected_byte_count * PHASE0_MAX_EXTRA_BYTES_RATIO)
@@ -3596,6 +3638,20 @@ def unique_dual_candidates(
             continue
         unique.append(candidate)
         seen.add(candidate)
+    return unique
+
+
+def unique_serial_settings(
+    settings_list: Sequence[SerialSettings],
+) -> list[SerialSettings]:
+    """Return serial settings with duplicates removed while preserving order."""
+    unique: list[SerialSettings] = []
+    seen: set[SerialSettings] = set()
+    for settings in settings_list:
+        if settings in seen:
+            continue
+        unique.append(settings)
+        seen.add(settings)
     return unique
 
 
@@ -4942,7 +4998,7 @@ def print_menu_help(paged: bool = True) -> None:
             "  2 SET COM/BAUD:    INPUT/TRANSMIT AND OUTPUT/READ PORTS PLUS BAUDS.",
             "  3 SCAN/VALIDATE:   MESSAGE SIZE, COUNT, VALIDATION SCOPE.",
             f"  BAUDS:             {supported_baud_label()}.",
-            "  4 TIMING/STALE:    READ WAITS AND OLD-OUTPUT CLEARING.",
+            "  4 TIMING/STALE:    PER-TEST READ WAITS AND QUICK OLD-OUTPUT CLEARING.",
             "  5 REPORT FILES:    TEXT REPORT AND DEBUG LOG PATHS.",
             "  6 RESET REPORTS:   RESTORE DEFAULT REPORT FILE NAMES.",
             "  7 MEMORY TEST:     SELECT 16K..64K ASCII STREAM, 8E1, NO FLOW.",
@@ -4968,7 +5024,8 @@ def print_menu_help(paged: bool = True) -> None:
             "  START 2 SETUP:     OPTION 3 ITEMS 1, 6, AND 7 CAN AFFECT BANK 2.",
             "  START 3 SETUP:     OPTION 3 DOES NOT AFFECT PHASE 0 ONLY.",
             "  MEMORY TEST:       MAIN MENU 7; FIXED 8E1, NO FLOW, ASCII CHECK.",
-            "  STALE DATA:        OLD BUFFER OUTPUT IS CLEARED BEFORE TESTS.",
+            "  STALE DATA:        QUICK PER-TEST CLEARING REJECTS OLD OUTPUT.",
+            "  KNOWN-BAUD PURGE:  BANK 2, MEMORY, AND VALIDATION USE LONG ESTIMATES.",
             "  NONCES:            EACH TEST PAYLOAD HAS RUN/CANDIDATE/TRIAL IDS.",
             "  8-BIT TEST:        SEPARATE HIGH-BIT CHALLENGE; ASCII IS NOT ENOUGH.",
             "  SCAN BREAK:        CTRL+C ASKS RESUME, REPORT, MENU, OR QUIT.",
@@ -5122,16 +5179,22 @@ def print_configuration(options: ScanOptions) -> None:
     lines.extend(setting_lines("OPEN PAUSE:", f"{options.settle_ms} MS"))
     lines.extend(
         setting_lines(
-            "STALE DATA:",
+            "PER-TEST STALE:",
             (
                 "NO"
                 if options.no_pre_drain
                 else (
                     f"YES, QUIET={options.pre_drain_quiet:.2f}S, "
-                    f"LIMIT={options.pre_drain_timeout:.2f}S, "
+                    f"QUICK LIMIT={options.pre_drain_timeout:.2f}S, "
                     f"MAX={options.max_drain_bytes} BYTES"
                 )
             ),
+        )
+    )
+    lines.extend(
+        setting_lines(
+            "KNOWN-BAUD PURGE:",
+            "USES CALCULATED LONG LIMITS WHEN OUTPUT BAUD/FRAME IS KNOWN",
         )
     )
     lines.extend(setting_lines("TOP ROWS:", options.top))
@@ -5359,9 +5422,11 @@ def configure_payload(options: ScanOptions) -> ScanOptions:
 def configure_timing(options: ScanOptions) -> ScanOptions:
     """Prompt for timing settings."""
     while prompt_loop_active():
-        print("TIMING AND STALE DATA")
+        print("TIMING AND PER-TEST STALE DATA")
         print("TURBO APPLIES ONLY TO SCAN DISCOVERY.")
         print("VALIDATION USES CONSERVATIVE TIMING.")
+        print("THE STALE-DATA LIMIT BELOW IS A QUICK PER-TEST CLEAR.")
+        print("KNOWN-BAUD PURGES USE CALCULATED LONG LIMITS.")
         turbo_enabled = prompt_yes_no(
             "TURBO DISCOVERY MODE",
             options.turbo_discovery_enabled,
@@ -5382,16 +5447,16 @@ def configure_timing(options: ScanOptions) -> ScanOptions:
             0.05,
         )
         pre_drain_timeout = prompt_float(
-            "MAX TIME CLEARING OLD OUTPUT, SECONDS",
+            "MAX QUICK CLEAR TIME BEFORE TEST, SECONDS",
             options.pre_drain_timeout,
             0.0,
         )
         if pre_drain_enabled and pre_drain_timeout < pre_drain_quiet:
-            print("TIMING ERROR: MAX TIME CLEARING OLD OUTPUT MUST BE >= QUIET TIME.")
+            print("TIMING ERROR: MAX QUICK CLEAR TIME MUST BE >= QUIET TIME.")
             print("RE-ENTER TIMING VALUES.")
             continue
         max_drain_bytes = prompt_int(
-            "MAX OLD BYTES TO CLEAR BEFORE STALE",
+            "MAX QUICK OLD BYTES BEFORE STALE",
             options.max_drain_bytes,
             1,
         )
@@ -6204,12 +6269,12 @@ def run_flow_control_validation(
         logger.info("flow control validation skipped: no recommendable frame")
         return [], None
 
-    purge_buffer_output(
+    run_known_output_purges(
         serial_module=serial_module,
         options=options,
         logger=logger,
-        reason="CLEAR VALIDATION DATA BEFORE FLOW-CONTROL TESTS.",
         settings_list=[frame],
+        reason="CLEAR VALIDATION DATA BEFORE FLOW-CONTROL TESTS.",
     )
     payload = generate_payload(options.flow_validate_size_bytes)
     settings_list = flow_validation_settings_for_frame(frame)
@@ -8642,7 +8707,7 @@ def print_commands() -> None:
     print(bordered_text("MAIN MENU", SCREEN_WIDTH))
     print(border_line(SCREEN_WIDTH))
     menu_line("  1  START SCAN", "  2  SET COM PORTS / BAUD")
-    menu_line("  3  SCAN / VALIDATE SETUP", "  4  TIMING / STALE DATA")
+    menu_line("  3  SCAN / VALIDATE SETUP", "  4  TIMING / PER-TEST STALE")
     menu_line("  5  SET REPORT FILES", "  6  RESET REPORT FILES")
     menu_line("  7  MEMORY TEST", "  8  CURRENT SETTINGS")
     menu_line("  9  HELP", "  0  QUIT")
@@ -8752,10 +8817,11 @@ def run_dual_bank_validation(
     """Run a larger validation payload for top dual-bank candidates."""
     if not shortlist:
         return [], None
-    purge_buffer_output(
+    run_known_output_purges(
         serial_module=serial_module,
         options=options,
         logger=logger,
+        settings_list=[result.settings for result in shortlist],
         reason="CLEAR SCAN DATA BEFORE DUAL VALIDATION.",
     )
     print()
@@ -8903,10 +8969,15 @@ def run_dual_bank_scan(
     candidate_total = len(full_candidates) + staged_flow_candidate_count
     staged_total = len(staged_preview_candidates) + staged_flow_candidate_count
     payload = generate_payload(options.payload_bytes)
-    purge_buffer_output(
+    phase0_purge_settings = [
+        dual_phase0_settings(input_baud, output_baud).output_settings
+        for input_baud, output_baud in selected_pairs
+    ]
+    run_known_output_purges(
         serial_module=serial_module,
         options=options,
         logger=logger,
+        settings_list=phase0_purge_settings,
         reason="CLEAR PHASE 0 DATA BEFORE DUAL FRAME SCAN.",
     )
     scan_started = time.monotonic()

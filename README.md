@@ -145,7 +145,8 @@ The default menu settings are tuned for a practical scan:
 - Output wait after send is `2.0` seconds by default.
 - `Ask on top match` is off by default. If enabled, a `PASS` result pauses the scan and asks whether to continue looking for possible ties.
 - `Auto validate top matches after scan` is on by default. It retests the top-score setting or settings with an 8K payload. The menu can turn this off or change the size.
-- Old-output clearing stops after `131072` bytes by default, which is enough for a 64K buffer plus margin.
+- Quick per-test old-output clearing stops after `131072` bytes by default, which is enough for a 64K buffer plus margin.
+- Known-baud purge stages use calculated long drain limits instead of the quick per-test clear time.
 - No early stop.
 
 Three repeated tests are not required for the first scan. One test is enough to rank settings. If you want more certainty afterward, rerun with a larger test message or more tests around the suspected setting range.
@@ -185,6 +186,10 @@ SCAN TIME 0001/0480: ELAPSED=2S AVG=2S/SET LEFT=15M58S FINISH=22:26:02
 ## Stale Output
 
 If the buffer is already dumping old data, the scan cannot reliably score the current test. The tool clears old output before each test and waits for the output side to go quiet.
+
+The `TIMING / PER-TEST STALE` menu controls the quick stale-data check that happens before individual tests. Its `MAX QUICK CLEAR TIME BEFORE TEST` setting is not meant to empty a full low-baud buffer.
+
+When the output baud and frame are known, the tool uses calculated long purge limits instead. Bank 2 known-baud tests, memory tests, flow validation, dual validation, and post-Phase-0 frame scans use those known-baud purge paths.
 
 If the output does not go quiet, the test is marked:
 
@@ -242,5 +247,6 @@ Stale data:
 
 - Clear/reset the physical buffer.
 - Let it finish dumping old data.
-- Increase the old-output clearing time from the menu if you want the tool to wait longer before marking a setting `STALE`.
-- For a 64K buffer, the default max clear value of `131072` bytes should usually be enough. If more than that keeps arriving, the output is probably repeating, noisy, or not really stale buffer contents.
+- Increase the quick per-test clear time from the menu if you want normal scan tests to wait longer before marking a setting `STALE`.
+- Known-baud purge stages already use calculated long limits for the selected output baud/frame.
+- For a 64K buffer, the default quick max clear value of `131072` bytes should usually be enough. If more than that keeps arriving, the output is probably repeating, noisy, or not really stale buffer contents.
