@@ -577,7 +577,7 @@ class FlowControlValidationResult:
 
 @dataclass(frozen=True)
 class Bank2BehaviorProbeResult:
-    """Byte-level printer-job behavior observation for one Bank 2 probe."""
+    """Byte-level printer-job behavior observation for one known-baud probe."""
 
     name: str
     settings: SerialSettings | DualSerialSettings
@@ -601,7 +601,7 @@ class Bank2BehaviorProbeResult:
 
 @dataclass(frozen=True)
 class Bank2EtxAckProbeResult:
-    """ETX/ACK byte-path observation for one Bank 2 probe frame."""
+    """ETX/ACK byte-path observation for one known-baud probe frame."""
 
     settings: SerialSettings | DualSerialSettings
     forward_bytes_sent: int
@@ -624,7 +624,7 @@ class Bank2EtxAckProbeResult:
 
 @dataclass(frozen=True)
 class Bank2CharacterizationResult:
-    """Append-only result block for one second-bank switch state."""
+    """Append-only result block for one known-baud device/switch state."""
 
     switch_note: str
     known_baud_text: str
@@ -4299,8 +4299,8 @@ def write_dual_bank_text_report(
         f"STARTED UTC:     {metadata.get('started_at', '')}",
         f"RUN ID:          {metadata.get('run_id', '')}",
         f"COM PATH:        {metadata.get('in_port')} -> BUFFER -> {metadata.get('out_port')}",
-        f"DIP NOTE:        {switch_note if switch_note else '(NOT ENTERED)'}",
-        "SCAN MODEL:      INPUT/OUTPUT PAIR TESTED; DIP MEANING NOT ASSUMED",
+        f"DEVICE NOTE:     {switch_note if switch_note else '(NOT ENTERED)'}",
+        "SCAN MODEL:      INPUT/OUTPUT PAIR TESTED; SWITCH MEANING NOT ASSUMED",
         (
             "PHASE 0 PAIRS:   "
             f"{len(phase0.alive_pairs)} ALIVE / "
@@ -4854,7 +4854,7 @@ def prompt_memory_test_note(current: str) -> str | None:
     """Prompt for the memory-test report note, canceling on EOF."""
     try:
         value = read_operator_input(
-            f"DIP SETTING NOTE FOR REPORT [{current}]: "
+            f"DEVICE/SWITCH NOTE FOR REPORT [{current}]: "
         ).strip()
     except EOFError:
         return None
@@ -5018,7 +5018,7 @@ def parse_start_scan_workflow_choice(choice: str) -> str | None:
         return "discovery"
     if choice in {"1", "d", "discovery", "auto", "automatic"}:
         return "discovery"
-    if choice in {"2", "b", "bank", "bank2", "switch"}:
+    if choice in {"2", "b", "bank", "bank2", "switch", "known", "known-baud", "device"}:
         return "bank2"
     if choice in {"3", "p", "phase0", "baud"}:
         return "phase0"
@@ -5032,7 +5032,7 @@ def prompt_start_scan_workflow() -> str:
     print()
     print_report_title("START SCAN WORKFLOW")
     print("  1 AUTOMATED DISCOVERY")
-    print("  2 BANK 2 SWITCH-STATE TEST USING KNOWN BAUD")
+    print("  2 KNOWN-BAUD DEVICE TEST")
     print("  3 PHASE 0 BAUD LIVENESS ONLY")
     print("  4 RETURN TO MAIN MENU")
     print(border_line(REPORT_WIDTH))
@@ -5077,24 +5077,24 @@ def print_menu_help(paged: bool = True) -> None:
             "",
             "START SCAN WORKFLOW",
             "  1 AUTOMATED DISCOVERY: PHASE 0, FRAME SWEEPS, FULL FALLBACK.",
-            "  2 BANK 2 KNOWN-BAUD:  USE OPTION 2 BAUDS; FRAME, 8-BIT, RAW, FLOW.",
+            "  2 KNOWN-BAUD DEVICE:  USE OPTION 2 BAUDS; FRAME, 8-BIT, RAW, FLOW.",
             "  3 PHASE 0 ONLY:       ASK BAUD RANGE, THEN LIVENESS MATRIX ONLY.",
             "  4 RETURN TO MAIN MENU.",
             "",
             "OPERATOR NOTES",
             "  DEVICE PATH:       COM1 -> BUFFER INPUT -> BUFFER OUTPUT -> COM5.",
             "  PROGRAM SETTINGS:  PROGRAM SETS BAUD, FRAME, AND FLOW ON OPEN.",
-            "  OPTION 2 BAUDS:    USED BY BANK 2 AND MEMORY TEST FIXED-BAUD RUNS.",
+            "  OPTION 2 BAUDS:    USED BY KNOWN-BAUD AND MEMORY TEST RUNS.",
             "  BAUD RANGE:        ASKED BY START SCAN 1 AND 3.",
             "  PHASE 0 SETTINGS:  FIXED 8E1 FLOW=NONE; OPTION 3 DOES NOT CHANGE IT.",
             "  BAUD PAIRS:        INPUT AND OUTPUT BAUDS MAY DIFFER.",
             "  NO PHASE 0 HIT:    SAME-BAUD FRAME FALLBACK OFFERED FOR NARROW RANGE.",
             "  START 1 SETUP:     OPTION 3 ITEMS 1-6 CAN AFFECT DISCOVERY.",
-            "  START 2 SETUP:     OPTION 3 ITEMS 1, 6, AND 7 CAN AFFECT BANK 2.",
+            "  START 2 SETUP:     OPTION 3 ITEMS 1, 6, AND 7 CAN AFFECT KNOWN-BAUD.",
             "  START 3 SETUP:     OPTION 3 DOES NOT AFFECT PHASE 0 ONLY.",
             "  MEMORY TEST:       MAIN MENU 7; FIXED 8E1, NO FLOW, ASCII CHECK.",
             "  STALE DATA:        QUICK PER-TEST CLEARING REJECTS OLD OUTPUT.",
-            "  KNOWN-BAUD PURGE:  BANK 2, MEMORY, AND VALIDATION USE LONG ESTIMATES.",
+            "  KNOWN-BAUD PURGE:  KNOWN-BAUD, MEMORY, AND VALIDATION USE LONG ESTIMATES.",
             "  NONCES:            EACH TEST PAYLOAD HAS RUN/CANDIDATE/TRIAL IDS.",
             "  8-BIT TEST:        SEPARATE HIGH-BIT CHALLENGE; ASCII IS NOT ENOUGH.",
             "  SCAN BREAK:        CTRL+C ASKS RESUME, REPORT, MENU, OR QUIT.",
@@ -5144,7 +5144,7 @@ def print_configuration(options: ScanOptions) -> None:
         frame_pairs_per_live_pair = 0
         range_error = str(exc)
     lines: list[str] = ["", *banner_lines(), "CURRENT SETTINGS"]
-    lines.extend(setting_lines("START SCAN:", "DISCOVERY / BANK 2 KNOWN-BAUD / PHASE 0"))
+    lines.extend(setting_lines("START SCAN:", "DISCOVERY / KNOWN-BAUD DEVICE / PHASE 0"))
     lines.extend(
         setting_lines(
             "MEMORY TEST:",
@@ -5239,7 +5239,7 @@ def print_configuration(options: ScanOptions) -> None:
                 if not options.auto_validate_flow_control
                 else (
                     "ON, DISCOVERY FLOW MODES; "
-                    f"BANK 2 VALIDATE SIZE={options.flow_validate_size_bytes} BYTES"
+                    f"KNOWN-BAUD VALIDATE SIZE={options.flow_validate_size_bytes} BYTES"
                 )
             ),
         )
@@ -5269,13 +5269,13 @@ def print_configuration(options: ScanOptions) -> None:
     lines.extend(setting_lines("TOP ROWS:", options.top))
     lines.extend(
         setting_lines(
-            "BANK 2 TEST:",
+            "KNOWN-BAUD TEST:",
             f"START SCAN 2; USES OPTION 2 PORTS AND BAUDS: {fixed_baud_text}",
         )
     )
     lines.extend(setting_lines("REPORT FILE:", options.text_report))
     lines.extend(
-        setting_lines("DIP SETTING NOTE:", options.switch_note or "(ASK AT SCAN START)")
+        setting_lines("DEVICE/SWITCH NOTE:", options.switch_note or "(ASK AT SCAN START)")
     )
     lines.extend(setting_lines("LOG FILE:", options.log_file))
     lines.extend(setting_lines("ESTIMATE:", "SHOWN AFTER PHASE 0 SELECTS LIVE BAUD PAIRS"))
@@ -5369,7 +5369,7 @@ def print_scan_validate_setup(options: ScanOptions) -> None:
         "DISCOVERY MESSAGE BYTES",
         options.payload_bytes,
         (
-            "START 1 DISCOVERY; START 2 BANK 2 ASCII; "
+            "START 1 DISCOVERY; START 2 KNOWN-BAUD ASCII; "
             f"START 2 8-BIT BYTES=MAX({DEFAULT_EIGHT_BIT_PAYLOAD_BYTES}, THIS)."
         ),
     )
@@ -5401,13 +5401,13 @@ def print_scan_validate_setup(options: ScanOptions) -> None:
         "6",
         "FLOW-CONTROL TESTING",
         yes_no_text(options.auto_validate_flow_control),
-        "START 1 FLOW SWEEP; START 2 BANK 2 FLOW VALIDATION ON/OFF.",
+        "START 1 FLOW SWEEP; START 2 KNOWN-BAUD FLOW VALIDATION ON/OFF.",
     )
     setting_line(
         "7",
-        "BANK 2 FLOW TEST BYTES",
+        "KNOWN-BAUD FLOW TEST BYTES",
         options.flow_validate_size_bytes,
-        "ONLY WHEN 6=YES; START 2 BANK 2 FLOW VALIDATION ONLY.",
+        "ONLY WHEN 6=YES; START 2 KNOWN-BAUD FLOW VALIDATION ONLY.",
     )
     print("  0 RETURN TO MAIN MENU")
     print(border_line(REPORT_WIDTH))
@@ -5478,7 +5478,7 @@ def configure_payload(options: ScanOptions) -> ScanOptions:
             options = dataclasses.replace(
                 options,
                 flow_validate_size_bytes=prompt_int(
-                    "BANK 2 FLOW TEST BYTES",
+                    "KNOWN-BAUD FLOW TEST BYTES",
                     options.flow_validate_size_bytes,
                     minimum=minimum_payload_size(),
                 ),
@@ -5552,7 +5552,7 @@ def configure_reports(options: ScanOptions) -> ScanOptions:
     """Prompt for result and report settings."""
     top = prompt_int("NUMBER OF TOP ROWS TO SHOW", options.top, 1)
     text_report = prompt_report_path("APPEND TEXT REPORT FILE", options.text_report)
-    switch_note = prompt_text("DEFAULT DIP SETTING NOTE", options.switch_note)
+    switch_note = prompt_text("DEFAULT DEVICE/SWITCH NOTE", options.switch_note)
     log_file = prompt_report_path("LOG FILE", options.log_file)
     return dataclasses.replace(
         options,
@@ -6581,7 +6581,7 @@ def compact_label_list(labels: Sequence[str], limit: int = 10) -> str:
 
 
 def bank2_settings_same_frame(settings: SerialSettings | DualSerialSettings) -> bool:
-    """Return True when a Bank 2 setting uses the same baud/frame on both sides."""
+    """Return True when a known-baud setting uses the same baud/frame on both sides."""
     if not isinstance(settings, DualSerialSettings):
         return True
     return same_baud_frame(settings.input_settings, settings.output_settings)
@@ -6610,7 +6610,7 @@ def is_eight_bit_clean_result(result: CandidateResult) -> bool:
 def bank2_eight_bit_clean_results(
     results: Sequence[CandidateResult],
 ) -> list[CandidateResult]:
-    """Return Bank 2 high-bit-clean candidates."""
+    """Return known-baud high-bit-clean candidates."""
     return [result for result in results if is_eight_bit_clean_result(result)]
 
 
@@ -6637,7 +6637,7 @@ def bank2_compact_result_summary(
     results: Sequence[CandidateResult],
     label_limit: int = 10,
 ) -> str:
-    """Return compact human-readable settings evidence for Bank 2 reports."""
+    """Return compact human-readable settings evidence for known-baud reports."""
     if not results:
         return "(NONE)"
     labels = [frame_or_pair_label(result.settings) for result in results]
@@ -6653,13 +6653,13 @@ def bank2_compact_result_summary(
 
 
 def bank2_ascii_pass_summary(results: Sequence[CandidateResult]) -> str:
-    """Return a compact summary of clean ASCII Bank 2 transfer candidates."""
+    """Return a compact summary of clean ASCII known-baud transfer candidates."""
     clean = [result for result in results if clean_ascii_transfer(result)]
     return bank2_compact_result_summary(clean)
 
 
 def bank2_eight_bit_detail_summary(results: Sequence[CandidateResult]) -> str:
-    """Return a compact summary of high-bit Bank 2 transfer candidates."""
+    """Return a compact summary of high-bit known-baud transfer candidates."""
     clean = bank2_eight_bit_clean_results(results)
     if clean:
         return "8-BIT CLEAN; " + bank2_compact_result_summary(clean, label_limit=8)
@@ -6667,7 +6667,7 @@ def bank2_eight_bit_detail_summary(results: Sequence[CandidateResult]) -> str:
 
 
 def bank2_target_sort_key(result: CandidateResult) -> tuple[bool, bool, bool, bool, bool, bool, bool, float, float, float, int]:
-    """Return a stable preference key for Bank 2 follow-up targets."""
+    """Return a stable preference key for known-baud follow-up targets."""
     transmit = transmit_side_settings(result.settings)
     receive = receive_side_settings(result.settings)
     same_frame = bank2_settings_same_frame(result.settings)
@@ -6691,11 +6691,10 @@ def best_bank2_followup_target(
     ascii_results: Sequence[CandidateResult],
     eight_bit_results: Sequence[CandidateResult],
 ) -> CandidateResult | None:
-    """Return the best Bank 2 target for raw probes and same-frame flow validation."""
+    """Return the best proven known-baud target for follow-up probes."""
     sources = [
         bank2_eight_bit_clean_results(eight_bit_results),
         likely_bank2_ascii_results(ascii_results),
-        list(ascii_results),
     ]
     for source in sources:
         eligible = [
@@ -6708,10 +6707,21 @@ def best_bank2_followup_target(
     return None
 
 
+def bank2_followup_target_label(
+    ascii_results: Sequence[CandidateResult],
+    eight_bit_results: Sequence[CandidateResult],
+) -> str:
+    """Return report text for the selected known-baud follow-up frame."""
+    target = best_bank2_followup_target(ascii_results, eight_bit_results)
+    if target is None:
+        return "(NONE - NO CLEAN ASCII/8-BIT TARGET)"
+    return frame_or_pair_label(target.settings)
+
+
 def best_bank2_ascii_target(
     results: Sequence[CandidateResult],
 ) -> CandidateResult | None:
-    """Return the best likely Bank 2 ASCII target for follow-up probes."""
+    """Return the best likely known-baud ASCII target for follow-up probes."""
     likely = likely_bank2_ascii_results(results)
     source = likely or list(results)
     if not source:
@@ -6744,13 +6754,15 @@ def bank2_flow_skip_reason(
     input_baud: int,
     output_baud: int,
 ) -> str | None:
-    """Return a conservative Bank 2 flow-validation skip reason, if any."""
+    """Return a conservative known-baud flow-validation skip reason, if any."""
+    if target is None:
+        return "No clean follow-up frame was found"
     if input_baud != output_baud:
         return (
             "Known input/output baud differs and current flow "
             "validation supports same-frame settings only"
         )
-    if target is None or not isinstance(target.settings, DualSerialSettings):
+    if not isinstance(target.settings, DualSerialSettings):
         return None
     if same_baud_frame(
         target.settings.input_settings,
@@ -6780,11 +6792,11 @@ def bank2_behavior_marker(
     probe_name: str,
     switch_hash: str | None,
 ) -> bytes:
-    """Return a unique marker embedded in raw Bank 2 behavior payloads."""
+    """Return a unique marker embedded in raw known-baud behavior payloads."""
     note = f" NOTE={switch_hash}" if switch_hash else ""
     marker = (
-        f"<<<BANK2_RAW RUN={sanitize_nonce_value(run_id or make_run_id('B2R'))} "
-        f"CAND=B2T{target_index:02d} PROBE={sanitize_nonce_value(probe_name)}"
+        f"<<<KNOWN_RAW RUN={sanitize_nonce_value(run_id or make_run_id('KBR'))} "
+        f"CAND=KBT{target_index:02d} PROBE={sanitize_nonce_value(probe_name)}"
         f"{note}>>>"
     )
     return marker.encode("ascii")
@@ -6795,7 +6807,7 @@ def bank2_behavior_probe_payloads(
     target_index: int,
     switch_hash: str | None,
 ) -> list[tuple[str, bytes]]:
-    """Return raw byte payload classes for Bank 2 behavior probing."""
+    """Return raw byte payload classes for known-baud behavior probing."""
     payloads: list[tuple[str, bytes]] = []
     for name, separator in (
         ("CR_ONLY", b"\r"),
@@ -6997,7 +7009,7 @@ def run_bank2_behavior_probe(
     observe_seconds: float,
     logger: logging.Logger,
 ) -> Bank2BehaviorProbeResult:
-    """Run one raw Bank 2 printer-job behavior probe."""
+    """Run one raw known-baud printer-job behavior probe."""
     started = time.monotonic()
     transmit_settings = transmit_side_settings(settings)
     receive_settings = receive_side_settings(settings)
@@ -7010,17 +7022,14 @@ def run_bank2_behavior_probe(
         max(options.pre_drain_timeout, payload_receive_seconds + options.pre_drain_quiet),
         options.pre_drain_quiet,
     )
-    prefix = f"[B2 RAW {index:02d}/{total:02d} {name} {settings.label()}]"
+    prefix = f"[KNOWN RAW {index:02d}/{total:02d} {name} {settings.label()}]"
     received = b""
     bytes_sent = 0
     error: str | None = None
     try:
         console_progress(border_line(PROGRESS_WIDTH))
         console_progress(
-            bordered_text(
-                f"BANK 2 RAW {index}/{total} {name}",
-                PROGRESS_WIDTH,
-            )
+            bordered_text(f"KNOWN-BAUD RAW {index}/{total} {name}", PROGRESS_WIDTH)
         )
         console_progress(border_line(PROGRESS_WIDTH))
         with open_serial_port(
@@ -7077,7 +7086,11 @@ def run_bank2_behavior_probe(
                     )
                     error = write_error or read_error
     except SERIAL_IO_ERRORS as exc:
-        logger.exception("Bank 2 behavior probe failed for %s %s", name, settings.label())
+        logger.exception(
+            "Known-baud behavior probe failed for %s %s",
+            name,
+            settings.label(),
+        )
         error = str(exc)
 
     exact, form_feed, cr_lf, status, reason = classify_bank2_behavior_bytes(
@@ -7106,7 +7119,7 @@ def run_bank2_behavior_probe(
         elapsed_sec=time.monotonic() - started,
     )
     logger.info(
-        "Bank 2 behavior %s %s: status=%s sent=%s read=%s "
+        "Known-baud behavior %s %s: status=%s sent=%s read=%s "
         "first_diff=%s exact=%s ff=%s crlf=%s reason=%s error=%s",
         name,
         settings.label(),
@@ -7121,7 +7134,7 @@ def run_bank2_behavior_probe(
         result.error,
     )
     logger.debug(
-        "Bank 2 behavior %s preview ascii=%r hex=%s",
+        "Known-baud behavior %s preview ascii=%r hex=%s",
         name,
         result.received_preview_ascii,
         result.received_preview_hex,
@@ -7164,14 +7177,14 @@ def run_bank2_behavior_probes(
     observe_seconds: float,
     logger: logging.Logger,
 ) -> list[Bank2BehaviorProbeResult]:
-    """Run optional raw Bank 2 behavior probes against a small target set."""
+    """Run optional raw known-baud behavior probes against a small target set."""
     if not targets:
         return []
     print()
-    print_report_title("BANK 2 RAW BYTE-BEHAVIOR PROBES")
+    print_report_title("KNOWN-BAUD RAW BYTE-BEHAVIOR PROBES")
     print(f"TARGETS: {len(targets)} PROBE FRAME(S).")
     print(f"TIMEOUT OBSERVE WINDOW: {observe_seconds:.1f}S.")
-    print("BYTE-LEVEL OBSERVATIONS ONLY; COMPARE SWITCH-STATE REPORT BLOCKS.")
+    print("BYTE-LEVEL OBSERVATIONS ONLY; COMPARE DEVICE/SWITCH REPORT BLOCKS.")
     print(border_line(REPORT_WIDTH))
     total = len(targets) * len(bank2_behavior_probe_payloads("COUNT", 1, None))
     results: list[Bank2BehaviorProbeResult] = []
@@ -7203,7 +7216,7 @@ def run_bank2_behavior_probes(
 def bank2_behavior_summary(
     results: Sequence[Bank2BehaviorProbeResult],
 ) -> str:
-    """Return a concise summary of raw Bank 2 behavior observations."""
+    """Return a concise summary of raw known-baud behavior observations."""
     if not results:
         return "NOT RUN"
     by_name = {result.name: result for result in results}
@@ -7235,7 +7248,7 @@ def bank2_value_lines(
     indent: str = "  ",
     width: int = REPORT_WIDTH,
 ) -> list[str]:
-    """Return Bank 2 key/value lines with one fixed value column."""
+    """Return known-baud key/value lines with one fixed value column."""
     return wrapped_value_lines(
         f"{indent}{label:<{BANK2_SUMMARY_LABEL_WIDTH}} ",
         value,
@@ -7244,7 +7257,7 @@ def bank2_value_lines(
 
 
 def print_bank2_value(label: str, value: object) -> None:
-    """Print one aligned Bank 2 key/value row."""
+    """Print one aligned known-baud key/value row."""
     for line in bank2_value_lines(label, value):
         print(line)
 
@@ -7347,7 +7360,7 @@ def bank2_behavior_report_lines(
         [
             "NOTE: RAW BEHAVIOR PROBES ARE BYTE-LEVEL OBSERVATIONS ONLY.",
             "NOTE: HASH VALUES ARE FNV-1A 32-BIT OVER SENT AND RECEIVED BYTES.",
-            "NOTE: SWITCH MEANING REQUIRES COMPARING MULTIPLE SWITCH-STATE BLOCKS.",
+            "NOTE: DEVICE/SWITCH MEANING REQUIRES COMPARING MULTIPLE BLOCKS.",
             border_line(REPORT_WIDTH),
         ]
     )
@@ -7358,7 +7371,7 @@ def bank2_etx_ack_payload(run_id: str, switch_hash: str | None) -> bytes:
     """Return a small ETX-bearing payload for forward path testing."""
     note = f" NOTE={switch_hash}" if switch_hash else ""
     marker = (
-        f"<<<BANK2_ETXACK RUN={sanitize_nonce_value(run_id or make_run_id('B2E'))}"
+        f"<<<KNOWN_ETXACK RUN={sanitize_nonce_value(run_id or make_run_id('KBE'))}"
         f"{note}>>>"
     ).encode("ascii")
     return marker + b"\r\nETX-FOLLOWS:" + b"\x03" + b":END\r\n"
@@ -7454,7 +7467,7 @@ def run_bank2_etx_ack_probe(
         max(options.pre_drain_timeout, 0.5),
         options.pre_drain_quiet,
     )
-    prefix = f"[B2 ETX/ACK {settings.label()}]"
+    prefix = f"[KNOWN ETX/ACK {settings.label()}]"
     forward_received = b""
     reverse_received = b""
     forward_sent = 0
@@ -7462,14 +7475,14 @@ def run_bank2_etx_ack_probe(
     error: str | None = None
     try:
         print()
-        print_report_title("BANK 2 ETX/ACK PATH PROBE")
+        print_report_title("KNOWN-BAUD ETX/ACK PATH PROBE")
         print(f"PROBE FRAME: {frame_or_pair_label(settings)}")
         print("FORWARD TEST SENDS ETX (03) TOWARD PRINTER SIDE.")
         print("REVERSE TEST INJECTS ACK (06) FROM PRINTER SIDE.")
         print("BYTE-LEVEL PATH TEST ONLY; NO PRINTER MEANING IS ASSIGNED.")
         print(border_line(REPORT_WIDTH))
         console_progress(border_line(PROGRESS_WIDTH))
-        console_progress(bordered_text("BANK 2 ETX/ACK PATH", PROGRESS_WIDTH))
+        console_progress(bordered_text("KNOWN-BAUD ETX/ACK PATH", PROGRESS_WIDTH))
         console_progress(border_line(PROGRESS_WIDTH))
         with open_serial_port(
             serial_module,
@@ -7554,7 +7567,7 @@ def run_bank2_etx_ack_probe(
                     )
                     error = reverse_write_error or reverse_read_error
     except SERIAL_IO_ERRORS as exc:
-        logger.exception("Bank 2 ETX/ACK probe failed for %s", settings.label())
+        logger.exception("Known-baud ETX/ACK probe failed for %s", settings.label())
         error = str(exc)
 
     etx_seen, etx_exact, ack_seen, reverse_seen, status, reason = classify_etx_ack_bytes(
@@ -7583,7 +7596,7 @@ def run_bank2_etx_ack_probe(
         elapsed_sec=time.monotonic() - started,
     )
     logger.info(
-        "Bank 2 ETX/ACK %s: status=%s fwd_sent=%s fwd_read=%s rev_sent=%s rev_read=%s etx=%s ack=%s reason=%s error=%s",
+        "Known-baud ETX/ACK %s: status=%s fwd_sent=%s fwd_read=%s rev_sent=%s rev_read=%s etx=%s ack=%s reason=%s error=%s",
         settings.label(),
         result.status,
         result.forward_bytes_sent,
@@ -7613,11 +7626,12 @@ def run_bank2_etx_ack_probes(
     observe_seconds: float,
     logger: logging.Logger,
 ) -> list[Bank2EtxAckProbeResult]:
-    """Run optional ETX/ACK probing on the selected Bank 2 probe frame."""
+    """Run optional ETX/ACK probing on the selected known-baud probe frame."""
     if target is None:
         print()
-        print_report_title("BANK 2 ETX/ACK PATH PROBE")
-        print("SKIPPED: NO PROBE FRAME WAS FOUND.")
+        print_report_title("KNOWN-BAUD ETX/ACK PATH PROBE")
+        print("SKIPPED: NO CLEAN FOLLOW-UP FRAME WAS FOUND.")
+        print("ASCII FRAME MUST PASS BEFORE ETX/ACK PATH RESULTS ARE USEFUL.")
         print(border_line(REPORT_WIDTH))
         return []
     return [
@@ -7632,7 +7646,7 @@ def run_bank2_etx_ack_probes(
 
 
 def bank2_etx_ack_summary(results: Sequence[Bank2EtxAckProbeResult]) -> str:
-    """Return a concise ETX/ACK path summary for Bank 2 reports."""
+    """Return a concise ETX/ACK path summary for known-baud reports."""
     if not results:
         return "NOT RUN"
     if any(result.ack_reverse_seen for result in results):
@@ -7695,7 +7709,7 @@ def bank2_conclusion(
 
     pass_frames = ascii_pass_frame_labels(ascii_results)
     if not pass_frames:
-        return with_stale_warning("No clean ASCII transfer observed")
+        return with_stale_warning("No working frame found for selected known bauds")
     eight_summary = eight_bit_result_summary(eight_bit_results)
     if "NOT CLEAN" in eight_summary or "MASKED" in eight_summary:
         return with_stale_warning("ASCII transfer passes, but 8-bit path is not clean")
@@ -7739,11 +7753,46 @@ def bank2_conclusion(
     return with_stale_warning("No observable change except listed byte-transfer evidence")
 
 
+def bank2_setup_verdict(result: Bank2CharacterizationResult) -> str:
+    """Return the human setup verdict for one known-baud characterization."""
+    pass_frames = ascii_pass_frame_labels(result.ascii_results)
+    if not pass_frames:
+        return (
+            "NO WORKING SERIAL SETTING FOUND FOR THIS DEVICE/SWITCH STATE AT "
+            f"{result.known_baud_text}."
+        )
+    if not bank2_eight_bit_clean_results(result.eight_bit_results):
+        return (
+            "ASCII TRANSFER WAS FOUND, BUT RAW 8-BIT TRANSFER IS NOT PROVEN CLEAN."
+        )
+    return "WORKING BYTE TRANSFER FOUND FOR THIS DEVICE/SWITCH STATE."
+
+
+def bank2_next_action(result: Bank2CharacterizationResult) -> str:
+    """Return the next operator action for one known-baud characterization."""
+    pass_frames = ascii_pass_frame_labels(result.ascii_results)
+    if not pass_frames:
+        return (
+            "DO NOT USE A FALLBACK FRAME AS THE SETTING. CHECK OPTION 2 BAUDS, "
+            "COM1->BUFFER INPUT AND BUFFER OUTPUT->COM5 CABLING, SWITCH STATE, "
+            "AND CLEAR/RESET THE BUFFER; THEN RUN AUTOMATED DISCOVERY OR RETRY "
+            "KNOWN-BAUD DEVICE TEST WITH DIFFERENT KNOWN BAUDS."
+        )
+    if not bank2_eight_bit_clean_results(result.eight_bit_results):
+        return (
+            "USE THE ASCII FRAME ONLY FOR PRINTABLE 7-BIT TRAFFIC; FOR MEMORY, "
+            "RAW DATA, OR PRINTER CONTROL BYTES, FIND AN 8-BIT CLEAN SETTING."
+        )
+    if result.flow_skip_reason:
+        return "COMPARE THIS BLOCK TO OTHER DEVICE/SWITCH STATES; FLOW WAS NOT PROVEN HERE."
+    return "COMPARE THIS BLOCK TO OTHER DEVICE/SWITCH STATES AND KEEP THE CLEANEST RESULT."
+
+
 def write_bank2_text_report(
     path: Path,
     result: Bank2CharacterizationResult,
 ) -> None:
-    """Append a concise second-bank characterization block."""
+    """Append a concise known-baud device-test block."""
     path.parent.mkdir(parents=True, exist_ok=True)
     created = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     ascii_summary = bank2_ascii_pass_summary(result.ascii_results)
@@ -7753,27 +7802,28 @@ def write_bank2_text_report(
         flow_summary = f"SKIPPED: {result.flow_skip_reason}"
     behavior_summary = bank2_behavior_summary(result.behavior_results)
     etx_ack_summary = bank2_etx_ack_summary(result.etx_ack_results)
-    target = best_bank2_followup_target(
+    target_label = bank2_followup_target_label(
         result.ascii_results,
         result.eight_bit_results,
     )
-    target_label = frame_or_pair_label(target.settings) if target else "(NONE)"
+    verdict = bank2_setup_verdict(result)
+    next_action = bank2_next_action(result)
     lines = [
         "",
         border_line(REPORT_WIDTH),
-        bordered_text("SECOND BANK CHARACTERIZATION", REPORT_WIDTH),
+        bordered_text("KNOWN-BAUD DEVICE TEST", REPORT_WIDTH),
         border_line(REPORT_WIDTH),
         *bank2_value_lines("APPENDED:", created, indent=""),
         *bank2_value_lines("RUN ID:", result.run_id, indent=""),
         *bank2_value_lines(
-            "DIP NOTE:",
+            "DEVICE NOTE:",
             result.switch_note or "(NOT ENTERED)",
             indent="",
         ),
         *bank2_value_lines("KNOWN BAUD/PAIR:", result.known_baud_text, indent=""),
         *bank2_value_lines("ASCII PASS:", ascii_summary, indent=""),
         *bank2_value_lines("8-BIT RESULT:", eight_detail, indent=""),
-        *bank2_value_lines("PROBE FRAME:", target_label, indent=""),
+        *bank2_value_lines("FOLLOW-UP FRAME:", target_label, indent=""),
         *bank2_value_lines("FLOW RESULT:", flow_summary, indent=""),
         *bank2_value_lines("BEHAVIOR RESULT:", behavior_summary, indent=""),
         *bank2_value_lines("ETX/ACK RESULT:", etx_ack_summary, indent=""),
@@ -7783,11 +7833,13 @@ def write_bank2_text_report(
             indent="",
         ),
         *bank2_value_lines("CONCLUSION:", result.conclusion, indent=""),
+        *bank2_value_lines("VERDICT:", verdict, indent=""),
+        *bank2_value_lines("NEXT:", next_action, indent=""),
         "",
         "SUMMARY TABLE:",
         border_line(REPORT_WIDTH),
         *bank2_value_lines(
-            "DIP NOTE:",
+            "DEVICE NOTE:",
             result.switch_note or "(NOT ENTERED)",
             indent="  ",
         ),
@@ -7803,12 +7855,13 @@ def write_bank2_text_report(
             indent="  ",
         ),
         *bank2_value_lines("CONCLUSION:", result.conclusion, indent="  "),
+        *bank2_value_lines("VERDICT:", verdict, indent="  "),
         border_line(REPORT_WIDTH),
         "",
         "EVIDENCE:",
         *bank2_value_lines("ASCII:", ascii_summary),
         *bank2_value_lines("8-BIT:", eight_detail),
-        *bank2_value_lines("PROBE FRAME:", target_label),
+        *bank2_value_lines("FOLLOW-UP FRAME:", target_label),
         *bank2_value_lines("RAW BYTES:", behavior_summary),
         *bank2_value_lines("ETX/ACK:", etx_ack_summary),
         *bank2_value_lines("FLOW:", flow_summary),
@@ -7826,9 +7879,9 @@ def write_bank2_text_report(
         "  8-BIT CLEAN IS STRONGER EVIDENCE FOR AN 8-BIT DATA PATH.",
         "  ETX/ACK REQUIRES A REVERSE ACK PATH; XON/XOFF DOES NOT PROVE THAT PATH.",
         "  FLOW IS PROVEN ONLY WHEN THE HOLD/RELEASE VALIDATION CHANGES BEHAVIOR.",
-        "  BEHAVIOR PROBES OBSERVE BYTES ONLY; THEY DO NOT ASSIGN SWITCH MEANING.",
-        "  STALE WARNING MEANS ONE ROW HAD WRONG-RUN DATA; IT IS NOT A SWITCH MEANING.",
-        "  COMPARE THIS APPENDED BLOCK TO OTHER SWITCH-NOTE BLOCKS MANUALLY.",
+        "  BEHAVIOR PROBES OBSERVE BYTES ONLY; THEY DO NOT ASSIGN DEVICE MEANING.",
+        "  STALE WARNING MEANS ONE ROW HAD WRONG-RUN DATA; IT IS NOT DEVICE MEANING.",
+        "  COMPARE THIS APPENDED BLOCK TO OTHER DEVICE-NOTE BLOCKS MANUALLY.",
         border_line(REPORT_WIDTH),
     ]
     with path.open("a", encoding="utf-8") as report_file:
@@ -7839,12 +7892,12 @@ def print_bank2_report(
     result: Bank2CharacterizationResult,
     report_path: Path,
 ) -> None:
-    """Print the second-bank characterization conclusion."""
+    """Print the known-baud device-test conclusion."""
     print()
-    print_report_title("SECOND BANK CHARACTERIZATION")
-    print_bank2_value("DIP NOTE:", result.switch_note or "(NOT ENTERED)")
+    print_report_title("KNOWN-BAUD DEVICE TEST")
+    print_bank2_value("DEVICE NOTE:", result.switch_note or "(NOT ENTERED)")
     print_bank2_value("KNOWN BAUD/PAIR:", result.known_baud_text)
-    target = best_bank2_followup_target(
+    target_label = bank2_followup_target_label(
         result.ascii_results,
         result.eight_bit_results,
     )
@@ -7853,10 +7906,7 @@ def print_bank2_report(
         "8-BIT RESULT:",
         bank2_eight_bit_detail_summary(result.eight_bit_results),
     )
-    print_bank2_value(
-        "PROBE FRAME:",
-        frame_or_pair_label(target.settings) if target else "(NONE)",
-    )
+    print_bank2_value("FOLLOW-UP FRAME:", target_label)
     flow_summary = bank2_flow_summary(result.flow_results)
     if result.flow_skip_reason:
         flow_summary = f"SKIPPED: {result.flow_skip_reason}"
@@ -7888,15 +7938,17 @@ def print_bank2_report(
             )
     print_bank2_value("STALE DATA SEEN:", "YES" if result.stale_data_seen else "NO")
     print_bank2_value("CONCLUSION:", result.conclusion)
+    print_bank2_value("VERDICT:", bank2_setup_verdict(result))
+    print_bank2_value("NEXT:", bank2_next_action(result))
     print_bank2_value("TEXT REPORT:", f"{report_path} (APPENDED)")
     print(border_line(REPORT_WIDTH))
 
 
 def run_second_bank_characterization(options: ScanOptions) -> None:
-    """Run a targeted known-baud switch-state characterization."""
+    """Run a targeted known-baud device characterization."""
     print()
-    print_report_title("SECOND BANK CHARACTERIZATION")
-    print("AUTOMATED TEST FOR THE CURRENT SECOND-BANK DIP SETTING.")
+    print_report_title("KNOWN-BAUD DEVICE TEST")
+    print("USES OPTION 2 BAUDS TO TEST FRAME, BYTES, AND DEVICE BEHAVIOR.")
     print_wrapped_value(
         "PORTS: ",
         f"{options.in_port} -> BUFFER -> {options.out_port}",
@@ -7915,7 +7967,7 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
         "KNOWN BAUDS: ",
         f"INPUT {input_baud}, OUTPUT {output_baud} (MAIN MENU OPTION 2)",
     )
-    switch_note = prompt_text("DIP SETTING NOTE FOR REPORT", options.switch_note)
+    switch_note = prompt_text("DEVICE/SWITCH NOTE FOR REPORT", options.switch_note)
     independent_frames = prompt_yes_no("TEST INPUT/OUTPUT FRAMES INDEPENDENTLY", True)
     if input_baud != output_baud:
         print("INPUT/OUTPUT BAUD DIFFER; INDEPENDENT FRAME TESTING FORCED ON.")
@@ -7948,7 +8000,7 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
         turbo_discovery_enabled=False,
         ask_on_top_match=False,
         no_pre_drain=False,
-        run_id=make_run_id("B2"),
+        run_id=make_run_id("KB"),
     )
     try:
         ensure_distinct_ports(bank_options.in_port, bank_options.out_port)
@@ -7971,7 +8023,7 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
         logger=logger,
         settings=purge_setting,
         max_seconds=purge_limit,
-        reason="AUTOMATED BANK-2 PRE-SCAN PURGE.",
+        reason="KNOWN-BAUD DEVICE PRE-TEST PURGE.",
     )
 
     ascii_results: list[CandidateResult] = []
@@ -7982,7 +8034,7 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
         independent_frames=independent_frames,
     )
     print()
-    print_report_title("BANK 2 ASCII FRAME TEST")
+    print_report_title("KNOWN-BAUD ASCII FRAME TEST")
     print(f"KNOWN BAUD/PAIR: {known_text}")
     print(f"FRAME CANDIDATES: {len(frames)}")
     print("TESTING TARGETED FRAME LIST.")
@@ -7999,7 +8051,7 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
                 logger=logger,
             )
         except KeyboardInterrupt:
-            action = prompt_operator_break_action("BANK 2 ASCII TEST")
+            action = prompt_operator_break_action("KNOWN-BAUD ASCII TEST")
             if action == "resume":
                 continue
             break
@@ -8013,6 +8065,7 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
     if ascii_results:
         likely_results = likely_bank2_ascii_results(ascii_results)
         eight_targets = likely_results or sorted(ascii_results, key=result_sort_key, reverse=True)[:1]
+        eight_targets_clean = bool(likely_results)
         eight_payload_bytes = max(
             DEFAULT_EIGHT_BIT_PAYLOAD_BYTES,
             payload_bytes,
@@ -8020,9 +8073,13 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
         )
         eight_payload = generate_eight_bit_payload(eight_payload_bytes)
         print()
-        print_report_title("BANK 2 8-BIT CHALLENGE")
-        print(f"TARGETS: {len(eight_targets)} LIKELY FRAME(S).")
-        print("ASCII PASS ALONE DOES NOT PROVE THIS PHASE.")
+        print_report_title("KNOWN-BAUD 8-BIT CHALLENGE")
+        if eight_targets_clean:
+            print(f"TARGETS: {len(eight_targets)} CLEAN ASCII FRAME(S).")
+            print("ASCII PASS ALONE DOES NOT PROVE THIS PHASE.")
+        else:
+            print(f"TARGETS: {len(eight_targets)} BEST NON-CLEAN FRAME(S).")
+            print("NO CLEAN ASCII FRAME FOUND; 8-BIT RESULT IS DIAGNOSTIC ONLY.")
         print(border_line(REPORT_WIDTH))
         for index, prior in enumerate(eight_targets, start=1):
             result = run_bank2_candidate(
@@ -8044,7 +8101,10 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
             else:
                 print(format_progress(result), flush=True)
             if result.status == "eight-bit-not-clean":
-                print("ASCII TRANSFER PASSES, BUT 8-BIT PATH IS NOT CLEAN.")
+                if eight_targets_clean:
+                    print("ASCII TRANSFER PASSES, BUT 8-BIT PATH IS NOT CLEAN.")
+                else:
+                    print("NO CLEAN ASCII PASS; 8-BIT CHECK IS DIAGNOSTIC ONLY.")
 
     behavior_results: list[Bank2BehaviorProbeResult] = []
     followup_target = best_bank2_followup_target(ascii_results, eight_bit_results)
@@ -8060,7 +8120,7 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
             )
         else:
             print()
-            print_report_title("BANK 2 RAW BYTE-BEHAVIOR PROBES")
+            print_report_title("KNOWN-BAUD RAW BYTE-BEHAVIOR PROBES")
             print("SKIPPED: NO CLEAN ASCII TARGET WAS FOUND.")
             print(border_line(REPORT_WIDTH))
 
@@ -8079,17 +8139,17 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
     if not bank_options.auto_validate_flow_control:
         flow_skip_reason = "FLOW-CONTROL TESTING DISABLED IN SCAN / VALIDATE SETUP"
         print()
-        print_report_title("BANK 2 FLOW VALIDATION")
+        print_report_title("KNOWN-BAUD FLOW VALIDATION")
         print(f"SKIPPED: {flow_skip_reason}.")
         print(border_line(REPORT_WIDTH))
-        logger.info("Bank 2 flow validation skipped: disabled by operator")
+        logger.info("Known-baud flow validation skipped: disabled by operator")
     elif flow_skip_reason:
         print()
-        print_report_title("BANK 2 FLOW VALIDATION")
+        print_report_title("KNOWN-BAUD FLOW VALIDATION")
         print(f"SKIPPED: {flow_skip_reason}.")
-        print("RESULT: NOT OBSERVABLE IN THIS BANK-2 RUN.")
+        print("RESULT: NOT OBSERVABLE IN THIS KNOWN-BAUD RUN.")
         print(border_line(REPORT_WIDTH))
-        logger.info("Bank 2 flow validation skipped: %s", flow_skip_reason)
+        logger.info("Known-baud flow validation skipped: %s", flow_skip_reason)
     else:
         flow_results, _break_action = run_flow_control_validation(
             serial_module=serial_module,
@@ -8241,7 +8301,7 @@ def memory_test_frame_mismatch_likely(
 def memory_test_frame_fix_text(config: MemoryTestConfig) -> str:
     """Return plain operator guidance for a frame-blocked memory test."""
     return (
-        "NOT PROVEN BROKEN. FIX SERIAL SETUP FIRST: RUN BANK 2 FRAME TEST AT "
+        "NOT PROVEN BROKEN. FIX SERIAL SETUP FIRST: RUN KNOWN-BAUD DEVICE TEST AT "
         f"INPUT {config.input_baud} / OUTPUT {config.output_baud}, OR SET THE "
         "BUFFER INPUT AND OUTPUT TO 8E1, THEN RERUN MEMORY TEST."
     )
@@ -8498,7 +8558,7 @@ def write_memory_test_text_report(path: Path, result: MemoryTestResult) -> None:
         f"COM PATH:        {result.config.in_port} -> BUFFER -> {result.config.out_port}",
         f"INPUT:           {settings.input_settings.label()}",
         f"OUTPUT:          {settings.output_settings.label()}",
-        f"DIP NOTE:        {result.config.switch_note or '(NOT ENTERED)'}",
+        f"DEVICE NOTE:     {result.config.switch_note or '(NOT ENTERED)'}",
         f"RESULT:          {diagnosis.result}",
         f"FINDING:         {diagnosis.finding}",
         f"DATA CHECK:      {diagnosis.data_check}",
@@ -8643,7 +8703,7 @@ def memory_test_summary_verdict(
                 "SERIAL SETUP MUST MATCH BEFORE RAM CAN BE JUDGED."
             ),
             (
-                "FIX SERIAL SETUP FIRST: RUN BANK 2 FRAME DISCOVERY AT INPUT "
+                "FIX SERIAL SETUP FIRST: RUN KNOWN-BAUD DEVICE TEST AT INPUT "
                 f"{config.input_baud} / OUTPUT {config.output_baud}, OR SET "
                 "THE BUFFER INPUT AND OUTPUT TO 8E1. THEN REPEAT THE "
                 f"{target_label} MEMORY TEST."
@@ -9181,7 +9241,7 @@ def run_dual_bank_scan(
             options.turbo_discovery_enabled,
         )
         switch_note = prompt_text(
-            "DIP setting note for report",
+            "Device/switch note for report",
             options.switch_note,
         )
         options = dataclasses.replace(
@@ -9834,13 +9894,13 @@ def run_self_tests() -> int:
     actual_bank2_frames = [
         frame_label(settings) for settings in bank2_frame_serial_settings(1200)
     ]
-    assert actual_bank2_frames == expected_bank2_frames, "Bank 2 frame order changed"
+    assert actual_bank2_frames == expected_bank2_frames, "known-baud frame order changed"
 
     dual_bank2 = bank2_frame_candidates(1200, 4800, independent_frames=True)
-    assert len(dual_bank2) == 144, "Bank 2 independent frame product must be 144"
+    assert len(dual_bank2) == 144, "known-baud independent frame product must be 144"
     assert all(
         isinstance(settings, DualSerialSettings) for settings in dual_bank2
-    ), "Bank 2 baud-pair candidates must be dual settings"
+    ), "known-baud pair candidates must be dual settings"
 
     def has_dual_frame_pair(input_frame: str, output_frame: str) -> bool:
         """Return whether the generated bank contains one frame pair."""
@@ -9855,13 +9915,13 @@ def run_self_tests() -> int:
     assert has_dual_frame_pair("8N1", "7O2"), "missing mixed 8N1 -> 7O2 pair"
 
     legacy_bank2 = bank2_frame_candidates(1200, 1200, independent_frames=False)
-    assert len(legacy_bank2) == 12, "legacy same-frame Bank 2 list must be 12"
+    assert len(legacy_bank2) == 12, "legacy same-frame known-baud list must be 12"
     assert all(
         isinstance(settings, SerialSettings) for settings in legacy_bank2
-    ), "legacy same-frame Bank 2 list must use SerialSettings"
+    ), "legacy same-frame known-baud list must use SerialSettings"
     assert [
         frame_label(settings) for settings in legacy_bank2
-    ] == expected_bank2_frames, "legacy same-frame Bank 2 order changed"
+    ] == expected_bank2_frames, "legacy same-frame known-baud order changed"
 
     dual_settings = DualSerialSettings(
         input_settings=SerialSettings(9600, 8, "none", 1, "none"),
@@ -10161,6 +10221,7 @@ def run_self_tests() -> int:
     assert parse_start_scan_workflow_choice("") == "discovery", "blank workflow must default to discovery"
     assert parse_start_scan_workflow_choice("1") == "discovery", "workflow 1 parse failed"
     assert parse_start_scan_workflow_choice("2") == "bank2", "workflow 2 parse failed"
+    assert parse_start_scan_workflow_choice("known-baud") == "bank2", "known-baud workflow parse failed"
     assert parse_start_scan_workflow_choice("3") == "phase0", "workflow 3 parse failed"
     assert parse_start_scan_workflow_choice("4") == "menu", "workflow 4 must return to menu"
     assert parse_start_scan_workflow_choice("main") == "menu", "workflow menu alias parse failed"
@@ -10257,23 +10318,60 @@ def run_self_tests() -> int:
         index=2,
     )
     preferred = best_bank2_followup_target([], [asym_eight, same_eight])
-    assert preferred is not None, "Bank 2 follow-up target was not selected"
+    assert preferred is not None, "known-baud follow-up target was not selected"
     assert (
         preferred.settings == same_followup
-    ), "Bank 2 target did not prefer same-frame 8E1 over asymmetric 8-bit clean"
+    ), "known-baud target did not prefer same-frame 8E1 over asymmetric 8-bit clean"
     assert (
         bank2_flow_skip_reason(preferred, 38400, 38400) is None
-    ), "same-frame Bank 2 target incorrectly skipped flow validation"
+    ), "same-frame known-baud target incorrectly skipped flow validation"
+    weak_followup = dataclasses.replace(
+        fake_clean_candidate_result(same_followup, payload_a),
+        status="weak",
+        score=10.0,
+    )
+    assert (
+        best_bank2_followup_target([weak_followup], []) is None
+    ), "weak known-baud rows must not become follow-up frames"
+    assert (
+        "NO CLEAN" in bank2_followup_target_label([weak_followup], [])
+    ), "unclean known-baud follow-up label should explain why no frame is shown"
+    no_clean_bank2 = Bank2CharacterizationResult(
+        switch_note="",
+        known_baud_text="IN 38400 / OUT 19200",
+        ascii_results=[weak_followup],
+        eight_bit_results=[],
+        flow_results=[],
+        behavior_results=[],
+        etx_ack_results=[],
+        stale_data_seen=False,
+        conclusion=bank2_conclusion([weak_followup], [], [], [], []),
+        run_id="KBTEST",
+        flow_skip_reason=None,
+    )
+    assert (
+        no_clean_bank2.conclusion == "No working frame found for selected known bauds"
+    ), "no-clean known-baud conclusion should say no working frame was found"
+    assert (
+        "NO WORKING SERIAL SETTING FOUND" in bank2_setup_verdict(no_clean_bank2)
+    ), "no-clean known-baud verdict should be explicit"
+    assert (
+        "DO NOT USE A FALLBACK FRAME" in bank2_next_action(no_clean_bank2)
+    ), "no-clean known-baud next action should reject fallback frames"
+    assert (
+        bank2_flow_skip_reason(None, 38400, 19200)
+        == "No clean follow-up frame was found"
+    ), "known-baud flow skip reason should prefer missing clean target"
     assert "PAIR(S)" in bank2_ascii_pass_summary(
         [fake_clean_candidate_result(same_followup, payload_a)]
-    ), "Bank 2 ASCII summary did not compact dual pairs"
+    ), "known-baud ASCII summary did not compact dual pairs"
 
     exact, form_feed, cr_lf, status, _reason = classify_bank2_behavior_bytes(
         b"RAW\r\n",
         b"RAW\r\n",
     )
     assert exact and not form_feed and not cr_lf and status == "exact", "raw exact classification failed"
-    behavior_payloads = dict(bank2_behavior_probe_payloads("B2RUN", 1, None))
+    behavior_payloads = dict(bank2_behavior_probe_payloads("KBRUN", 1, None))
     assert b"\x1b@" in behavior_payloads["PRINT_CTRL"], "printer ESC reset missing"
     assert b"\x1bE" in behavior_payloads["PRINT_CTRL"], "printer ESC bold missing"
     assert b"\x1bF" in behavior_payloads["PRINT_CTRL"], "printer ESC cancel missing"
@@ -10354,7 +10452,7 @@ def run_self_tests() -> int:
     )
     assert (
         conclusion == "8-bit clean; raw bytes exact; stale row seen"
-    ), "Bank 2 stale warning incorrectly dominated useful evidence"
+    ), "known-baud stale warning incorrectly dominated useful evidence"
 
     flow_settings = SerialSettings(1200, 8, "none", 1, "xon/xoff")
     clean_flow = fake_clean_candidate_result(flow_settings, payload_a)

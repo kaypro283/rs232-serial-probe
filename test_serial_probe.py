@@ -228,6 +228,7 @@ def test_start_scan_discovery_prompts_for_baud_range(
 
 def test_start_scan_bank2_uses_configured_bauds_without_range_prompt(
     monkeypatch: MonkeyPatch,
+    capsys: CaptureFixture[str],
 ) -> None:
     options = dataclasses.replace(
         serial_probe.default_scan_options(),
@@ -239,10 +240,13 @@ def test_start_scan_bank2_uses_configured_bauds_without_range_prompt(
     monkeypatch.setattr(builtins, "input", fake_input_from(["1", "2"]))
 
     selection = serial_probe.interactive_menu(options)
+    output = capsys.readouterr().out
 
     assert selection is not None
     assert selection.action == "scan"
     assert selection.workflow == "bank2"
+    assert "KNOWN-BAUD DEVICE TEST" in output
+    assert "BANK 2 SWITCH-STATE TEST" not in output
     assert selection.options.input_baud == 38400
     assert selection.options.output_baud == 19200
     assert selection.options.min_baud == 300
@@ -436,7 +440,7 @@ def test_memory_test_high_bit_ascii_output_reports_frame_issue() -> None:
 
 
 def test_bank2_behavior_payload_classes_cover_control_ranges() -> None:
-    payloads = dict(serial_probe.bank2_behavior_probe_payloads("B2RUN", 1, None))
+    payloads = dict(serial_probe.bank2_behavior_probe_payloads("KBRUN", 1, None))
 
     assert {"PRINT_CTRL", "ASCII_SWEEP", "CTL7_SAFE", "CTL7_FULL"} <= set(payloads)
     assert b"\x1b@" in payloads["PRINT_CTRL"]
@@ -526,7 +530,7 @@ def test_bank2_report_columns_are_fixed_width(
         etx_ack_results=[],
         stale_data_seen=False,
         conclusion="8-bit clean; raw bytes exact",
-        run_id="B2TEST",
+        run_id="KBTEST",
         flow_skip_reason=None,
     )
 
@@ -534,7 +538,7 @@ def test_bank2_report_columns_are_fixed_width(
 
     lines = capsys.readouterr().out.splitlines()
     known_line = next(line for line in lines if "KNOWN BAUD/PAIR:" in line)
-    probe_line = next(line for line in lines if "PROBE FRAME:" in line)
+    probe_line = next(line for line in lines if "FOLLOW-UP FRAME:" in line)
     assert known_line.index("IN 38400") == probe_line.index("IN 8E1")
 
     raw_header = next(line for line in lines if "RAW PROBE" in line)
@@ -543,6 +547,75 @@ def test_bank2_report_columns_are_fixed_width(
     assert raw_row == serial_probe.bank2_raw_console_row(behavior)
     assert len(serial_probe.bank2_raw_report_header()) == serial_probe.REPORT_WIDTH
     assert len(serial_probe.bank2_raw_report_row(behavior)) == serial_probe.REPORT_WIDTH
+
+
+def test_bank2_report_does_not_recommend_unclean_followup_frame(
+    capsys: CaptureFixture[str],
+) -> None:
+    settings = serial_probe.DualSerialSettings(
+        serial_probe.SerialSettings(38400, 8, "even", 1, "none"),
+        serial_probe.SerialSettings(19200, 8, "even", 1, "none"),
+    )
+    payload = serial_probe.generate_payload(serial_probe.DEFAULT_PAYLOAD_BYTES)
+    score = serial_probe.score_received(payload.data, payload.data[:64])
+    trial = serial_probe.TrialResult(
+        burst_index=1,
+        bytes_sent=payload.byte_count,
+        bytes_received=64,
+        bytes_drained_before=0,
+        drain_status="quiet",
+        score=score.score,
+        metrics=score.metrics,
+        status="weak",
+        error=None,
+        elapsed_sec=0.0,
+        timing=serial_probe.zero_timing_breakdown(),
+        received_preview_ascii="",
+        received_preview_hex="",
+        score_classification=score.classification,
+        evidence=score.evidence,
+        payload_mode=payload.payload_mode,
+    )
+    weak_result = serial_probe.aggregate_candidate_result(
+        index=1,
+        total=1,
+        settings=settings,
+        trials=[trial],
+        elapsed_sec=0.0,
+    )
+    result = serial_probe.Bank2CharacterizationResult(
+        switch_note="",
+        known_baud_text="IN 38400 / OUT 19200",
+        ascii_results=[weak_result],
+        eight_bit_results=[],
+        flow_results=[],
+        behavior_results=[],
+        etx_ack_results=[],
+        stale_data_seen=False,
+        conclusion=serial_probe.bank2_conclusion([weak_result], [], [], [], []),
+        run_id="KBTEST",
+        flow_skip_reason=None,
+    )
+
+    assert serial_probe.best_bank2_followup_target([weak_result], []) is None
+    assert (
+        result.conclusion == "No working frame found for selected known bauds"
+    )
+    assert "NO WORKING SERIAL SETTING FOUND" in serial_probe.bank2_setup_verdict(result)
+    assert "DO NOT USE A FALLBACK FRAME" in serial_probe.bank2_next_action(result)
+    assert (
+        serial_probe.bank2_flow_skip_reason(None, 38400, 19200)
+        == "No clean follow-up frame was found"
+    )
+
+    serial_probe.print_bank2_report(result, Path("serial_probe_report.txt"))
+    output = capsys.readouterr().out
+
+    assert "ASCII PASS:      (NONE)" in output
+    assert "FOLLOW-UP FRAME: (NONE - NO CLEAN ASCII/8-BIT TARGET)" in output
+    assert "VERDICT:         NO WORKING SERIAL SETTING FOUND" in output
+    assert "NEXT:            DO NOT USE A FALLBACK FRAME" in output
+    assert "PROBE FRAME:     IN 8E1" not in output
 
 
 def test_terminal_progress_rows_fit_80_columns() -> None:

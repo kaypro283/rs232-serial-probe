@@ -94,7 +94,7 @@ Select `1 START SCAN` from the main menu to choose one of the scan workflows:
 
 ```text
 1 AUTOMATED DISCOVERY
-2 BANK 2 SWITCH-STATE TEST USING KNOWN BAUD
+2 KNOWN-BAUD DEVICE TEST
 3 PHASE 0 BAUD LIVENESS ONLY
 4 RETURN TO MAIN MENU
 ```
@@ -103,9 +103,13 @@ Select `1 START SCAN` from the main menu to choose one of the scan workflows:
 
 After choosing `AUTOMATED DISCOVERY` or `PHASE 0 BAUD LIVENESS ONLY`, the workflow asks for the baud range for that run.
 
-`BANK 2 SWITCH-STATE TEST USING KNOWN BAUD` is for a switch bank or buffer mode where you already know the input and output baud. It uses the fixed input/output bauds configured in `2 SET COM PORTS / BAUD`, then runs targeted ASCII, 8-bit, raw byte behavior, ETX/ACK, and flow validation checks.
+`KNOWN-BAUD DEVICE TEST` is for any serial device or switch mode where you already know the input and output baud. It uses the fixed input/output bauds configured in `2 SET COM PORTS / BAUD`, then runs targeted ASCII frame checks, an 8-bit challenge, raw byte behavior probes, ETX/ACK probing, and flow validation checks.
 
 The raw byte behavior phase runs several payload classes after a likely frame is found: CR-only, LF-only, CR/LF, printer-control bytes with TAB/FF/ESC, printable ASCII `0x20..0x7E`, 7-bit controls excluding XON/XOFF, and 7-bit controls including XON/XOFF. Its report compares bytes exactly and records sent/read counts, sent and received hashes, first mismatch offset, and missing/extra byte counts. If the XON/XOFF-free control sweep is exact but the full control sweep changes, the report calls out that XON/XOFF control bytes affected the raw path.
+
+Known-baud device reports use `FOLLOW-UP FRAME` only for a clean ASCII or clean 8-bit target. If no clean ASCII transfer is observed, follow-up behavior, ETX/ACK, and flow checks are skipped or marked diagnostic so a weak fallback row is not mistaken for a recommended setting.
+
+If the known-baud device test cannot find a clean ASCII transfer for the selected known bauds, the result is `NO WORKING SERIAL SETTING FOUND` for that device/switch state and baud pair. The next step is to check the selected bauds, cabling direction, switch state, and buffer clear/reset state, or run automated discovery instead of assuming the known bauds are correct.
 
 `PHASE 0 BAUD LIVENESS ONLY` only tests whether selected input/output baud pairs show a basic signal. It does not use the scan/validate message-size settings.
 
@@ -193,7 +197,7 @@ If the buffer is already dumping old data, the scan cannot reliably score the cu
 
 The `TIMING / PER-TEST STALE` menu controls the quick stale-data check that happens before individual tests. Its `MAX QUICK CLEAR TIME BEFORE TEST` setting is not meant to empty a full low-baud buffer.
 
-When the output baud and frame are known, the tool uses calculated long purge limits instead. Bank 2 known-baud tests, memory tests, flow validation, dual validation, and post-Phase-0 frame scans use those known-baud purge paths.
+When the output baud and frame are known, the tool uses calculated long purge limits instead. Known-baud device tests, memory tests, flow validation, dual validation, and post-Phase-0 frame scans use those known-baud purge paths.
 
 If the output does not go quiet, the test is marked:
 
