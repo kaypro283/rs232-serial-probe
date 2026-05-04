@@ -105,7 +105,7 @@ After choosing `AUTOMATED DISCOVERY` or `PHASE 0 BAUD LIVENESS ONLY`, the workfl
 
 `KNOWN-BAUD DEVICE TEST` is for any serial device or switch mode where you already know the input and output baud. It uses the fixed input/output bauds configured in `2 SET COM PORTS / BAUD`, then runs targeted ASCII frame checks, an 8-bit challenge, raw byte behavior probes, ETX/ACK probing, and flow validation checks.
 
-When known-baud independent frame testing finds an asymmetric follow-up frame, flow validation keeps that input/output frame pair and sweeps the 16 input/output flow-control combinations as transfer checks. Same-frame flow validation can additionally run hold/release handshake checks.
+When known-baud testing finds a clean follow-up frame, flow validation sweeps the 16 input/output flow-control combinations as transfer checks. If the follow-up frame is the same on both sides, it also runs the output-side hold/release handshake proof. The report keeps these separate as `FLOW MATRIX` and `OUTPUT HOLD` because transfer compatibility and handshake pause/resume are different evidence.
 
 The raw byte behavior phase runs several payload classes after a likely frame is found: CR-only, LF-only, CR/LF, printer-control bytes with TAB/FF/ESC, printable ASCII `0x20..0x7E`, 7-bit controls excluding XON/XOFF, and 7-bit controls including XON/XOFF. Its report compares bytes exactly and records sent/read counts, sent and received hashes, first mismatch offset, and missing/extra byte counts. If the XON/XOFF-free control sweep is exact but the full control sweep changes, the report calls out that XON/XOFF control bytes affected the raw path.
 

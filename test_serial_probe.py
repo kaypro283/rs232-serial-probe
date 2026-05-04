@@ -827,3 +827,121 @@ def test_known_baud_asymmetric_followup_uses_dual_flow_summary() -> None:
         len(line) <= serial_probe.REPORT_WIDTH
         for line in serial_probe.flow_validation_report_lines([flow_row])
     )
+
+
+def test_known_baud_flow_summary_splits_matrix_and_hold() -> None:
+    payload = serial_probe.generate_payload(512)
+    base_frame = serial_probe.SerialSettings(38400, 8, "even", 1, "none")
+    flow_pair = serial_probe.DualSerialSettings(
+        dataclasses.replace(base_frame, flow_control="dsr/dtr"),
+        dataclasses.replace(base_frame, flow_control="none"),
+    )
+    clean_flow = serial_probe.fake_clean_candidate_result(flow_pair, payload)
+    matrix_row = serial_probe.flow_validation_result_from_candidate(
+        serial_probe.dual_flow_control_code(flow_pair),
+        "dual-transfer",
+        clean_flow,
+        payload,
+    )
+    hold_row = serial_probe.FlowControlValidationResult(
+        flow_control="dsr/dtr",
+        method="dtr-hold-release",
+        settings=dataclasses.replace(base_frame, flow_control="dsr/dtr"),
+        bytes_sent=payload.byte_count,
+        bytes_received=payload.byte_count,
+        bytes_seen_while_held=0,
+        score=100.0,
+        indicator="PASS",
+        status="validated",
+        reason="OUTPUT PAUSED DURING HOLD AND CLEANLY RESUMED.",
+        error=None,
+        elapsed_sec=0.0,
+        metrics=clean_flow.metrics,
+    )
+    results = [matrix_row, hold_row]
+
+    assert serial_probe.bank2_flow_matrix_summary(results).startswith(
+        "CLEAN DUAL FLOW TRANSFER"
+    )
+    assert (
+        serial_probe.bank2_flow_hold_summary(results)
+        == "PROVEN HANDSHAKE: DSR/DTR."
+    )
+    summary = serial_probe.bank2_flow_summary(results)
+    assert "MATRIX:" in summary
+    assert "OUTPUT HOLD:" in summary
+
+    report_lines = serial_probe.bank2_flow_report_lines(results)
+    assert "FLOW TRANSFER MATRIX:" in report_lines
+    assert "OUTPUT HOLD/RELEASE:" in report_lines
+    assert all(len(line) <= serial_probe.REPORT_WIDTH for line in report_lines)
+
+
+def test_known_baud_text_report_includes_split_flow_evidence(tmp_path: Path) -> None:
+    payload = serial_probe.generate_payload(512)
+    base_frame = serial_probe.SerialSettings(38400, 8, "even", 1, "none")
+    ascii_result = serial_probe.fake_clean_candidate_result(base_frame, payload)
+    matrix_pair = serial_probe.DualSerialSettings(
+        dataclasses.replace(base_frame, flow_control="dsr/dtr"),
+        dataclasses.replace(base_frame, flow_control="none"),
+    )
+    matrix_candidate = serial_probe.fake_clean_candidate_result(matrix_pair, payload)
+    matrix_row = serial_probe.flow_validation_result_from_candidate(
+        serial_probe.dual_flow_control_code(matrix_pair),
+        "dual-transfer",
+        matrix_candidate,
+        payload,
+    )
+    hold_row = serial_probe.FlowControlValidationResult(
+        flow_control="dsr/dtr",
+        method="dtr-hold-release",
+        settings=dataclasses.replace(base_frame, flow_control="dsr/dtr"),
+        bytes_sent=payload.byte_count,
+        bytes_received=payload.byte_count,
+        bytes_seen_while_held=0,
+        score=100.0,
+        indicator="PASS",
+        status="validated",
+        reason="OUTPUT PAUSED DURING HOLD AND CLEANLY RESUMED.",
+        error=None,
+        elapsed_sec=0.0,
+        metrics=matrix_candidate.metrics,
+    )
+    result = serial_probe.Bank2CharacterizationResult(
+        switch_note="00000000",
+        known_baud_text="38400",
+        ascii_results=[ascii_result],
+        eight_bit_results=[],
+        flow_results=[matrix_row, hold_row],
+        behavior_results=[],
+        etx_ack_results=[],
+        stale_data_seen=False,
+        conclusion="Flow behavior changed or was validated; compare prior blocks",
+        run_id="KBTEST",
+        flow_skip_reason=None,
+    )
+    report_path = tmp_path / "serial_probe_report.txt"
+
+    serial_probe.write_bank2_text_report(report_path, result)
+    report_text = report_path.read_text()
+
+    assert "FLOW MATRIX:" in report_text
+    assert "OUTPUT HOLD:" in report_text
+    assert "FLOW TRANSFER MATRIX:" in report_text
+    assert "OUTPUT HOLD/RELEASE:" in report_text
+    assert "INPUT-SIDE BACKPRESSURE IS NOT PROVEN" in report_text
+
+
+def test_known_baud_dual_flow_target_wraps_single_frame() -> None:
+    payload = serial_probe.generate_payload(512)
+    frame = serial_probe.SerialSettings(38400, 8, "even", 1, "xon/xoff")
+    target = serial_probe.fake_clean_candidate_result(frame, payload)
+
+    matrix_target = serial_probe.bank2_dual_flow_validation_target(target)
+
+    assert matrix_target is not None
+    assert isinstance(matrix_target.settings, serial_probe.DualSerialSettings)
+    assert matrix_target.settings.input_settings.flow_control == "none"
+    assert matrix_target.settings.output_settings.flow_control == "none"
+    assert matrix_target.settings.input_settings.data_bits == 8
+    assert matrix_target.settings.output_settings.parity == "even"

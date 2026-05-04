@@ -6786,7 +6786,109 @@ def bank2_flow_summary(results: Sequence[FlowControlValidationResult]) -> str:
     """Return a concise flow validation summary for bank-2 reports."""
     if not results:
         return "NOT RUN"
+    matrix_results = flow_transfer_matrix_results(results)
+    hold_results = flow_hold_release_results(results)
+    if matrix_results and hold_results:
+        return (
+            f"MATRIX: {bank2_flow_matrix_summary(results)}; "
+            f"OUTPUT HOLD: {bank2_flow_hold_summary(results)}"
+        )
+    if matrix_results:
+        return f"MATRIX: {bank2_flow_matrix_summary(results)}"
+    if hold_results:
+        return f"OUTPUT HOLD: {bank2_flow_hold_summary(results)}"
     return flow_control_validation_recommendation(results)
+
+
+def flow_transfer_matrix_results(
+    results: Sequence[FlowControlValidationResult],
+) -> list[FlowControlValidationResult]:
+    """Return dual input/output flow-transfer matrix rows."""
+    return [result for result in results if result.method == "dual-transfer"]
+
+
+def flow_hold_release_results(
+    results: Sequence[FlowControlValidationResult],
+) -> list[FlowControlValidationResult]:
+    """Return same-frame output hold/release flow validation rows."""
+    return [result for result in results if result.method != "dual-transfer"]
+
+
+def bank2_flow_matrix_summary(
+    results: Sequence[FlowControlValidationResult],
+) -> str:
+    """Return the known-baud input/output flow-transfer matrix summary."""
+    matrix_results = flow_transfer_matrix_results(results)
+    if not matrix_results:
+        return "NOT RUN"
+    return flow_control_validation_recommendation(matrix_results)
+
+
+def bank2_flow_hold_summary(
+    results: Sequence[FlowControlValidationResult],
+) -> str:
+    """Return the known-baud output-side hold/release summary."""
+    hold_results = flow_hold_release_results(results)
+    if not hold_results:
+        return "NOT RUN"
+    return flow_control_validation_recommendation(hold_results)
+
+
+def titled_flow_validation_report_lines(
+    title: str,
+    results: Sequence[FlowControlValidationResult],
+) -> list[str]:
+    """Return flow validation report lines under a custom section title."""
+    lines = flow_validation_report_lines(results)
+    if lines:
+        lines[0] = title
+    return lines
+
+
+def bank2_flow_report_lines(
+    results: Sequence[FlowControlValidationResult],
+    skip_reason: str | None = None,
+) -> list[str]:
+    """Return detailed known-baud flow evidence split by test method."""
+    if skip_reason:
+        lines = ["FLOW CONTROL VALIDATION:"]
+        lines.extend(
+            wrapped_value_lines(
+                "FINDING:         ",
+                f"SKIPPED: {skip_reason}",
+                REPORT_WIDTH,
+            )
+        )
+        lines.append(border_line(REPORT_WIDTH))
+        return lines
+
+    matrix_results = flow_transfer_matrix_results(results)
+    hold_results = flow_hold_release_results(results)
+    if not matrix_results and not hold_results:
+        return [
+            "FLOW CONTROL VALIDATION:",
+            "FINDING:         NOT RUN",
+            border_line(REPORT_WIDTH),
+        ]
+
+    lines: list[str] = []
+    if matrix_results:
+        lines.extend(
+            titled_flow_validation_report_lines(
+                "FLOW TRANSFER MATRIX:",
+                matrix_results,
+            )
+        )
+    if matrix_results and hold_results:
+        lines.append("")
+    if hold_results:
+        lines.extend(
+            titled_flow_validation_report_lines(
+                "OUTPUT HOLD/RELEASE:",
+                hold_results,
+            )
+        )
+    return lines
 
 
 def same_baud_frame(left: SerialSettings, right: SerialSettings) -> bool:
@@ -7003,6 +7105,21 @@ def bank2_flow_validation_seed(
     if isinstance(target.settings, DualSerialSettings):
         return [dataclasses.replace(target, settings=target.settings.input_settings)]
     return [target]
+
+
+def bank2_dual_flow_validation_target(
+    target: CandidateResult | None,
+) -> CandidateResult | None:
+    """Return a dual-settings target for known-baud flow matrix testing."""
+    if target is None:
+        return None
+    if isinstance(target.settings, DualSerialSettings):
+        return target
+    base_settings = dataclasses.replace(target.settings, flow_control="none")
+    return dataclasses.replace(
+        target,
+        settings=DualSerialSettings(base_settings, base_settings),
+    )
 
 
 def bank2_behavior_marker(
@@ -8017,8 +8134,12 @@ def write_bank2_text_report(
     ascii_summary = bank2_ascii_pass_summary(result.ascii_results)
     eight_detail = bank2_eight_bit_detail_summary(result.eight_bit_results)
     flow_summary = bank2_flow_summary(result.flow_results)
+    flow_matrix_summary = bank2_flow_matrix_summary(result.flow_results)
+    flow_hold_summary = bank2_flow_hold_summary(result.flow_results)
     if result.flow_skip_reason:
         flow_summary = f"SKIPPED: {result.flow_skip_reason}"
+        flow_matrix_summary = flow_summary
+        flow_hold_summary = flow_summary
     behavior_summary = bank2_behavior_summary(result.behavior_results)
     etx_ack_summary = bank2_etx_ack_summary(result.etx_ack_results)
     target_label = bank2_followup_target_label(
@@ -8044,6 +8165,8 @@ def write_bank2_text_report(
         *bank2_value_lines("8-BIT RESULT:", eight_detail, indent=""),
         *bank2_value_lines("FOLLOW-UP FRAME:", target_label, indent=""),
         *bank2_value_lines("FLOW RESULT:", flow_summary, indent=""),
+        *bank2_value_lines("FLOW MATRIX:", flow_matrix_summary, indent=""),
+        *bank2_value_lines("OUTPUT HOLD:", flow_hold_summary, indent=""),
         *bank2_value_lines("BEHAVIOR RESULT:", behavior_summary, indent=""),
         *bank2_value_lines("ETX/ACK RESULT:", etx_ack_summary, indent=""),
         *bank2_value_lines(
@@ -8068,6 +8191,8 @@ def write_bank2_text_report(
         *bank2_value_lines("RAW:", behavior_summary, indent="  "),
         *bank2_value_lines("ETX/ACK:", etx_ack_summary, indent="  "),
         *bank2_value_lines("FLOW:", flow_summary, indent="  "),
+        *bank2_value_lines("FLOW MATRIX:", flow_matrix_summary, indent="  "),
+        *bank2_value_lines("OUTPUT HOLD:", flow_hold_summary, indent="  "),
         *bank2_value_lines(
             "STALE:",
             "YES" if result.stale_data_seen else "NO",
@@ -8084,6 +8209,8 @@ def write_bank2_text_report(
         *bank2_value_lines("RAW BYTES:", behavior_summary),
         *bank2_value_lines("ETX/ACK:", etx_ack_summary),
         *bank2_value_lines("FLOW:", flow_summary),
+        *bank2_value_lines("FLOW MATRIX:", flow_matrix_summary),
+        *bank2_value_lines("OUTPUT HOLD:", flow_hold_summary),
         *bank2_value_lines(
             "STALE WARNING:",
             "YES" if result.stale_data_seen else "NO",
@@ -8093,11 +8220,15 @@ def write_bank2_text_report(
         "",
         *bank2_etx_ack_report_lines(result.etx_ack_results),
         "",
+        *bank2_flow_report_lines(result.flow_results, result.flow_skip_reason),
+        "",
         "INTERPRETATION:",
         "  FRAME PASS HERE MEANS CLEAN ASCII BYTE TRANSFER, NOT UNIQUE PARITY/STOP PROOF.",
         "  8-BIT CLEAN IS STRONGER EVIDENCE FOR AN 8-BIT DATA PATH.",
         "  ETX/ACK REQUIRES A REVERSE ACK PATH; XON/XOFF DOES NOT PROVE THAT PATH.",
-        "  FLOW IS PROVEN ONLY WHEN THE HOLD/RELEASE VALIDATION CHANGES BEHAVIOR.",
+        "  FLOW MATRIX SHOWS WHICH IN/OUT FLOW PAIRS MOVE BYTES CLEANLY.",
+        "  OUTPUT HOLD/RELEASE PROVES ONLY OBSERVED OUTPUT-SIDE PAUSE/RESUME.",
+        "  INPUT-SIDE BACKPRESSURE IS NOT PROVEN BY THIS FLOW VALIDATION.",
         "  BEHAVIOR PROBES OBSERVE BYTES ONLY; THEY DO NOT ASSIGN DEVICE MEANING.",
         "  STALE WARNING MEANS ONE ROW HAD WRONG-RUN DATA; IT IS NOT DEVICE MEANING.",
         "  COMPARE THIS REPORT BLOCK TO OTHER DEVICE-NOTE BLOCKS MANUALLY.",
@@ -8127,9 +8258,15 @@ def print_bank2_report(
     )
     print_bank2_value("FOLLOW-UP FRAME:", target_label)
     flow_summary = bank2_flow_summary(result.flow_results)
+    flow_matrix_summary = bank2_flow_matrix_summary(result.flow_results)
+    flow_hold_summary = bank2_flow_hold_summary(result.flow_results)
     if result.flow_skip_reason:
         flow_summary = f"SKIPPED: {result.flow_skip_reason}"
+        flow_matrix_summary = flow_summary
+        flow_hold_summary = flow_summary
     print_bank2_value("FLOW RESULT:", flow_summary)
+    print_bank2_value("FLOW MATRIX:", flow_matrix_summary)
+    print_bank2_value("OUTPUT HOLD:", flow_hold_summary)
     print_bank2_value(
         "BEHAVIOR RESULT:",
         bank2_behavior_summary(result.behavior_results),
@@ -8176,7 +8313,7 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
         "SEQUENCE: ",
         (
             "PURGE, ASCII FRAME TEST, 8-BIT CHALLENGE, RAW BEHAVIOR, "
-            "ETX/ACK PATH, FLOW VALIDATION."
+            "ETX/ACK PATH, FLOW MATRIX, OUTPUT HOLD VALIDATION."
         ),
     )
     print(border_line(REPORT_WIDTH))
@@ -8369,25 +8506,35 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
         print("RESULT: NOT OBSERVABLE IN THIS KNOWN-BAUD RUN.")
         print(border_line(REPORT_WIDTH))
         logger.info("Known-baud flow validation skipped: %s", flow_skip_reason)
-    elif (
-        followup_target is not None
-        and isinstance(followup_target.settings, DualSerialSettings)
-        and not bank2_settings_same_frame(followup_target.settings)
-    ):
-        flow_results, _break_action = run_dual_flow_control_validation(
-            serial_module=serial_module,
-            options=bank_options,
-            target=followup_target,
-            logger=logger,
-        )
     else:
-        flow_results, _break_action = run_flow_control_validation(
-            serial_module=serial_module,
-            options=bank_options,
-            results=ascii_results,
-            validation_results=bank2_flow_validation_seed(followup_target),
-            logger=logger,
-        )
+        dual_flow_target = bank2_dual_flow_validation_target(followup_target)
+        if dual_flow_target is not None:
+            matrix_results, _break_action = run_dual_flow_control_validation(
+                serial_module=serial_module,
+                options=bank_options,
+                target=dual_flow_target,
+                logger=logger,
+            )
+            flow_results.extend(matrix_results)
+
+        if followup_target is not None and bank2_settings_same_frame(followup_target.settings):
+            hold_results, _break_action = run_flow_control_validation(
+                serial_module=serial_module,
+                options=bank_options,
+                results=ascii_results,
+                validation_results=bank2_flow_validation_seed(followup_target),
+                logger=logger,
+            )
+            flow_results.extend(hold_results)
+        elif followup_target is not None:
+            print()
+            print_report_title("KNOWN-BAUD OUTPUT HOLD/RELEASE")
+            print("SKIPPED: FOLLOW-UP FRAME IS ASYMMETRIC.")
+            print("RESULT: FLOW TRANSFER MATRIX WAS RUN; HOLD/RELEASE NOT PROVEN.")
+            print(border_line(REPORT_WIDTH))
+            logger.info(
+                "Known-baud output hold/release skipped: asymmetric follow-up frame"
+            )
 
     stale_seen = stale_nonce_seen(ascii_results) or stale_nonce_seen(eight_bit_results)
     conclusion = bank2_conclusion(
