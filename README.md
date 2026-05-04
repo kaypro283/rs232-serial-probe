@@ -25,7 +25,7 @@ Usage screen:
 python serial_probe.py --help
 ```
 
-The first screen is the command menu. Use `8 CURRENT SETTINGS` to view ports, each port's configured baud, the last scan baud range, test message size, repeat count, timing, old-output clearing, Phase 0 liveness settings, report files, and available test workflows. `1 START SCAN` opens the discovery workflow menu. `7 MEMORY TEST` runs the fixed-frame memory test.
+The first screen is the command menu. Use `6 CURRENT SETTINGS` to view ports, each port's configured baud, the last scan baud range, test message size, repeat count, timing, old-output clearing, Phase 0 liveness settings, fixed report files, and available test workflows. `1 START SCAN` opens the discovery workflow menu. `5 MEMORY TEST` runs the fixed-frame memory test.
 
 The terminal UI is written for an 80-column by 25-line early terminal style. Long operator screens pause with `PRESS ENTER FOR MORE, Q TO STOP:`. Screens use terse uppercase operator text and bright green text when the console supports ANSI color. PyCharm runs are treated as color-capable. Set `NO_COLOR=1` before running if you want plain console text.
 
@@ -45,14 +45,14 @@ During a running scan or validation pass, press `Ctrl+C` for the `OPERATOR BREAK
 
 ## Memory Test
 
-Select `7 MEMORY TEST` from the main menu to send a checked ASCII printer-style stream through the buffer and compare the output byte for byte.
+Select `5 MEMORY TEST` from the main menu to send a checked ASCII printer-style stream through the buffer and compare the output byte for byte.
 
 The memory test is deliberately separate from scan discovery:
 
 - Fixed frame: `8E1`.
 - Flow control: `DSR/DTR`.
 - Input baud and output baud from `2 SET COM PORTS / BAUD`.
-- Append-only loop blocks and a final summary in the normal text report.
+- Loop blocks and a final summary in the normal text report for the current session.
 - Result fields separate exact stream return, returned-data integrity, capacity behavior, and RAM suspicion.
 - In `FILL` mode, dropped excess bytes can be a useful clean-full result rather than a generic problem.
 - If the fixed `8E1` memory frame does not match the buffer output frame, ASCII output may contain high-bit/framing-looking bytes. The report treats that as `CHECK SERIAL FRAME` and does not judge RAM from that run.
@@ -225,12 +225,12 @@ At the end, the tool prints:
 
 It also writes:
 
-- One append-only text report, `serial_probe_report.txt` by default.
-- One append-only debug log, `serial_probe_debug.log` by default.
+- One fixed text report, `serial_probe_report.txt`.
+- One fixed debug log, `serial_probe_debug.log`.
 
-The report paths are configured from the menu.
+The report paths are not menu-configurable. The first report/log write in a program session overwrites the previous session's file, then additional blocks in the same open session are added to that current-session file.
 
-Each scan appends a compact run block with the switch/jumper note, selected workflow, phase summary, top results, validation results when run, and interpretation notes.
+Each scan writes a compact run block with the switch/jumper note, selected workflow, phase summary, top results, validation results when run, and interpretation notes.
 
 ## Safety Notes
 

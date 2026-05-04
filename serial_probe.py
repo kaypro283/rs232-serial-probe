@@ -4,7 +4,7 @@
 The script assumes a device under test sits between the transmit and receive
 ports. It opens both PC serial ports with matching candidate settings, sends
 deterministic probe payloads into the buffer input, scores what is received
-from the buffer output, and appends a compact text report for each run.
+from the buffer output, and writes a compact text report for the session.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ import textwrap
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Sequence, TextIO
 
 BAUD_RATES: list[int] = [
     300,
@@ -129,6 +129,8 @@ PROGRESS_TIMESTAMP_WIDTH = len("00:00:00 ")
 PROGRESS_WIDTH = TERMINAL_COLUMNS - PROGRESS_TIMESTAMP_WIDTH
 PAGE_BODY_LINES = 22
 HELP_BODY_LINES = 20
+SESSION_TEXT_REPORT_PATHS: set[Path] = set()
+SESSION_LOG_FILE_PATHS: set[Path] = set()
 RECOMMENDATION_MIN_SCORE = 90.0
 TOP_MATCH_MIN_SCORE = 99.0
 TIE_SCORE_TOLERANCE = 0.5
@@ -625,7 +627,7 @@ class Bank2EtxAckProbeResult:
 
 @dataclass(frozen=True)
 class Bank2CharacterizationResult:
-    """Append-only result block for one known-baud device/switch state."""
+    """Report result block for one known-baud device/switch state."""
 
     switch_note: str
     known_baud_text: str
@@ -2834,15 +2836,41 @@ def result_sort_key(result: CandidateResult) -> tuple[float, float, float, int]:
     )
 
 
+def session_file_key(path: Path) -> Path:
+    """Return a stable key for tracking files initialized this program session."""
+    return path.expanduser().resolve(strict=False)
+
+
+def session_file_mode(path: Path, initialized_paths: set[Path]) -> str:
+    """Return write mode that truncates only on first use this program session."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key = session_file_key(path)
+    if key in initialized_paths:
+        return "a"
+    initialized_paths.add(key)
+    return "w"
+
+
+def open_session_text_report(path: Path) -> TextIO:
+    """Open a text report block, replacing prior sessions on first write."""
+    return path.open(
+        session_file_mode(path, SESSION_TEXT_REPORT_PATHS),
+        encoding="utf-8",
+    )
+
+
 def setup_logging(log_file: Path) -> logging.Logger:
     """Configure file logging and return the scan logger."""
-    log_file.parent.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("serial_probe")
     logger.setLevel(logging.DEBUG)
     for existing_handler in list(logger.handlers):
         logger.removeHandler(existing_handler)
         existing_handler.close()
-    handler = logging.FileHandler(log_file, encoding="utf-8")
+    handler = logging.FileHandler(
+        log_file,
+        mode=session_file_mode(log_file, SESSION_LOG_FILE_PATHS),
+        encoding="utf-8",
+    )
     handler.setLevel(logging.DEBUG)
     handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)s %(message)s")
@@ -3196,7 +3224,7 @@ def flow_control_name(flow_control: str) -> str:
 
 
 def default_report_paths() -> tuple[Path, Path]:
-    """Return append-only text report and debug log paths."""
+    """Return fixed text report and debug log paths."""
     return Path("serial_probe_report.txt"), Path("serial_probe_debug.log")
 
 
@@ -4282,7 +4310,7 @@ def write_dual_bank_text_report(
     results: Sequence[CandidateResult],
     validation_results: Sequence[CandidateResult] | None = None,
 ) -> None:
-    """Append a compact dual-bank scan report entry."""
+    """Write a compact dual-bank scan report entry."""
     path.parent.mkdir(parents=True, exist_ok=True)
     validation_results = [] if validation_results is None else list(validation_results)
     created = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -4296,7 +4324,7 @@ def write_dual_bank_text_report(
         border_line(REPORT_WIDTH),
         bordered_text("SERIAL PROBE DUAL-BANK REPORT", REPORT_WIDTH),
         border_line(REPORT_WIDTH),
-        f"APPENDED:        {created}",
+        f"WRITTEN:         {created}",
         f"STARTED UTC:     {metadata.get('started_at', '')}",
         f"RUN ID:          {metadata.get('run_id', '')}",
         f"COM PATH:        {metadata.get('in_port')} -> BUFFER -> {metadata.get('out_port')}",
@@ -4356,7 +4384,7 @@ def write_dual_bank_text_report(
             border_line(REPORT_WIDTH),
         ]
     )
-    with path.open("a", encoding="utf-8") as report_file:
+    with open_session_text_report(path) as report_file:
         report_file.write("\n".join(lines) + "\n")
 
 
@@ -4378,7 +4406,7 @@ def validate_supported_baud(baud: int) -> None:
 
 
 def validate_report_path(path: Path) -> None:
-    """Raise if a report/log path cannot be used as an append target."""
+    """Raise if a report/log path cannot be used as a write target."""
     text = str(path).strip()
     if not text:
         raise ValueError("PATH CANNOT BE BLANK")
@@ -4467,28 +4495,6 @@ def prompt_float(label: str, current: float, minimum: float | None = None) -> fl
             print(f"ENTER A VALUE >= {minimum}.")
             continue
         return parsed
-    return current
-
-
-def prompt_path(label: str, current: Path) -> Path:
-    """Prompt for a filesystem path, preserving current on blank input."""
-    try:
-        value = read_operator_input(f"{label.upper()} [{current}]: ").strip()
-    except EOFError:
-        return current
-    return current if value == "" else Path(value)
-
-
-def prompt_report_path(label: str, current: Path) -> Path:
-    """Prompt for an appendable report/log path."""
-    while prompt_loop_active():
-        path = prompt_path(label, current)
-        try:
-            validate_report_path(path)
-        except ValueError as exc:
-            print(f"PATH ERROR: {exc}")
-            continue
-        return path
     return current
 
 
@@ -5081,11 +5087,9 @@ def print_menu_help(paged: bool = True) -> None:
             "  3 SCAN/VALIDATE:   MESSAGE SIZE, COUNT, VALIDATION SCOPE.",
             f"  BAUDS:             {supported_baud_label()}.",
             "  4 TIMING/STALE:    PER-TEST READ WAITS AND QUICK OLD-OUTPUT CLEARING.",
-            "  5 REPORT FILES:    TEXT REPORT AND DEBUG LOG PATHS.",
-            "  6 RESET REPORTS:   RESTORE DEFAULT REPORT FILE NAMES.",
-            "  7 MEMORY TEST:     SELECT 16K..64K ASCII STREAM, 8E1, DSR/DTR.",
-            "  8 CURRENT SETTINGS: SHOW ACTIVE SETUP.",
-            "  9 HELP:            THIS SCREEN.",
+            "  5 MEMORY TEST:     SELECT 16K..64K ASCII STREAM, 8E1, DSR/DTR.",
+            "  6 CURRENT SETTINGS: SHOW ACTIVE SETUP.",
+            "  7 HELP:            THIS SCREEN.",
             "  0 QUIT:            END PROGRAM.",
             "",
             "START SCAN WORKFLOW",
@@ -5105,7 +5109,8 @@ def print_menu_help(paged: bool = True) -> None:
             "  START 1 SETUP:     OPTION 3 ITEMS 1-6 CAN AFFECT DISCOVERY.",
             "  START 2 SETUP:     OPTION 3 ITEMS 1, 6, AND 7 CAN AFFECT KNOWN-BAUD.",
             "  START 3 SETUP:     OPTION 3 DOES NOT AFFECT PHASE 0 ONLY.",
-            "  MEMORY TEST:       MAIN MENU 7; FIXED 8E1, DSR/DTR, ASCII CHECK.",
+            "  MEMORY TEST:       MAIN MENU 5; FIXED 8E1, DSR/DTR, ASCII CHECK.",
+            "  REPORT FILES:      FIXED TXT REPORT AND DEBUG LOG; NEW SESSION OVERWRITES.",
             "  STALE DATA:        QUICK PER-TEST CLEARING REJECTS OLD OUTPUT.",
             "  KNOWN-BAUD PURGE:  KNOWN-BAUD, MEMORY, AND VALIDATION USE LONG ESTIMATES.",
             "  NONCES:            EACH TEST PAYLOAD HAS RUN/CANDIDATE/TRIAL IDS.",
@@ -5162,7 +5167,7 @@ def print_configuration(options: ScanOptions) -> None:
         setting_lines(
             "MEMORY TEST:",
             (
-                "MAIN MENU 7; USES OPTION 2 PORTS AND BAUDS; "
+                "MAIN MENU 5; USES OPTION 2 PORTS AND BAUDS; "
                 "SELECT 16K..64K ASCII; FIXED 8E1 FLOW=DSR/DTR"
             ),
         )
@@ -5559,21 +5564,6 @@ def configure_timing(options: ScanOptions) -> ScanOptions:
             progress_interval=progress_interval,
         )
     return options
-
-
-def configure_reports(options: ScanOptions) -> ScanOptions:
-    """Prompt for result and report settings."""
-    top = prompt_int("NUMBER OF TOP ROWS TO SHOW", options.top, 1)
-    text_report = prompt_report_path("APPEND TEXT REPORT FILE", options.text_report)
-    switch_note = prompt_text("DEFAULT DEVICE/SWITCH NOTE", options.switch_note)
-    log_file = prompt_report_path("LOG FILE", options.log_file)
-    return dataclasses.replace(
-        options,
-        top=top,
-        text_report=text_report,
-        switch_note=switch_note,
-        log_file=log_file,
-    )
 
 
 def write_payload_only(
@@ -8021,7 +8011,7 @@ def write_bank2_text_report(
     path: Path,
     result: Bank2CharacterizationResult,
 ) -> None:
-    """Append a concise known-baud device-test block."""
+    """Write a concise known-baud device-test block."""
     path.parent.mkdir(parents=True, exist_ok=True)
     created = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     ascii_summary = bank2_ascii_pass_summary(result.ascii_results)
@@ -8042,7 +8032,7 @@ def write_bank2_text_report(
         border_line(REPORT_WIDTH),
         bordered_text("KNOWN-BAUD DEVICE TEST", REPORT_WIDTH),
         border_line(REPORT_WIDTH),
-        *bank2_value_lines("APPENDED:", created, indent=""),
+        *bank2_value_lines("WRITTEN:", created, indent=""),
         *bank2_value_lines("RUN ID:", result.run_id, indent=""),
         *bank2_value_lines(
             "DEVICE NOTE:",
@@ -8110,10 +8100,10 @@ def write_bank2_text_report(
         "  FLOW IS PROVEN ONLY WHEN THE HOLD/RELEASE VALIDATION CHANGES BEHAVIOR.",
         "  BEHAVIOR PROBES OBSERVE BYTES ONLY; THEY DO NOT ASSIGN DEVICE MEANING.",
         "  STALE WARNING MEANS ONE ROW HAD WRONG-RUN DATA; IT IS NOT DEVICE MEANING.",
-        "  COMPARE THIS APPENDED BLOCK TO OTHER DEVICE-NOTE BLOCKS MANUALLY.",
+        "  COMPARE THIS REPORT BLOCK TO OTHER DEVICE-NOTE BLOCKS MANUALLY.",
         border_line(REPORT_WIDTH),
     ]
-    with path.open("a", encoding="utf-8") as report_file:
+    with open_session_text_report(path) as report_file:
         report_file.write("\n".join(lines) + "\n")
 
 
@@ -8169,7 +8159,7 @@ def print_bank2_report(
     print_bank2_value("CONCLUSION:", result.conclusion)
     print_bank2_value("VERDICT:", bank2_setup_verdict(result))
     print_bank2_value("NEXT:", bank2_next_action(result))
-    print_bank2_value("TEXT REPORT:", f"{report_path} (APPENDED)")
+    print_bank2_value("TEXT REPORT:", f"{report_path} (CURRENT SESSION)")
     print(border_line(REPORT_WIDTH))
 
 
@@ -8761,7 +8751,7 @@ def memory_test_diagnosis(result: MemoryTestResult) -> MemoryTestDiagnosis:
 
 
 def write_memory_test_text_report(path: Path, result: MemoryTestResult) -> None:
-    """Append one memory-test block to the text report."""
+    """Write one memory-test block to the text report."""
     candidate = result.candidate
     payload = result.payload
     metrics = candidate.metrics
@@ -8827,7 +8817,7 @@ def write_memory_test_text_report(path: Path, result: MemoryTestResult) -> None:
             ]
         )
     lines.append(border_line(REPORT_WIDTH))
-    with path.open("a", encoding="utf-8") as report_file:
+    with open_session_text_report(path) as report_file:
         report_file.write("\n".join(lines) + "\n")
 
 
@@ -8873,7 +8863,7 @@ def print_memory_test_report(result: MemoryTestResult, report_path: Path) -> Non
     print(f"  PURGE:      {result.purge.bytes_drained} BYTES, {result.purge.reason.upper()}")
     print(f"  ELAPSED:    {format_duration(result.elapsed_sec)}")
     print_wrapped_value("  FIX:        ", diagnosis.operator_note)
-    print_wrapped_value("  REPORT:     ", f"{report_path} (APPENDED)")
+    print_wrapped_value("  REPORT:     ", f"{report_path} (CURRENT SESSION)")
     print(border_line(REPORT_WIDTH))
 
 
@@ -9026,7 +9016,7 @@ def write_memory_test_summary_report(
     total_elapsed: float,
     stopped_on_unexpected: bool,
 ) -> None:
-    """Append the compact memory-test loop summary to the text report."""
+    """Write the compact memory-test loop summary to the text report."""
     counts = memory_test_summary_counts(results)
     mode_label = memory_test_mode_label(config.mode, config.target_bytes)
     final_status = memory_test_summary_status(config, results, stopped_on_unexpected)
@@ -9058,7 +9048,7 @@ def write_memory_test_summary_report(
     lines.extend(wrapped_value_lines("VERDICT:         ", verdict, REPORT_WIDTH))
     lines.extend(wrapped_value_lines("NEXT:            ", next_step, REPORT_WIDTH))
     lines.append(border_line(REPORT_WIDTH))
-    with path.open("a", encoding="utf-8") as report_file:
+    with open_session_text_report(path) as report_file:
         report_file.write("\n".join(lines) + "\n")
 
 
@@ -9088,7 +9078,7 @@ def print_memory_test_summary(
     print(f"  TOTAL:      {format_duration(total_elapsed)}")
     print_wrapped_value("  VERDICT:   ", verdict)
     print_wrapped_value("  NEXT:      ", next_step)
-    print_wrapped_value("  REPORT:     ", f"{report_path} (APPENDED)")
+    print_wrapped_value("  REPORT:     ", f"{report_path} (CURRENT SESSION)")
     print(border_line(REPORT_WIDTH))
 
 
@@ -9288,9 +9278,8 @@ def print_commands() -> None:
     print(border_line(SCREEN_WIDTH))
     menu_line("  1  START SCAN", "  2  SET COM PORTS / BAUD")
     menu_line("  3  SCAN / VALIDATE SETUP", "  4  TIMING / PER-TEST STALE")
-    menu_line("  5  SET REPORT FILES", "  6  RESET REPORT FILES")
-    menu_line("  7  MEMORY TEST", "  8  CURRENT SETTINGS")
-    menu_line("  9  HELP", "  0  QUIT")
+    menu_line("  5  MEMORY TEST", "  6  CURRENT SETTINGS")
+    menu_line("  7  HELP", "  0  QUIT")
     print(border_line(SCREEN_WIDTH))
 
 
@@ -9301,7 +9290,7 @@ def interactive_menu(options: ScanOptions | None = None) -> MenuSelection | None
     while prompt_loop_active():
         print_commands()
         try:
-            choice = read_operator_input("COMMAND (0-9): ").lstrip("\ufeff").strip()
+            choice = read_operator_input("COMMAND (0-7): ").lstrip("\ufeff").strip()
         except EOFError:
             return None
 
@@ -9332,29 +9321,20 @@ def interactive_menu(options: ScanOptions | None = None) -> MenuSelection | None
         elif choice == "4":
             options = configure_timing(options)
         elif choice == "5":
-            options = configure_reports(options)
-        elif choice == "6":
-            default_text_report, default_log = default_report_paths()
-            options = dataclasses.replace(
-                options,
-                text_report=default_text_report,
-                log_file=default_log,
-            )
-        elif choice == "7":
             try:
                 validate_options(options)
             except ValueError as exc:
                 print(f"SETTINGS ERROR: {exc}")
                 continue
             return MenuSelection("memory", options)
-        elif choice == "8":
+        elif choice == "6":
             print_configuration(options)
-        elif choice == "9":
+        elif choice == "7":
             print_menu_help()
         elif choice == "0":
             return None
         else:
-            print("ENTER A NUMBER FROM 0 THROUGH 9.")
+            print("ENTER A NUMBER FROM 0 THROUGH 7.")
     return None
 
 
@@ -9599,7 +9579,7 @@ def run_dual_bank_scan(
     else:
         print("VALIDATION: OFF.")
     print_progress_legend()
-    print_wrapped_value("REPORT: ", f"{options.text_report} (APPEND)")
+    print_wrapped_value("REPORT: ", f"{options.text_report} (CURRENT SESSION)")
     print_wrapped_value("DEBUG LOG: ", options.log_file)
     staged_rough_total = 0.0
     staged_estimate_candidates = list(staged_preview_candidates)
@@ -9903,7 +9883,7 @@ def run_dual_bank_scan(
     )
     print()
     print_report_title("REPORT FILES")
-    print_wrapped_value("  TEXT REPORT: ", f"{options.text_report} (APPENDED)")
+    print_wrapped_value("  TEXT REPORT: ", f"{options.text_report} (CURRENT SESSION)")
     print_wrapped_value("  DEBUG LOG:   ", options.log_file)
     print(border_line(REPORT_WIDTH))
     if operator_break_action == "menu":

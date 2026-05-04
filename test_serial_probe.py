@@ -138,10 +138,12 @@ def test_main_menu_uses_numbered_options_only(
 
     output = capsys.readouterr().out
 
-    assert "  7  MEMORY TEST" in output
-    assert "  8  CURRENT SETTINGS" in output
-    assert "  9  HELP" in output
+    assert "  5  MEMORY TEST" in output
+    assert "  6  CURRENT SETTINGS" in output
+    assert "  7  HELP" in output
     assert "  0  QUIT" in output
+    assert "SET REPORT FILES" not in output
+    assert "RESET REPORT FILES" not in output
     assert "S  CURRENT SETTINGS" not in output
     assert "?  HELP" not in output
 
@@ -156,8 +158,52 @@ def test_main_menu_rejects_letter_shortcuts(
     output = capsys.readouterr().out
 
     assert selection is None
-    assert output.count("ENTER A NUMBER FROM 0 THROUGH 9.") == 2
+    assert output.count("ENTER A NUMBER FROM 0 THROUGH 7.") == 2
     assert "OPTION 2 PORTS" not in output
+
+
+def test_session_text_report_replaces_prior_session_then_appends(
+    tmp_path: Path,
+) -> None:
+    report_path = tmp_path / "serial_probe_report.txt"
+    report_path.write_text("OLD SESSION\n", encoding="utf-8")
+    original_paths = set(serial_probe.SESSION_TEXT_REPORT_PATHS)
+    serial_probe.SESSION_TEXT_REPORT_PATHS.clear()
+    try:
+        with serial_probe.open_session_text_report(report_path) as report_file:
+            report_file.write("FIRST BLOCK\n")
+        with serial_probe.open_session_text_report(report_path) as report_file:
+            report_file.write("SECOND BLOCK\n")
+    finally:
+        serial_probe.SESSION_TEXT_REPORT_PATHS.clear()
+        serial_probe.SESSION_TEXT_REPORT_PATHS.update(original_paths)
+
+    assert report_path.read_text(encoding="utf-8") == "FIRST BLOCK\nSECOND BLOCK\n"
+
+
+def test_session_log_replaces_prior_session_then_appends(tmp_path: Path) -> None:
+    log_path = tmp_path / "serial_probe_debug.log"
+    log_path.write_text("OLD SESSION\n", encoding="utf-8")
+    original_paths = set(serial_probe.SESSION_LOG_FILE_PATHS)
+    serial_probe.SESSION_LOG_FILE_PATHS.clear()
+    logger = logging.getLogger("serial_probe")
+    try:
+        logger = serial_probe.setup_logging(log_path)
+        logger.info("first block")
+        logger = serial_probe.setup_logging(log_path)
+        logger.info("second block")
+    finally:
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
+        serial_probe.SESSION_LOG_FILE_PATHS.clear()
+        serial_probe.SESSION_LOG_FILE_PATHS.update(original_paths)
+
+    output = log_path.read_text(encoding="utf-8")
+
+    assert "OLD SESSION" not in output
+    assert "first block" in output
+    assert "second block" in output
 
 
 def test_current_settings_show_option_2_ports_and_bauds(
