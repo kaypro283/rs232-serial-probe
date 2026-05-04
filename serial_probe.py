@@ -256,7 +256,7 @@ class DualSerialSettings:
 
     def label(self) -> str:
         """Return a compact human-readable dual-bank setting label."""
-        return f"IN {self.input_mode()} -> OUT {self.output_mode()}"
+        return f"IN {self.input_mode()} >> OUT {self.output_mode()}"
 
 
 @dataclass(frozen=True)
@@ -2882,7 +2882,7 @@ def frame_or_pair_label(settings: SerialSettings | DualSerialSettings) -> str:
     if isinstance(settings, DualSerialSettings):
         input_frame = frame_label(settings.input_settings)
         output_frame = frame_label(settings.output_settings)
-        return f"IN {input_frame} -> OUT {output_frame}"
+        return f"IN {input_frame} >> OUT {output_frame}"
     return frame_label(settings)
 
 
@@ -3182,8 +3182,8 @@ def default_scan_options() -> ScanOptions:
     return ScanOptions(
         in_port="COM1",
         out_port="COM5",
-        input_baud=1200,
-        output_baud=1200,
+        input_baud=38400,
+        output_baud=38400,
         min_baud=300,
         max_baud=38400,
         payload_bytes=DEFAULT_PAYLOAD_BYTES,
@@ -4047,7 +4047,7 @@ def write_phase0_text_report(
         f"COMPLETED UTC:   {metadata.get('completed_at', '')}",
         f"RUN ID:          {metadata.get('run_id', '')}",
         f"WORKFLOW:        {metadata.get('workflow', '')}",
-        f"COM PATH:        {metadata.get('in_port')} -> BUFFER -> {metadata.get('out_port')}",
+        f"COM PATH:        {metadata.get('in_port')} >> BUFFER >> {metadata.get('out_port')}",
         f"DEVICE NOTE:     {switch_note if switch_note else '(NOT ENTERED)'}",
     ]
     lines.extend(
@@ -4099,7 +4099,7 @@ def run_dual_phase0_baud_matrix(
     print_wrapped_value(
         "PORTS: ",
         (
-            f"IN {options.in_port} -> BUFFER -> OUT {options.out_port}; "
+            f"IN {options.in_port} >> BUFFER >> OUT {options.out_port}; "
             f"TEST={phase0_payload.byte_count} BYTES X {phase0_options.bursts}"
         ),
     )
@@ -4414,7 +4414,7 @@ def write_dual_bank_text_report(
         f"WRITTEN:         {created}",
         f"STARTED UTC:     {metadata.get('started_at', '')}",
         f"RUN ID:          {metadata.get('run_id', '')}",
-        f"COM PATH:        {metadata.get('in_port')} -> BUFFER -> {metadata.get('out_port')}",
+        f"COM PATH:        {metadata.get('in_port')} >> BUFFER >> {metadata.get('out_port')}",
         f"DEVICE NOTE:     {switch_note if switch_note else '(NOT ENTERED)'}",
         "SCAN MODEL:      INPUT/OUTPUT PAIR TESTED; SWITCH MEANING NOT ASSUMED",
         (
@@ -4731,7 +4731,7 @@ def print_menu_help(paged: bool = True) -> None:
             "  4 RETURN TO MAIN MENU.",
             "",
             "OPERATOR NOTES",
-            "  DEVICE PATH:       COM1 -> BUFFER INPUT -> BUFFER OUTPUT -> COM5.",
+            "  DEVICE PATH:       COM1 >> BUFFER INPUT >> BUFFER OUTPUT >> COM5.",
             "  PROGRAM SETTINGS:  PROGRAM SETS BAUD, FRAME, AND FLOW ON OPEN.",
             "  OPTION 2 BAUDS:    USED BY KNOWN-BAUD DEVICE TEST RUNS.",
             "  BAUD RANGE:        ASKED BY START SCAN 1 AND 3.",
@@ -4797,7 +4797,7 @@ def print_configuration(options: ScanOptions) -> None:
     lines.extend(
         setting_lines(
             "OPTION 2 PORTS:",
-            f"{options.in_port} INPUT -> {options.out_port} OUTPUT",
+            f"{options.in_port} INPUT >> {options.out_port} OUTPUT",
         )
     )
     lines.extend(
@@ -5472,7 +5472,7 @@ def flow_control_setting_label(settings: SerialSettings | DualSerialSettings) ->
     """Return a report label for one same-frame or dual flow setting."""
     if isinstance(settings, DualSerialSettings):
         return (
-            f"IN {flow_control_name(settings.input_settings.flow_control)} -> "
+            f"IN {flow_control_name(settings.input_settings.flow_control)} >> "
             f"OUT {flow_control_name(settings.output_settings.flow_control)}"
         )
     return flow_control_name(settings.flow_control)
@@ -7824,7 +7824,7 @@ def format_bank2_behavior_progress(
     total: int,
 ) -> str:
     """Return one compact console line for a raw behavior probe."""
-    frame_text = frame_or_pair_label(result.settings).replace(" -> ", "->")[:17]
+    frame_text = frame_or_pair_label(result.settings).replace(" >> ", ">>")[:17]
     flags = []
     if result.exact_match:
         flags.append("EXACT")
@@ -8455,7 +8455,7 @@ def bank2_next_action(result: Bank2CharacterizationResult) -> str:
     if not pass_frames:
         return (
             "DO NOT USE A FALLBACK FRAME AS THE SETTING. CHECK OPTION 2 BAUDS, "
-            "COM1->BUFFER INPUT AND BUFFER OUTPUT->COM5 CABLING, SWITCH STATE, "
+            "COM1>>BUFFER INPUT AND BUFFER OUTPUT>>COM5 CABLING, SWITCH STATE, "
             "AND CLEAR/RESET THE BUFFER; THEN RUN AUTOMATED DISCOVERY OR RETRY "
             "KNOWN-BAUD DEVICE TEST WITH DIFFERENT KNOWN BAUDS."
         )
@@ -8660,7 +8660,7 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
     print("USES OPTION 2 BAUDS TO TEST FRAME, BYTES, AND DEVICE BEHAVIOR.")
     print_wrapped_value(
         "PORTS: ",
-        f"{options.in_port} -> BUFFER -> {options.out_port}",
+        f"{options.in_port} >> BUFFER >> {options.out_port}",
     )
     print_wrapped_value(
         "SEQUENCE: ",
@@ -9247,7 +9247,7 @@ def run_dual_bank_scan(
     print_wrapped_value(
         "PORTS: ",
         (
-            f"{options.in_port} -> BUFFER -> {options.out_port}; "
+            f"{options.in_port} >> BUFFER >> {options.out_port}; "
             f"TEST={payload.byte_count} BYTES X {options.bursts}"
         ),
     )
@@ -9843,9 +9843,9 @@ def run_self_tests() -> int:
             for candidate_settings in dual_bank2
         )
 
-    assert has_dual_frame_pair("7E1", "8N1"), "missing mixed 7E1 -> 8N1 pair"
-    assert has_dual_frame_pair("8N1", "7O2"), "missing mixed 8N1 -> 7O2 pair"
-    assert has_dual_frame_pair("7M1", "8S2"), "missing mixed 7M1 -> 8S2 pair"
+    assert has_dual_frame_pair("7E1", "8N1"), "missing mixed 7E1 >> 8N1 pair"
+    assert has_dual_frame_pair("8N1", "7O2"), "missing mixed 8N1 >> 7O2 pair"
+    assert has_dual_frame_pair("7M1", "8S2"), "missing mixed 7M1 >> 8S2 pair"
 
     legacy_bank2 = bank2_frame_candidates(1200, 1200, independent_frames=False)
     assert len(legacy_bank2) == 20, "legacy same-frame known-baud list must be 20"
@@ -9873,7 +9873,7 @@ def run_self_tests() -> int:
         "dual receive estimate",
     )
     assert (
-        frame_or_pair_label(dual_settings) == "IN 8N1 -> OUT 7E2"
+        frame_or_pair_label(dual_settings) == "IN 8N1 >> OUT 7E2"
     ), "dual frame label did not include both sides"
 
     validate_port_name("COM1")

@@ -302,6 +302,15 @@ def test_session_log_replaces_prior_session_then_appends(tmp_path: Path) -> None
     assert "second block" in output
 
 
+def test_default_scan_options_use_com1_com5_at_38400() -> None:
+    options = serial_probe.default_scan_options()
+
+    assert options.in_port == "COM1"
+    assert options.input_baud == 38400
+    assert options.out_port == "COM5"
+    assert options.output_baud == 38400
+
+
 def test_current_settings_show_option_2_ports_and_bauds(
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -328,7 +337,7 @@ def test_current_settings_show_option_2_ports_and_bauds(
     output = "\n".join(captured_lines)
 
     assert "OPTION 2 PORTS:" in output
-    assert "COM2 INPUT -> COM6 OUTPUT" in output
+    assert "COM2 INPUT >> COM6 OUTPUT" in output
     assert "OPTION 2 BAUDS:" in output
     assert "INPUT 38400 / OUTPUT 9600" in output
     assert "SCAN BAUD RANGE:" in output
@@ -852,7 +861,7 @@ def test_known_baud_asymmetric_followup_uses_dual_flow_summary() -> None:
     assert "DUAL-FLOW TRANSFER" in flow_row.reason
     summary = serial_probe.flow_control_validation_recommendation([flow_row])
     assert "CLEAN DUAL FLOW TRANSFER" in summary
-    assert "IN DSR/DTR -> OUT NONE" in summary
+    assert "IN DSR/DTR >> OUT NONE" in summary
     assert all(
         len(line) <= serial_probe.REPORT_WIDTH
         for line in serial_probe.flow_validation_report_lines([flow_row])

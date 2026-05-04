@@ -6,7 +6,7 @@ The intended setup is:
 
 - Input side: `COM1`, where the tool transmits test data.
 - Output side: `COM5`, where the tool reads data from the buffer.
-- Physical path: `COM1 -> buffer input -> buffer output -> COM5`.
+- Physical path: `COM1 >> buffer input >> buffer output >> COM5`.
 - Switch-mapping assumption: set both buffer switch banks the same way for a scan.
 
 The program sets the COM port baud/data/parity/stop/flow options itself when it opens the ports. Device Manager defaults are not used as fixed test settings.
@@ -37,7 +37,7 @@ Suggested first run for this COM1-to-COM5 setup:
 python serial_probe.py
 ```
 
-Use the default settings or set ports and fixed bauds with `2 SET COM PORTS / BAUD`, then select `1 START SCAN`. Discovery and Phase 0 ask for the baud range inside that start-scan workflow.
+Use the default fixed settings (`COM1` input and `COM5` output at `38400` baud each) or set ports and fixed bauds with `2 SET COM PORTS / BAUD`, then select `1 START SCAN`. Discovery and Phase 0 ask for the baud range inside that start-scan workflow.
 
 After a scan finishes or is interrupted by the operator, the program stays in the terminal UI and asks whether to run the same settings again, return to the main menu, or quit.
 
