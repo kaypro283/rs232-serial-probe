@@ -25,7 +25,7 @@ Usage screen:
 python serial_probe.py --help
 ```
 
-The first screen is the command menu. Use `S CURRENT SETTINGS` to view ports, each port's configured baud, the last scan baud range, test message size, repeat count, timing, old-output clearing, Phase 0 liveness settings, report files, and available test workflows. `1 START SCAN` opens the discovery workflow menu. `7 MEMORY TEST` runs the fixed-frame memory test.
+The first screen is the command menu. Use `8 CURRENT SETTINGS` to view ports, each port's configured baud, the last scan baud range, test message size, repeat count, timing, old-output clearing, Phase 0 liveness settings, report files, and available test workflows. `1 START SCAN` opens the discovery workflow menu. `7 MEMORY TEST` runs the fixed-frame memory test.
 
 The terminal UI is written for an 80-column by 25-line early terminal style. Long operator screens pause with `PRESS ENTER FOR MORE, Q TO STOP:`. Screens use terse uppercase operator text and bright green text when the console supports ANSI color. PyCharm runs are treated as color-capable. Set `NO_COLOR=1` before running if you want plain console text.
 

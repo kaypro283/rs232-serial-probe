@@ -100,6 +100,68 @@ def test_import_pyserial_missing_reports_install_command_without_install(
     )
 
 
+def test_main_menu_uses_numbered_options_only(
+    capsys: CaptureFixture[str],
+) -> None:
+    serial_probe.print_commands()
+
+    output = capsys.readouterr().out
+
+    assert "  7  MEMORY TEST" in output
+    assert "  8  CURRENT SETTINGS" in output
+    assert "  9  HELP" in output
+    assert "  0  QUIT" in output
+    assert "S  CURRENT SETTINGS" not in output
+    assert "?  HELP" not in output
+
+
+def test_main_menu_rejects_letter_shortcuts(
+    monkeypatch: MonkeyPatch,
+    capsys: CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(builtins, "input", fake_input_from(["s", "?", "0"]))
+
+    selection = serial_probe.interactive_menu(serial_probe.default_scan_options())
+    output = capsys.readouterr().out
+
+    assert selection is None
+    assert output.count("ENTER A NUMBER FROM 0 THROUGH 9.") == 2
+    assert "OPTION 2 PORTS" not in output
+
+
+def test_current_settings_show_option_2_ports_and_bauds(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    captured_lines: list[str] = []
+
+    def capture_paged_lines(
+        lines: list[str],
+        page_lines: int = serial_probe.PAGE_BODY_LINES,
+        pause_at_end: bool = True,
+        return_label: str = "RETURN",
+    ) -> None:
+        captured_lines.extend(lines)
+
+    monkeypatch.setattr(serial_probe, "print_paged_lines", capture_paged_lines)
+    options = dataclasses.replace(
+        serial_probe.default_scan_options(),
+        in_port="COM2",
+        out_port="COM6",
+        input_baud=38400,
+        output_baud=9600,
+    )
+
+    serial_probe.print_configuration(options)
+    output = "\n".join(captured_lines)
+
+    assert "OPTION 2 PORTS:" in output
+    assert "COM2 INPUT -> COM6 OUTPUT" in output
+    assert "OPTION 2 BAUDS:" in output
+    assert "INPUT 38400 / OUTPUT 9600" in output
+    assert "SCAN BAUD RANGE:" in output
+    assert "ASKED IN START SCAN 1 OR 3" in output
+
+
 def test_configure_ports_updates_ports_and_bauds(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(
         builtins,

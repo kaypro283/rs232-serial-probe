@@ -4946,8 +4946,8 @@ def print_menu_help(paged: bool = True) -> None:
             "  5 REPORT FILES:    TEXT REPORT AND DEBUG LOG PATHS.",
             "  6 RESET REPORTS:   RESTORE DEFAULT REPORT FILE NAMES.",
             "  7 MEMORY TEST:     SELECT 16K..64K ASCII STREAM, 8E1, NO FLOW.",
-            "  S CURRENT SETTINGS: SHOW ACTIVE SETUP.",
-            "  ? HELP:            THIS SCREEN.",
+            "  8 CURRENT SETTINGS: SHOW ACTIVE SETUP.",
+            "  9 HELP:            THIS SCREEN.",
             "  0 QUIT:            END PROGRAM.",
             "",
             "START SCAN WORKFLOW",
@@ -5023,24 +5023,27 @@ def print_configuration(options: ScanOptions) -> None:
         setting_lines(
             "MEMORY TEST:",
             (
-                "MAIN MENU 7; USES OPTION 2 BAUDS; "
+                "MAIN MENU 7; USES OPTION 2 PORTS AND BAUDS; "
                 "SELECT 16K..64K ASCII; FIXED 8E1 FLOW=NONE"
             ),
         )
     )
     lines.extend(
         setting_lines(
-            "PORTS/BAUD:",
-            (
-                f"{options.in_port} @ {options.input_baud} -> "
-                f"{options.out_port} @ {options.output_baud}"
-            ),
+            "OPTION 2 PORTS:",
+            f"{options.in_port} INPUT -> {options.out_port} OUTPUT",
+        )
+    )
+    lines.extend(
+        setting_lines(
+            "OPTION 2 BAUDS:",
+            f"INPUT {options.input_baud} / OUTPUT {options.output_baud}",
         )
     )
     lines.extend(
         setting_lines(
             "SCAN BAUD RANGE:",
-            f"{options.min_baud}..{options.max_baud} (ASKED IN START SCAN)",
+            f"{options.min_baud}..{options.max_baud} (ASKED IN START SCAN 1 OR 3)",
         )
     )
     lines.extend(setting_lines("BAUDS:", len(bauds)))
@@ -5135,7 +5138,7 @@ def print_configuration(options: ScanOptions) -> None:
     lines.extend(
         setting_lines(
             "BANK 2 TEST:",
-            f"START SCAN 2; USES OPTION 2 BAUDS: {fixed_baud_text}",
+            f"START SCAN 2; USES OPTION 2 PORTS AND BAUDS: {fixed_baud_text}",
         )
     )
     lines.extend(setting_lines("REPORT FILE:", options.text_report))
@@ -8641,9 +8644,8 @@ def print_commands() -> None:
     menu_line("  1  START SCAN", "  2  SET COM PORTS / BAUD")
     menu_line("  3  SCAN / VALIDATE SETUP", "  4  TIMING / STALE DATA")
     menu_line("  5  SET REPORT FILES", "  6  RESET REPORT FILES")
-    menu_line("  7  MEMORY TEST")
-    menu_line("  S  CURRENT SETTINGS", "  ?  HELP")
-    menu_line("  0  QUIT")
+    menu_line("  7  MEMORY TEST", "  8  CURRENT SETTINGS")
+    menu_line("  9  HELP", "  0  QUIT")
     print(border_line(SCREEN_WIDTH))
 
 
@@ -8654,7 +8656,7 @@ def interactive_menu(options: ScanOptions | None = None) -> MenuSelection | None
     while prompt_loop_active():
         print_commands()
         try:
-            choice = read_operator_input("COMMAND (1-7,S,?,0): ").lstrip("\ufeff").strip().lower()
+            choice = read_operator_input("COMMAND (0-9): ").lstrip("\ufeff").strip()
         except EOFError:
             return None
 
@@ -8693,21 +8695,21 @@ def interactive_menu(options: ScanOptions | None = None) -> MenuSelection | None
                 text_report=default_text_report,
                 log_file=default_log,
             )
-        elif choice in {"7", "8"}:
+        elif choice == "7":
             try:
                 validate_options(options)
             except ValueError as exc:
                 print(f"SETTINGS ERROR: {exc}")
                 continue
             return MenuSelection("memory", options)
-        elif choice in {"s", "c", "settings", "current"}:
+        elif choice == "8":
             print_configuration(options)
-        elif choice in {"h", "help", "?"}:
+        elif choice == "9":
             print_menu_help()
-        elif choice in {"0", "q", "quit", "exit"}:
+        elif choice == "0":
             return None
         else:
-            print("ENTER 1-7, S, ?, OR 0.")
+            print("ENTER A NUMBER FROM 0 THROUGH 9.")
     return None
 
 
