@@ -44,7 +44,7 @@ STOP_BITS: list[int] = [1, 2]
 FLOW_CONTROLS: list[str] = ["none", "xon/xoff", "rts/cts", "dsr/dtr"]
 KIB_BYTES = 1024
 DEFAULT_BURSTS = 1
-DEFAULT_PAYLOAD_BYTES = 384
+DEFAULT_PAYLOAD_BYTES = 512
 DEFAULT_READ_TIMEOUT = 2.0
 DEFAULT_SETTLE_MS = 50
 DEFAULT_PROGRESS_INTERVAL = 1.0
@@ -62,6 +62,12 @@ FLOW_VALIDATE_PAYLOAD_BYTES = 1024
 FLOW_VALIDATE_READ_TIMEOUT = 2.0
 FLOW_VALIDATE_HOLD_SECONDS = 1.0
 FLOW_VALIDATE_RELEASE_SETTLE_SECONDS = 0.15
+INPUT_BACKPRESSURE_STRESS_ENABLED_DEFAULT = True
+INPUT_BACKPRESSURE_STRESS_BYTES = 128 * KIB_BYTES
+INPUT_BACKPRESSURE_FLOW_CONTROLS = ["xon/xoff", "rts/cts", "dsr/dtr"]
+INPUT_BACKPRESSURE_METHOD = "buffer-full"
+INPUT_BACKPRESSURE_MONITOR_SECONDS = 0.05
+INPUT_BACKPRESSURE_STALL_SECONDS = 1.5
 RECEIVE_DEADLINE_SAFETY_FACTOR = 2.0
 RECEIVE_DEADLINE_MARGIN_SECONDS = 2.0
 DEFAULT_BANK2_JOB_TIMEOUT_OBSERVE_SECONDS = 10.0
@@ -430,6 +436,8 @@ class ScanOptions:
     validate_size_1_bytes: int
     auto_validate_flow_control: bool
     flow_validate_size_bytes: int
+    auto_stress_input_backpressure: bool
+    input_backpressure_stress_bytes: int
     run_id: str = ""
 
 
@@ -1990,7 +1998,7 @@ def payload_for_trial(
     switch_hash: str | None,
 ) -> ProbePayload:
     """Return a nonce-bearing payload for the current candidate/trial."""
-    if template.nonce is not None or template.payload_mode == PAYLOAD_MODE_PHASE0:
+    if template.nonce is not None:
         return template
     nonce = ProbeNonce(
         run_id=sanitize_nonce_value(run_id or make_run_id()),
@@ -3197,6 +3205,8 @@ def default_scan_options() -> ScanOptions:
         validate_size_1_bytes=8 * 1024,
         auto_validate_flow_control=True,
         flow_validate_size_bytes=FLOW_VALIDATE_PAYLOAD_BYTES,
+        auto_stress_input_backpressure=INPUT_BACKPRESSURE_STRESS_ENABLED_DEFAULT,
+        input_backpressure_stress_bytes=INPUT_BACKPRESSURE_STRESS_BYTES,
     )
 
 
@@ -3238,6 +3248,10 @@ def validate_options(options: ScanOptions) -> None:
         raise ValueError(f"VALIDATE SIZE 1 MUST BE AT LEAST {minimum_payload_size()} BYTES")
     if options.flow_validate_size_bytes < minimum_payload_size():
         raise ValueError(f"FLOW VALIDATE SIZE MUST BE AT LEAST {minimum_payload_size()} BYTES")
+    if options.input_backpressure_stress_bytes < minimum_payload_size():
+        raise ValueError(
+            f"BUFFER-FULL STRESS SIZE MUST BE AT LEAST {minimum_payload_size()} BYTES"
+        )
     validate_report_path(options.text_report)
     validate_report_path(options.log_file)
     available_bauds(options.min_baud, options.max_baud)
@@ -3277,7 +3291,10 @@ def phase0_minimum_payload_size(nonce: ProbeNonce | None = None) -> int:
 
 def phase0_payload_bytes() -> int:
     """Return the fixed internal Phase 0 liveness payload size."""
-    return max(PHASE0_PAYLOAD_BYTES, phase0_minimum_payload_size())
+    return max(
+        PHASE0_PAYLOAD_BYTES,
+        phase0_minimum_payload_size(representative_nonce()),
+    )
 
 
 def generate_phase0_payload(
@@ -4721,8 +4738,8 @@ def print_menu_help(paged: bool = True) -> None:
             "  PHASE 0 SETTINGS:  FIXED 8E1 FLOW=NONE; OPTION 3 DOES NOT CHANGE IT.",
             "  BAUD PAIRS:        INPUT AND OUTPUT BAUDS MAY DIFFER.",
             "  NO PHASE 0 HIT:    SAME-BAUD FRAME FALLBACK OFFERED FOR NARROW RANGE.",
-            "  START 1 SETUP:     OPTION 3 ITEMS 1-6 CAN AFFECT DISCOVERY.",
-            "  START 2 SETUP:     OPTION 3 ITEMS 1, 6, AND 7 CAN AFFECT KNOWN-BAUD.",
+            "  START 1 SETUP:     OPTION 3 QUICK SCAN AND VERIFY ITEMS AFFECT DISCOVERY.",
+            "  START 2 SETUP:     OPTION 3 FLOW AND BUFFER-FULL ITEMS AFFECT KNOWN-BAUD.",
             "  START 3 SETUP:     OPTION 3 DOES NOT AFFECT PHASE 0 ONLY.",
             "  REPORT FILES:      FIXED TXT REPORT AND DEBUG LOG; NEW SESSION OVERWRITES.",
             "  STALE DATA:        QUICK PER-TEST CLEARING REJECTS OLD OUTPUT.",
@@ -4820,7 +4837,7 @@ def print_configuration(options: ScanOptions) -> None:
             f"{frame_pairs_per_live_pair} INPUT/OUTPUT FRAME PAIRS PER LIVE BAUD PAIR",
         )
     )
-    lines.extend(setting_lines("SCAN BYTES:", f"{options.payload_bytes} BYTES"))
+    lines.extend(setting_lines("QUICK SCAN MSG:", f"{options.payload_bytes} BYTES"))
     lines.extend(setting_lines("SCAN COUNT:", options.bursts))
     lines.extend(setting_lines("PHASE 0:", phase0_fixed_settings_label()))
     lines.extend(
@@ -4846,7 +4863,7 @@ def print_configuration(options: ScanOptions) -> None:
     )
     lines.extend(
         setting_lines(
-            "AUTO VALIDATE:",
+            "TOP-MATCH VERIFY:",
             (
                 "OFF"
                 if not options.auto_validate_top_matches
@@ -4856,13 +4873,19 @@ def print_configuration(options: ScanOptions) -> None:
     )
     lines.extend(
         setting_lines(
-            "FLOW TESTING:",
+            "FLOW TESTS:",
             (
                 "OFF"
                 if not options.auto_validate_flow_control
                 else (
-                    "ON, DISCOVERY FLOW MODES; "
-                    f"KNOWN-BAUD VALIDATE SIZE={options.flow_validate_size_bytes} BYTES"
+                    "ON; "
+                    f"TRANSFER={options.flow_validate_size_bytes} BYTES; "
+                    "BUFFER-FULL="
+                    + (
+                        f"{options.input_backpressure_stress_bytes} BYTES"
+                        if options.auto_stress_input_backpressure
+                        else "OFF"
+                    )
                 )
             ),
         )
@@ -4989,7 +5012,7 @@ def print_scan_validate_setup(options: ScanOptions) -> None:
     print(border_line(REPORT_WIDTH))
     setting_line(
         "1",
-        "DISCOVERY MESSAGE BYTES",
+        "QUICK SCAN MESSAGE BYTES",
         options.payload_bytes,
         (
             "START 1 DISCOVERY; START 2 KNOWN-BAUD ASCII; "
@@ -4998,39 +5021,51 @@ def print_scan_validate_setup(options: ScanOptions) -> None:
     )
     setting_line(
         "2",
-        "DISCOVERY COUNT PER SETTING",
+        "QUICK SCAN COUNT",
         options.bursts,
         "START 1 AUTOMATED DISCOVERY ONLY.",
     )
     setting_line(
         "3",
-        "DISCOVERY PAUSE ON TOP MATCH",
+        "PAUSE ON CLEAN MATCH",
         yes_no_text(options.ask_on_top_match),
         "START 1 AUTOMATED DISCOVERY ONLY.",
     )
     setting_line(
         "4",
-        "VALIDATE TOP MATCH",
+        "TOP-MATCH VERIFY",
         yes_no_text(options.auto_validate_top_matches),
         "START 1 AUTOMATED DISCOVERY AFTER SCAN.",
     )
     setting_line(
         "5",
-        "VALIDATE TOP MATCH BYTES",
+        "TOP-MATCH VERIFY BYTES",
         options.validate_size_1_bytes,
         "ONLY WHEN 4=YES; START 1 TOP-MATCH VALIDATION.",
     )
     setting_line(
         "6",
-        "FLOW-CONTROL TESTING",
+        "FLOW TESTS",
         yes_no_text(options.auto_validate_flow_control),
-        "START 1 FLOW SWEEP; START 2 KNOWN-BAUD FLOW VALIDATION ON/OFF.",
+        "START 1 FLOW SWEEP; START 2 FLOW TRANSFER AND BUFFER-FULL TESTS.",
     )
     setting_line(
         "7",
-        "KNOWN-BAUD FLOW TEST BYTES",
+        "FLOW TRANSFER BYTES",
         options.flow_validate_size_bytes,
-        "ONLY WHEN 6=YES; START 2 KNOWN-BAUD FLOW VALIDATION ONLY.",
+        "ONLY WHEN 6=YES; START 2 SHORT FLOW TRANSFER MATRIX.",
+    )
+    setting_line(
+        "8",
+        "BUFFER-FULL STRESS",
+        yes_no_text(options.auto_stress_input_backpressure),
+        "ONLY WHEN 6=YES; START 2 INPUT-SIDE BUFFER-FULL HANDSHAKE.",
+    )
+    setting_line(
+        "9",
+        "BUFFER-FULL BYTES",
+        options.input_backpressure_stress_bytes,
+        "ONLY WHEN 6=YES AND 8=YES; USE MORE THAN BUFFER CAPACITY.",
     )
     print("  0 RETURN TO MAIN MENU")
     print(border_line(REPORT_WIDTH))
@@ -5041,7 +5076,7 @@ def configure_payload(options: ScanOptions) -> ScanOptions:
     while prompt_loop_active():
         print_scan_validate_setup(options)
         try:
-            choice = read_operator_input("ENTER SELECTION (1-7,0): ").lstrip("\ufeff").strip().lower()
+            choice = read_operator_input("ENTER SELECTION (1-9,0): ").lstrip("\ufeff").strip().lower()
         except EOFError:
             return options
         if choice in {"0", "m", "menu", "main", "return"}:
@@ -5050,7 +5085,7 @@ def configure_payload(options: ScanOptions) -> ScanOptions:
             options = dataclasses.replace(
                 options,
                 payload_bytes=prompt_int(
-                    "DISCOVERY MESSAGE BYTES",
+                    "QUICK SCAN MESSAGE BYTES",
                     options.payload_bytes,
                     minimum=minimum_payload_size(),
                 ),
@@ -5059,7 +5094,7 @@ def configure_payload(options: ScanOptions) -> ScanOptions:
             options = dataclasses.replace(
                 options,
                 bursts=prompt_int(
-                    "DISCOVERY COUNT PER SETTING",
+                    "QUICK SCAN COUNT",
                     options.bursts,
                     minimum=1,
                 ),
@@ -5068,7 +5103,7 @@ def configure_payload(options: ScanOptions) -> ScanOptions:
             options = dataclasses.replace(
                 options,
                 ask_on_top_match=prompt_yes_no(
-                    "DISCOVERY PAUSE ON TOP MATCH",
+                    "PAUSE ON CLEAN MATCH",
                     options.ask_on_top_match,
                 ),
             )
@@ -5076,7 +5111,7 @@ def configure_payload(options: ScanOptions) -> ScanOptions:
             options = dataclasses.replace(
                 options,
                 auto_validate_top_matches=prompt_yes_no(
-                    "VALIDATE TOP MATCH",
+                    "TOP-MATCH VERIFY",
                     options.auto_validate_top_matches,
                 ),
             )
@@ -5084,7 +5119,7 @@ def configure_payload(options: ScanOptions) -> ScanOptions:
             options = dataclasses.replace(
                 options,
                 validate_size_1_bytes=prompt_int(
-                    "VALIDATE TOP MATCH BYTES",
+                    "TOP-MATCH VERIFY BYTES",
                     options.validate_size_1_bytes,
                     minimum=minimum_payload_size(),
                 ),
@@ -5093,7 +5128,7 @@ def configure_payload(options: ScanOptions) -> ScanOptions:
             options = dataclasses.replace(
                 options,
                 auto_validate_flow_control=prompt_yes_no(
-                    "FLOW-CONTROL TESTING",
+                    "FLOW TESTS",
                     options.auto_validate_flow_control,
                 ),
             )
@@ -5101,13 +5136,30 @@ def configure_payload(options: ScanOptions) -> ScanOptions:
             options = dataclasses.replace(
                 options,
                 flow_validate_size_bytes=prompt_int(
-                    "KNOWN-BAUD FLOW TEST BYTES",
+                    "FLOW TRANSFER BYTES",
                     options.flow_validate_size_bytes,
                     minimum=minimum_payload_size(),
                 ),
             )
+        elif choice == "8":
+            options = dataclasses.replace(
+                options,
+                auto_stress_input_backpressure=prompt_yes_no(
+                    "BUFFER-FULL STRESS",
+                    options.auto_stress_input_backpressure,
+                ),
+            )
+        elif choice == "9":
+            options = dataclasses.replace(
+                options,
+                input_backpressure_stress_bytes=prompt_int(
+                    "BUFFER-FULL BYTES",
+                    options.input_backpressure_stress_bytes,
+                    minimum=minimum_payload_size(),
+                ),
+            )
         else:
-            print("ENTER 1-7 OR 0.")
+            print("ENTER 1-9 OR 0.")
     return options
 
 
@@ -5380,10 +5432,18 @@ def flow_validation_indicator(status: str, score: float, error: str | None) -> s
     """Return a compact indicator for a flow-control validation status."""
     if error or status == "error":
         return "ERROR"
-    if status == "validated":
+    if status in {"validated", "backpressure-proven"}:
         return "PASS"
-    if status in {"transfer-good", "paused-partial-transfer"}:
+    if status in {
+        "transfer-good",
+        "paused-partial-transfer",
+        "backpressure-partial",
+    }:
         return "GOOD"
+    if status in {"stress-skipped", "stress-invalid"}:
+        return "SKIP"
+    if status == "no-backpressure":
+        return "FAIL"
     if status == "transfer-partial":
         return "PARTIAL"
     if status == "no-pause":
@@ -5930,6 +5990,28 @@ def flow_control_validation_recommendation(
     if len(proven_handshake) > 1:
         flows = ", ".join(flow_control_name(result.flow_control) for result in proven_handshake)
         return f"MULTIPLE HANDSHAKES VALIDATED: {flows}."
+    stress_results = [
+        result for result in results if result.method == INPUT_BACKPRESSURE_METHOD
+    ]
+    proven_backpressure = [
+        result for result in stress_results if result.status == "backpressure-proven"
+    ]
+    if len(proven_backpressure) == 1:
+        return (
+            "INPUT BACKPRESSURE PROVEN: "
+            f"{flow_control_name(proven_backpressure[0].flow_control)}."
+        )
+    if len(proven_backpressure) > 1:
+        flows = ", ".join(
+            flow_control_name(result.flow_control) for result in proven_backpressure
+        )
+        return f"MULTIPLE INPUT BACKPRESSURE MODES: {flows}."
+    if stress_results and all(result.status == "stress-skipped" for result in stress_results):
+        return "INPUT BACKPRESSURE STRESS SKIPPED."
+    if stress_results and any(result.status == "no-backpressure" for result in stress_results):
+        return "INPUT BACKPRESSURE NOT OBSERVED."
+    if stress_results:
+        return "INPUT BACKPRESSURE NOT PROVEN."
     if any(result.flow_control == "none" for result in proven):
         return "CLEAN TRANSFER WITHOUT HANDSHAKE; NO HANDSHAKE MODE PROVEN."
     clean_dual = [
@@ -6002,6 +6084,11 @@ def flow_validation_note_lines(
     results: Sequence[FlowControlValidationResult],
 ) -> list[str]:
     """Return explanatory report notes for the flow-validation method used."""
+    if results and all(result.method == INPUT_BACKPRESSURE_METHOD for result in results):
+        return [
+            "NOTE: BUFFER-FULL STRESS HOLDS OUTPUT SO THE INPUT BUFFER CAN FILL.",
+            "NOTE: PASS REQUIRES INPUT THROTTLE AND CLEAN DRAIN AFTER RELEASE.",
+        ]
     if any(result.method == "dual-transfer" for result in results):
         return [
             "NOTE: DUAL-FLOW SWEEP PROVES TRANSFER COMPATIBILITY ONLY.",
@@ -6262,6 +6349,614 @@ def run_dual_flow_control_validation(
     return flow_results, None
 
 
+def flow_pause_holds_output(result: FlowControlValidationResult) -> bool:
+    """Return True when a hold/release row is good enough to fill the buffer."""
+    if result.method not in {"xoff-xon-pause", "rts-hold-release", "dtr-hold-release"}:
+        return False
+    if result.error or result.status in {
+        "error",
+        "no-pause",
+        "no-data",
+        "partial-write",
+        "stale-output",
+    }:
+        return False
+    if result.bytes_sent <= 0 or result.bytes_received <= 0:
+        return False
+    return result.bytes_seen_while_held <= flow_control_hold_byte_limit(
+        max(result.bytes_sent, 1)
+    )
+
+
+def select_backpressure_output_hold(
+    hold_results: Sequence[FlowControlValidationResult],
+) -> FlowControlValidationResult | None:
+    """Return the best proven output hold mode for buffer-fill stress."""
+    candidates = [result for result in hold_results if flow_pause_holds_output(result)]
+    if not candidates:
+        return None
+    flow_rank = {"xon/xoff": 0, "rts/cts": 1, "dsr/dtr": 2}
+    return sorted(
+        candidates,
+        key=lambda result: (
+            0 if result.status == "validated" else 1,
+            result.bytes_seen_while_held,
+            flow_rank.get(result.flow_control, 9),
+        ),
+    )[0]
+
+
+def input_backpressure_settings_for_target(
+    target: CandidateResult,
+) -> DualSerialSettings | None:
+    """Return concrete input/output frame settings for input stress."""
+    if isinstance(target.settings, DualSerialSettings):
+        return DualSerialSettings(
+            dataclasses.replace(target.settings.input_settings, flow_control="none"),
+            dataclasses.replace(target.settings.output_settings, flow_control="none"),
+        )
+    if isinstance(target.settings, SerialSettings):
+        frame = dataclasses.replace(target.settings, flow_control="none")
+        return DualSerialSettings(frame, frame)
+    return None
+
+
+def input_backpressure_skip_result(
+    settings: SerialSettings | DualSerialSettings,
+    reason: str,
+) -> FlowControlValidationResult:
+    """Return a report row for an input stress test that could not run."""
+    empty_score = score_received(b"", b"")
+    return FlowControlValidationResult(
+        flow_control="stress",
+        method=INPUT_BACKPRESSURE_METHOD,
+        settings=settings,
+        bytes_sent=0,
+        bytes_received=0,
+        bytes_seen_while_held=0,
+        score=0.0,
+        indicator="SKIP",
+        status="stress-skipped",
+        reason=reason,
+        error=None,
+        elapsed_sec=0.0,
+        metrics=empty_score.metrics,
+    )
+
+
+def release_input_backpressure_hold(
+    out_serial: Any,
+    output_hold_flow: str,
+    hold_released: threading.Event,
+) -> None:
+    """Release the output hold once input backpressure has been observed."""
+    if hold_released.is_set():
+        return
+    release_flow_control_hold(out_serial, output_hold_flow)
+    hold_released.set()
+
+
+def input_backpressure_release_reason(
+    input_flow: str,
+    before_snapshot: dict[str, bool],
+    line_snapshot: dict[str, bool],
+    stalled: bool,
+) -> str | None:
+    """Return the backpressure reason visible at the input adapter."""
+    if (
+        input_flow == "rts/cts"
+        and before_snapshot.get("cts", True)
+        and not line_snapshot.get("cts", True)
+    ):
+        return "CTS DROPPED"
+    if (
+        input_flow == "dsr/dtr"
+        and before_snapshot.get("dsr", True)
+        and not line_snapshot.get("dsr", True)
+    ):
+        return "DSR DROPPED"
+    if stalled:
+        return "WRITE STALLED"
+    return None
+
+
+def run_input_backpressure_stress(
+    serial_module: Any,
+    index: int,
+    total: int,
+    frame: DualSerialSettings,
+    input_flow: str,
+    output_hold_flow: str,
+    options: ScanOptions,
+    payload: ProbePayload,
+    logger: logging.Logger,
+) -> FlowControlValidationResult:
+    """Fill the buffer with output held and watch input-side flow control."""
+    started = time.monotonic()
+    input_settings = dataclasses.replace(
+        frame.input_settings,
+        flow_control=input_flow,
+    )
+    output_settings = dataclasses.replace(
+        frame.output_settings,
+        flow_control="none",
+    )
+    settings = DualSerialSettings(input_settings, output_settings)
+    payload = payload_for_trial(
+        template=payload,
+        settings=settings,
+        candidate_index=index,
+        burst_index=1,
+        run_id=options.run_id or make_run_id("B"),
+        switch_hash=switch_note_hash(options.switch_note),
+    )
+    expected = payload.data
+    payload_bytes = payload.byte_count
+    read_timeout = max(options.read_timeout, FLOW_VALIDATE_READ_TIMEOUT)
+    chunk_size = write_chunk_size(input_settings)
+    hold_limit = flow_control_hold_byte_limit(payload_bytes)
+    stall_seconds = max(
+        INPUT_BACKPRESSURE_STALL_SECONDS,
+        estimated_transmit_seconds(input_settings, chunk_size) * 3.0,
+    )
+    prefix = (
+        f"[BFULL {index:02d}/{total:02d} IN={flow_control_code(input_flow)} "
+        f"HOLD={flow_control_code(output_hold_flow)}]"
+    )
+    console_progress(border_line(PROGRESS_WIDTH))
+    console_progress(
+        bordered_text(
+            f"INPUT BUFFER-FULL {index}/{total} {input_flow.upper()}",
+            PROGRESS_WIDTH,
+        )
+    )
+    console_progress(border_line(PROGRESS_WIDTH))
+    console_progress(
+        f"{prefix}: HOLD OUTPUT WITH {output_hold_flow.upper()}; "
+        f"SEND {payload_bytes} BYTES"
+    )
+
+    received = bytearray()
+    received_lock = threading.Lock()
+    write_lock = threading.Lock()
+    stop_event = threading.Event()
+    writer_done = threading.Event()
+    hold_released = threading.Event()
+    reader_errors: list[str] = []
+    bytes_sent = 0
+    held_bytes_seen = 0
+    write_error: str | None = None
+    last_write_time = time.monotonic()
+    last_data_time = time.monotonic()
+    release_reason: str | None = None
+    release_sent = 0
+    before_input_lines: dict[str, bool] = {}
+    after_input_lines: dict[str, bool] = {}
+    hold_applied = False
+
+    def reader() -> None:
+        """Read output continuously so the PC-side receive buffer cannot fill."""
+        nonlocal held_bytes_seen, last_data_time
+        while not stop_event.is_set():
+            try:
+                waiting = getattr(out_serial, "in_waiting", 0)  # type: ignore[name-defined]
+                read_size = min(max(int(waiting), 1), 4096)
+                chunk = out_serial.read(read_size)  # type: ignore[name-defined]
+            except SERIAL_IO_ERRORS as exc:
+                reader_errors.append(str(exc))
+                stop_event.set()
+                break
+
+            now = time.monotonic()
+            if chunk:
+                with received_lock:
+                    received.extend(chunk)
+                    if not hold_released.is_set():
+                        held_bytes_seen += len(chunk)
+                last_data_time = now
+                continue
+
+            if (
+                writer_done.is_set()
+                and hold_released.is_set()
+                and (now - last_data_time) >= read_timeout
+            ):
+                stop_event.set()
+                break
+
+    def writer() -> None:
+        """Write the stress payload and leave release decisions to the monitor."""
+        nonlocal bytes_sent, write_error, last_write_time
+        try:
+            while bytes_sent < len(expected):
+                chunk = expected[bytes_sent : bytes_sent + chunk_size]
+                written = in_serial.write(chunk)  # type: ignore[name-defined]
+                if written is None:
+                    written = len(chunk)
+                if written <= 0:
+                    raise RuntimeError("serial write returned zero bytes")
+                with write_lock:
+                    bytes_sent += int(written)
+                    last_write_time = time.monotonic()
+            in_serial.flush()  # type: ignore[name-defined]
+        except SERIAL_IO_ERRORS as exc:
+            write_error = str(exc)
+            logger.debug("%s write failed: %s", prefix, write_error)
+        finally:
+            writer_done.set()
+
+    try:
+        with open_serial_port(
+            serial_module,
+            options.out_port,
+            output_settings,
+            read_timeout,
+        ) as out_serial:
+            with open_serial_port(
+                serial_module,
+                options.in_port,
+                input_settings,
+                read_timeout,
+            ) as in_serial:
+                reset_serial_buffers(out_serial)
+                reset_serial_buffers(in_serial)
+                time.sleep(options.settle_ms / 1000.0)
+
+                if not options.no_pre_drain:
+                    drain = drain_output_until_quiet(
+                        out_serial=out_serial,
+                        quiet_seconds=options.pre_drain_quiet,
+                        max_seconds=max(options.pre_drain_timeout, 2.0),
+                        max_bytes=options.max_drain_bytes,
+                        progress_interval=options.progress_interval,
+                        progress=console_progress,
+                        prefix=prefix,
+                        logger=logger,
+                    )
+                    if not drain.quiet:
+                        error = (
+                            "OUTPUT DID NOT GO QUIET BEFORE BUFFER-FULL STRESS "
+                            f"(REASON={drain.reason.upper()}, "
+                            f"CLEARED={drain.bytes_drained})"
+                        )
+                        if drain.error:
+                            error = f"{error}: {drain.error}"
+                        return input_backpressure_skip_result(settings, error)
+
+                before_input_lines = modem_line_snapshot(in_serial)
+                console_progress(
+                    f"{prefix}: INPUT LINES BEFORE "
+                    f"{modem_line_snapshot_label(before_input_lines)}"
+                )
+                apply_flow_control_hold(out_serial, output_hold_flow)
+                hold_applied = True
+                time.sleep(FLOW_VALIDATE_RELEASE_SETTLE_SECONDS)
+
+                reader_thread = threading.Thread(
+                    target=reader,
+                    name="serial-probe-backpressure-reader",
+                    daemon=True,
+                )
+                writer_thread = threading.Thread(
+                    target=writer,
+                    name="serial-probe-backpressure-writer",
+                    daemon=True,
+                )
+                reader_thread.start()
+                writer_thread.start()
+
+                last_progress_bytes = 0
+                last_progress_time = time.monotonic()
+                next_progress_at = time.monotonic() + max(options.progress_interval, 0.1)
+                max_hold_seconds = max(
+                    estimated_transmit_seconds(input_settings, payload_bytes)
+                    + read_timeout
+                    + 10.0,
+                    10.0,
+                )
+                hold_deadline = time.monotonic() + max_hold_seconds
+                while writer_thread.is_alive() and not hold_released.is_set():
+                    time.sleep(INPUT_BACKPRESSURE_MONITOR_SECONDS)
+                    now = time.monotonic()
+                    with write_lock:
+                        sent_snapshot = bytes_sent
+                        last_write_snapshot = last_write_time
+                    if sent_snapshot != last_progress_bytes:
+                        last_progress_bytes = sent_snapshot
+                        last_progress_time = now
+                    stalled = (
+                        sent_snapshot > 0
+                        and (now - max(last_progress_time, last_write_snapshot))
+                        >= stall_seconds
+                    )
+                    line_snapshot = modem_line_snapshot(in_serial)
+                    reason = input_backpressure_release_reason(
+                        input_flow,
+                        before_input_lines,
+                        line_snapshot,
+                        stalled,
+                    )
+                    if reason:
+                        release_reason = reason
+                        release_sent = sent_snapshot
+                        after_input_lines = line_snapshot
+                        console_progress(
+                            f"{prefix}: {reason}; RELEASE OUTPUT HOLD "
+                            f"AFTER {sent_snapshot} BYTES"
+                        )
+                        release_input_backpressure_hold(
+                            out_serial,
+                            output_hold_flow,
+                            hold_released,
+                        )
+                        hold_applied = False
+                        break
+                    if now >= hold_deadline:
+                        release_reason = "NO INPUT THROTTLE BEFORE HOLD LIMIT"
+                        release_sent = sent_snapshot
+                        after_input_lines = line_snapshot
+                        console_progress(
+                            f"{prefix}: NO INPUT THROTTLE; RELEASE OUTPUT HOLD"
+                        )
+                        release_input_backpressure_hold(
+                            out_serial,
+                            output_hold_flow,
+                            hold_released,
+                        )
+                        hold_applied = False
+                        break
+                    if now >= next_progress_at:
+                        with received_lock:
+                            held_snapshot = held_bytes_seen
+                        console_progress(
+                            f"{prefix}: SENT={sent_snapshot}/{payload_bytes} "
+                            f"HELD-OUT={held_snapshot} "
+                            f"{modem_line_snapshot_label(line_snapshot)}"
+                        )
+                        next_progress_at = now + max(options.progress_interval, 0.1)
+
+                if not hold_released.is_set():
+                    with write_lock:
+                        release_sent = bytes_sent
+                    after_input_lines = modem_line_snapshot(in_serial)
+                    release_reason = "STRESS WRITE COMPLETED WITHOUT INPUT THROTTLE"
+                    console_progress(f"{prefix}: WRITE COMPLETE; RELEASE OUTPUT HOLD")
+                    release_input_backpressure_hold(
+                        out_serial,
+                        output_hold_flow,
+                        hold_released,
+                    )
+                    hold_applied = False
+
+                writer_join_seconds = max(
+                    estimated_transmit_seconds(input_settings, payload_bytes) * 2.0
+                    + 10.0,
+                    10.0,
+                )
+                writer_thread.join(timeout=writer_join_seconds)
+                if writer_thread.is_alive():
+                    write_error = write_error or "WRITE DID NOT FINISH AFTER OUTPUT RELEASE"
+                    stop_event.set()
+
+                reader_deadline = time.monotonic() + max(
+                    estimated_receive_seconds(settings, payload_bytes) * 2.0
+                    + read_timeout
+                    + 10.0,
+                    read_timeout + 10.0,
+                )
+                while reader_thread.is_alive() and time.monotonic() < reader_deadline:
+                    reader_thread.join(timeout=0.2)
+                if reader_thread.is_alive():
+                    reader_errors.append("OUTPUT READ DID NOT GO QUIET AFTER STRESS")
+                    stop_event.set()
+                    reader_thread.join(timeout=1.0)
+    except SERIAL_IO_ERRORS as exc:
+        logger.exception("input backpressure stress failed for %s", settings.label())
+        return flow_validation_error_result(
+            flow_control=input_flow,
+            method=INPUT_BACKPRESSURE_METHOD,
+            settings=settings,
+            payload=payload,
+            error=str(exc),
+            elapsed_sec=time.monotonic() - started,
+        )
+    finally:
+        if hold_applied:
+            try:
+                release_flow_control_hold(out_serial, output_hold_flow)  # type: ignore[name-defined]
+            except SERIAL_IO_ERRORS:
+                logger.debug("failed to release %s hold in cleanup", output_hold_flow)
+
+    received_bytes = bytes(received)
+    score = score_received(expected, received_bytes)
+    error = write_error or (reader_errors[0] if reader_errors else None)
+    output_hold_ok = held_bytes_seen <= hold_limit
+    backpressure_observed = release_reason in {
+        "CTS DROPPED",
+        "DSR DROPPED",
+        "WRITE STALLED",
+    }
+    clean = (
+        score.score >= 99.0
+        and bytes_sent == payload_bytes
+        and len(received_bytes) == payload_bytes
+        and score.metrics.missing_bytes == 0
+        and score.metrics.extra_bytes == 0
+    )
+    if not output_hold_ok:
+        status = "stress-invalid"
+        reason = (
+            f"OUTPUT HOLD LEAKED {held_bytes_seen} BYTES BEFORE RELEASE "
+            f"(LIMIT {hold_limit}); BUFFER MAY NOT HAVE FILLED."
+        )
+    elif error and backpressure_observed:
+        status = "backpressure-partial"
+        reason = f"{release_reason} AFTER {release_sent} BYTES; {error}"
+    elif error:
+        status = "error"
+        reason = error
+    elif bytes_sent < payload_bytes and not backpressure_observed:
+        status = "partial-write"
+        reason = "STRESS PAYLOAD WAS NOT FULLY SENT."
+    elif backpressure_observed and clean:
+        status = "backpressure-proven"
+        reason = (
+            f"{release_reason} AFTER {release_sent} BYTES; "
+            "OUTPUT THEN DRAINED CLEANLY."
+        )
+    elif backpressure_observed:
+        status = "backpressure-partial"
+        reason = (
+            f"{release_reason} AFTER {release_sent} BYTES; "
+            "DRAINED OUTPUT WAS NOT BYTE-PERFECT."
+        )
+    elif clean:
+        status = "no-backpressure"
+        reason = (
+            "STRESS PAYLOAD WAS ACCEPTED WHILE OUTPUT WAS HELD; "
+            "NO INPUT-SIDE THROTTLE OBSERVED."
+        )
+    elif not received_bytes:
+        status = "no-data"
+        reason = "NO OUTPUT WAS RECEIVED AFTER STRESS RELEASE."
+    else:
+        status = "transfer-partial"
+        reason = "STRESS DRAIN PRODUCED ONLY A PARTIAL MATCH."
+
+    if before_input_lines or after_input_lines:
+        logger.info(
+            "%s input lines before=%s after=%s",
+            prefix,
+            before_input_lines,
+            after_input_lines,
+        )
+    return FlowControlValidationResult(
+        flow_control=input_flow,
+        method=INPUT_BACKPRESSURE_METHOD,
+        settings=settings,
+        bytes_sent=bytes_sent,
+        bytes_received=len(received_bytes),
+        bytes_seen_while_held=held_bytes_seen,
+        score=score.score,
+        indicator=flow_validation_indicator(status, score.score, error),
+        status=status,
+        reason=reason,
+        error=error,
+        elapsed_sec=time.monotonic() - started,
+        metrics=score.metrics,
+    )
+
+
+def run_input_backpressure_validation(
+    serial_module: Any,
+    options: ScanOptions,
+    target: CandidateResult | None,
+    hold_results: Sequence[FlowControlValidationResult],
+    logger: logging.Logger,
+) -> tuple[list[FlowControlValidationResult], str | None]:
+    """Run the known-baud input-side buffer-full stress test."""
+    print()
+    print_report_title("INPUT BUFFER-FULL STRESS")
+    if target is None:
+        print("SKIPPED: NO CLEAN FOLLOW-UP FRAME WAS FOUND.")
+        print(border_line(REPORT_WIDTH))
+        return [], None
+    frame = input_backpressure_settings_for_target(target)
+    if frame is None:
+        print("SKIPPED: NO CONCRETE INPUT/OUTPUT FRAME WAS FOUND.")
+        print(border_line(REPORT_WIDTH))
+        return [], None
+    if not options.auto_stress_input_backpressure:
+        reason = "BUFFER-FULL STRESS IS OFF IN SCAN / VALIDATE SETUP."
+        print(f"SKIPPED: {reason}")
+        print(border_line(REPORT_WIDTH))
+        return [input_backpressure_skip_result(frame, reason)], None
+    hold = select_backpressure_output_hold(hold_results)
+    if hold is None:
+        reason = "NO OUTPUT HOLD MODE PROVEN; BUFFER MAY NOT FILL AT EQUAL BAUD."
+        print(f"SKIPPED: {reason}")
+        print(border_line(REPORT_WIDTH))
+        return [input_backpressure_skip_result(frame, reason)], None
+
+    run_known_output_purges(
+        serial_module=serial_module,
+        options=options,
+        logger=logger,
+        settings_list=[frame.output_settings],
+        reason="CLEAR VALIDATION DATA BEFORE INPUT BUFFER-FULL STRESS.",
+    )
+    payload = generate_payload(options.input_backpressure_stress_bytes)
+    print_wrapped_value("FRAME PAIR: ", frame.label())
+    print(
+        f"TEST: {payload.byte_count} BYTES; OUTPUT HELD BY "
+        f"{flow_control_name(hold.flow_control)}."
+    )
+    print("RESULT PROVES INPUT-SIDE BUFFER-FULL HANDSHAKE ONLY IF THROTTLE IS SEEN.")
+    print(border_line(REPORT_WIDTH))
+    logger.info(
+        "input backpressure stress started frame=%s payload=%s output_hold=%s",
+        frame.label(),
+        payload.byte_count,
+        hold.flow_control,
+    )
+
+    results: list[FlowControlValidationResult] = []
+    total = len(INPUT_BACKPRESSURE_FLOW_CONTROLS)
+    for index, input_flow in enumerate(INPUT_BACKPRESSURE_FLOW_CONTROLS, start=1):
+        while True:
+            try:
+                result = run_input_backpressure_stress(
+                    serial_module=serial_module,
+                    index=index,
+                    total=total,
+                    frame=frame,
+                    input_flow=input_flow,
+                    output_hold_flow=hold.flow_control,
+                    options=options,
+                    payload=payload,
+                    logger=logger,
+                )
+            except KeyboardInterrupt:
+                action = prompt_operator_break_action("INPUT BUFFER-FULL STRESS")
+                if action == "resume":
+                    logger.info(
+                        "operator resumed input backpressure stress at %s/%s %s",
+                        index,
+                        total,
+                        input_flow,
+                    )
+                    continue
+                logger.info(
+                    "operator break during input backpressure stress; action=%s completed=%s/%s",
+                    action,
+                    len(results),
+                    total,
+                )
+                print_flow_control_validation_report(frame, results)
+                return results, action
+            results.append(result)
+            print(format_flow_validation_progress(result, index, total))
+            logger.info(
+                "input backpressure %s: indicator=%s status=%s sent=%s read=%s held=%s reason=%s error=%s",
+                input_flow,
+                result.indicator,
+                result.status,
+                result.bytes_sent,
+                result.bytes_received,
+                result.bytes_seen_while_held,
+                result.reason,
+                result.error,
+            )
+            break
+
+    print_flow_control_validation_report(frame, results)
+    logger.info(
+        "input backpressure stress completed: %s",
+        flow_control_validation_recommendation(results),
+    )
+    return results, None
+
+
 def bank2_frame_serial_settings(baud: int) -> list[SerialSettings]:
     """Return the targeted frame list used for second-bank characterization."""
     frame_specs = [
@@ -6401,15 +7096,16 @@ def bank2_flow_summary(results: Sequence[FlowControlValidationResult]) -> str:
         return "NOT RUN"
     matrix_results = flow_transfer_matrix_results(results)
     hold_results = flow_hold_release_results(results)
-    if matrix_results and hold_results:
-        return (
-            f"MATRIX: {bank2_flow_matrix_summary(results)}; "
-            f"OUTPUT HOLD: {bank2_flow_hold_summary(results)}"
-        )
+    stress_results = flow_input_backpressure_results(results)
+    summary_parts: list[str] = []
     if matrix_results:
-        return f"MATRIX: {bank2_flow_matrix_summary(results)}"
+        summary_parts.append(f"MATRIX: {bank2_flow_matrix_summary(results)}")
     if hold_results:
-        return f"OUTPUT HOLD: {bank2_flow_hold_summary(results)}"
+        summary_parts.append(f"OUTPUT HOLD: {bank2_flow_hold_summary(results)}")
+    if stress_results:
+        summary_parts.append(f"INPUT FULL: {bank2_flow_input_summary(results)}")
+    if summary_parts:
+        return "; ".join(summary_parts)
     return flow_control_validation_recommendation(results)
 
 
@@ -6424,7 +7120,18 @@ def flow_hold_release_results(
     results: Sequence[FlowControlValidationResult],
 ) -> list[FlowControlValidationResult]:
     """Return same-frame output hold/release flow validation rows."""
-    return [result for result in results if result.method != "dual-transfer"]
+    return [
+        result
+        for result in results
+        if result.method not in {"dual-transfer", INPUT_BACKPRESSURE_METHOD}
+    ]
+
+
+def flow_input_backpressure_results(
+    results: Sequence[FlowControlValidationResult],
+) -> list[FlowControlValidationResult]:
+    """Return input-side buffer-full stress rows."""
+    return [result for result in results if result.method == INPUT_BACKPRESSURE_METHOD]
 
 
 def bank2_flow_matrix_summary(
@@ -6445,6 +7152,16 @@ def bank2_flow_hold_summary(
     if not hold_results:
         return "NOT RUN"
     return flow_control_validation_recommendation(hold_results)
+
+
+def bank2_flow_input_summary(
+    results: Sequence[FlowControlValidationResult],
+) -> str:
+    """Return the known-baud input-side buffer-full stress summary."""
+    stress_results = flow_input_backpressure_results(results)
+    if not stress_results:
+        return "NOT RUN"
+    return flow_control_validation_recommendation(stress_results)
 
 
 def titled_flow_validation_report_lines(
@@ -6477,7 +7194,8 @@ def bank2_flow_report_lines(
 
     matrix_results = flow_transfer_matrix_results(results)
     hold_results = flow_hold_release_results(results)
-    if not matrix_results and not hold_results:
+    stress_results = flow_input_backpressure_results(results)
+    if not matrix_results and not hold_results and not stress_results:
         return [
             "FLOW CONTROL VALIDATION:",
             "FINDING:         NOT RUN",
@@ -6499,6 +7217,15 @@ def bank2_flow_report_lines(
             titled_flow_validation_report_lines(
                 "OUTPUT HOLD/RELEASE:",
                 hold_results,
+            )
+        )
+    if (matrix_results or hold_results) and stress_results:
+        lines.append("")
+    if stress_results:
+        lines.extend(
+            titled_flow_validation_report_lines(
+                "INPUT BUFFER-FULL STRESS:",
+                stress_results,
             )
         )
     return lines
@@ -7695,7 +8422,10 @@ def bank2_conclusion(
         return with_stale_warning(
             "Ambiguous; byte transfer does not distinguish these settings"
         )
-    if any(result.status == "validated" for result in flow_results):
+    if any(
+        result.status in {"validated", "backpressure-proven"}
+        for result in flow_results
+    ):
         return with_stale_warning(
             "Flow behavior changed or was validated; compare prior blocks"
         )
@@ -7751,10 +8481,12 @@ def write_bank2_text_report(
     flow_summary = bank2_flow_summary(result.flow_results)
     flow_matrix_summary = bank2_flow_matrix_summary(result.flow_results)
     flow_hold_summary = bank2_flow_hold_summary(result.flow_results)
+    flow_input_summary = bank2_flow_input_summary(result.flow_results)
     if result.flow_skip_reason:
         flow_summary = f"SKIPPED: {result.flow_skip_reason}"
         flow_matrix_summary = flow_summary
         flow_hold_summary = flow_summary
+        flow_input_summary = flow_summary
     behavior_summary = bank2_behavior_summary(result.behavior_results)
     etx_ack_summary = bank2_etx_ack_summary(result.etx_ack_results)
     target_label = bank2_followup_target_label(
@@ -7782,6 +8514,7 @@ def write_bank2_text_report(
         *bank2_value_lines("FLOW RESULT:", flow_summary, indent=""),
         *bank2_value_lines("FLOW MATRIX:", flow_matrix_summary, indent=""),
         *bank2_value_lines("OUTPUT HOLD:", flow_hold_summary, indent=""),
+        *bank2_value_lines("INPUT FULL:", flow_input_summary, indent=""),
         *bank2_value_lines("BEHAVIOR RESULT:", behavior_summary, indent=""),
         *bank2_value_lines("ETX/ACK RESULT:", etx_ack_summary, indent=""),
         *bank2_value_lines(
@@ -7808,6 +8541,7 @@ def write_bank2_text_report(
         *bank2_value_lines("FLOW:", flow_summary, indent="  "),
         *bank2_value_lines("FLOW MATRIX:", flow_matrix_summary, indent="  "),
         *bank2_value_lines("OUTPUT HOLD:", flow_hold_summary, indent="  "),
+        *bank2_value_lines("INPUT FULL:", flow_input_summary, indent="  "),
         *bank2_value_lines(
             "STALE:",
             "YES" if result.stale_data_seen else "NO",
@@ -7826,6 +8560,7 @@ def write_bank2_text_report(
         *bank2_value_lines("FLOW:", flow_summary),
         *bank2_value_lines("FLOW MATRIX:", flow_matrix_summary),
         *bank2_value_lines("OUTPUT HOLD:", flow_hold_summary),
+        *bank2_value_lines("INPUT FULL:", flow_input_summary),
         *bank2_value_lines(
             "STALE WARNING:",
             "YES" if result.stale_data_seen else "NO",
@@ -7843,7 +8578,7 @@ def write_bank2_text_report(
         "  ETX/ACK REQUIRES A REVERSE ACK PATH; XON/XOFF DOES NOT PROVE THAT PATH.",
         "  FLOW MATRIX SHOWS WHICH IN/OUT FLOW PAIRS MOVE BYTES CLEANLY.",
         "  OUTPUT HOLD/RELEASE PROVES ONLY OBSERVED OUTPUT-SIDE PAUSE/RESUME.",
-        "  INPUT-SIDE BACKPRESSURE IS NOT PROVEN BY THIS FLOW VALIDATION.",
+        "  INPUT BUFFER-FULL STRESS IS THE INPUT-SIDE BACKPRESSURE PROOF.",
         "  BEHAVIOR PROBES OBSERVE BYTES ONLY; THEY DO NOT ASSIGN DEVICE MEANING.",
         "  STALE WARNING MEANS ONE ROW HAD WRONG-RUN DATA; IT IS NOT DEVICE MEANING.",
         "  COMPARE THIS REPORT BLOCK TO OTHER DEVICE-NOTE BLOCKS MANUALLY.",
@@ -7875,13 +8610,16 @@ def print_bank2_report(
     flow_summary = bank2_flow_summary(result.flow_results)
     flow_matrix_summary = bank2_flow_matrix_summary(result.flow_results)
     flow_hold_summary = bank2_flow_hold_summary(result.flow_results)
+    flow_input_summary = bank2_flow_input_summary(result.flow_results)
     if result.flow_skip_reason:
         flow_summary = f"SKIPPED: {result.flow_skip_reason}"
         flow_matrix_summary = flow_summary
         flow_hold_summary = flow_summary
+        flow_input_summary = flow_summary
     print_bank2_value("FLOW RESULT:", flow_summary)
     print_bank2_value("FLOW MATRIX:", flow_matrix_summary)
     print_bank2_value("OUTPUT HOLD:", flow_hold_summary)
+    print_bank2_value("INPUT FULL:", flow_input_summary)
     print_bank2_value(
         "BEHAVIOR RESULT:",
         bank2_behavior_summary(result.behavior_results),
@@ -7928,7 +8666,7 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
         "SEQUENCE: ",
         (
             "PURGE, ASCII FRAME TEST, 8-BIT CHALLENGE, RAW BEHAVIOR, "
-            "ETX/ACK PATH, FLOW MATRIX, OUTPUT HOLD VALIDATION."
+            "ETX/ACK PATH, FLOW MATRIX, OUTPUT HOLD, INPUT BUFFER-FULL."
         ),
     )
     print(border_line(REPORT_WIDTH))
@@ -8105,7 +8843,7 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
     flow_results: list[FlowControlValidationResult] = []
     flow_skip_reason = bank2_flow_skip_reason(followup_target, input_baud, output_baud)
     if not bank_options.auto_validate_flow_control:
-        flow_skip_reason = "FLOW-CONTROL TESTING DISABLED IN SCAN / VALIDATE SETUP"
+        flow_skip_reason = "FLOW TESTS DISABLED IN SCAN / VALIDATE SETUP"
         print()
         print_report_title("KNOWN-BAUD FLOW VALIDATION")
         print(f"SKIPPED: {terminal_text(flow_skip_reason)}.")
@@ -8147,6 +8885,15 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
             logger.info(
                 "Known-baud output hold/release skipped: asymmetric follow-up frame"
             )
+
+        stress_results, _break_action = run_input_backpressure_validation(
+            serial_module=serial_module,
+            options=bank_options,
+            target=followup_target,
+            hold_results=flow_hold_release_results(flow_results),
+            logger=logger,
+        )
+        flow_results.extend(stress_results)
 
     stale_seen = stale_nonce_seen(ascii_results) or stale_nonce_seen(eight_bit_results)
     conclusion = bank2_conclusion(
@@ -8936,10 +9683,13 @@ def run_self_tests() -> int:
 
     phase0_template = generate_phase0_payload()
     assert (
-        phase0_payload_bytes() == PHASE0_PAYLOAD_BYTES
-    ), "Phase 0 liveness payload must stay compact"
+        phase0_payload_bytes() >= phase0_minimum_payload_size(representative_nonce())
+    ), "Phase 0 liveness payload must fit nonce fields"
     assert (
-        phase0_template.byte_count == PHASE0_PAYLOAD_BYTES
+        phase0_payload_bytes() > PHASE0_PAYLOAD_BYTES
+    ), "Phase 0 liveness payload must include nonce capacity"
+    assert (
+        phase0_template.byte_count == phase0_payload_bytes()
     ), "Phase 0 template size changed"
     phase0_trial = payload_for_trial(
         template=phase0_template,
@@ -8949,10 +9699,27 @@ def run_self_tests() -> int:
         run_id="DTEST",
         switch_hash=None,
     )
-    assert phase0_trial is phase0_template, "Phase 0 trial should not be nonced"
-    assert b"RUN=" not in phase0_trial.data, "Phase 0 payload should remain compact"
+    assert phase0_trial is not phase0_template, "Phase 0 trial should be nonced"
+    assert phase0_trial.nonce is not None, "Phase 0 trial nonce missing"
+    assert b"RUN=DTEST" in phase0_trial.data, "Phase 0 payload missing run nonce"
+    assert (
+        phase0_trial.byte_count == phase0_template.byte_count
+    ), "Phase 0 trial should keep fixed payload size"
     phase0_score = score_received(phase0_trial.data, phase0_trial.data)
     assert phase0_score.score == 100.0, "Phase 0 exact payload did not score 100"
+    stale_phase0_trial = payload_for_trial(
+        template=phase0_template,
+        settings=dual_phase0_settings(1200, 1200),
+        candidate_index=1,
+        burst_index=1,
+        run_id="DOLD",
+        switch_hash=None,
+    )
+    stale_phase0_score = score_received(phase0_trial.data, stale_phase0_trial.data)
+    assert stale_phase0_score.score == 0.0, "stale Phase 0 nonce must score zero"
+    assert (
+        stale_phase0_score.classification == "wrong-nonce"
+    ), "stale Phase 0 nonce not classified stale"
     phase0_options = phase0_scan_options(default_scan_options())
     phase0_1200_timing = effective_discovery_timing(
         phase0_options,

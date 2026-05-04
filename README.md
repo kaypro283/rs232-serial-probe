@@ -60,7 +60,7 @@ After choosing `AUTOMATED DISCOVERY` or `PHASE 0 BAUD LIVENESS ONLY`, the workfl
 
 `KNOWN-BAUD DEVICE TEST` is for any serial device or switch mode where you already know the input and output baud. It uses the fixed input/output bauds configured in `2 SET COM PORTS / BAUD`, then runs targeted ASCII frame checks, an 8-bit challenge, raw byte behavior probes, ETX/ACK probing, and flow validation checks.
 
-When known-baud testing finds a clean follow-up frame, flow validation sweeps the 16 input/output flow-control combinations as transfer checks. If the follow-up frame is the same on both sides, it also runs the output-side hold/release handshake proof. The report keeps these separate as `FLOW MATRIX` and `OUTPUT HOLD` because transfer compatibility and handshake pause/resume are different evidence.
+When known-baud testing finds a clean follow-up frame, flow validation sweeps the 16 input/output flow-control combinations as transfer checks. If the follow-up frame is the same on both sides, it also runs the output-side hold/release handshake proof. When an output hold is proven, the buffer-full stress test holds output, sends a larger input payload, watches for input-side XOFF/CTS/DSR throttling, then releases output and verifies the drain. The report keeps these separate as `FLOW MATRIX`, `OUTPUT HOLD`, and `INPUT FULL` because transfer compatibility, output pause/resume, and input buffer-full backpressure are different evidence.
 
 The raw byte behavior phase runs several payload classes after a likely frame is found: CR-only, LF-only, CR/LF, printer-control bytes with TAB/FF/ESC, printable ASCII `0x20..0x7E`, 7-bit controls excluding XON/XOFF, and 7-bit controls including XON/XOFF. Its report compares bytes exactly and records sent/read counts, sent and received hashes, first mismatch offset, and missing/extra byte counts. If the XON/XOFF-free control sweep is exact but the full control sweep changes, the report calls out that XON/XOFF control bytes affected the raw path.
 
@@ -104,12 +104,13 @@ The scan tries the fastest selected baud rate first, then works downward. With t
 
 The default menu settings are tuned for a practical scan:
 
-- `384` bytes per setting.
+- `512` quick-scan bytes per setting.
 - `1` test per setting.
 - Automated discovery uses Phase 0 and staged frame sweeps before any full matrix fallback.
 - Output wait after send is `2.0` seconds by default.
 - `Ask on top match` is off by default. If enabled, a `PASS` result pauses the scan and asks whether to continue looking for possible ties.
-- `Auto validate top matches after scan` is on by default. It retests the top-score setting or settings with an 8K payload. The menu can turn this off or change the size.
+- `Top-match verify` is on by default. It retests the top-score setting or settings with an 8K payload. The menu can turn this off or change the size.
+- `Flow tests` are on by default. Known-baud flow transfer still uses a short 1K payload, while `BUFFER-FULL STRESS` uses 128K by default to test input-side backpressure after output hold is proven.
 - Quick per-test old-output clearing stops after `131072` bytes by default, which is enough for a 64K buffer plus margin.
 - Known-baud purge stages use calculated long drain limits instead of the quick per-test clear time.
 - No early stop.
@@ -143,7 +144,7 @@ Example:
 
 ```text
 22:10:02 *              SETTING 1/480  38400 8N1 FLOW=NONE            *
-22:10:02 [0001/0480 38400 8N1 FLOW=NONE] TEST 1/1: SEND 384 BYTES
+22:10:02 [0001/0480 38400 8N1 FLOW=NONE] TEST 1/1: SEND 512 BYTES
 22:10:04 [0001/0480 38400 8N1 FLOW=NONE] TEST 1/1: RESULT FAIL SCORE=0.00
 SCAN TIME 0001/0480: ELAPSED=2S AVG=2S/SET LEFT=15M58S FINISH=22:26:02
 ```
@@ -207,6 +208,7 @@ Gibberish data:
 Flow-control problems:
 
 - Compare `none`, `xon/xoff`, `rts/cts`, and `dsr/dtr`; those are the flow-control modes in the scan.
+- For input-side buffer-full handshake mapping, use `KNOWN-BAUD DEVICE TEST` and check the `INPUT FULL` result. A clean transfer matrix alone does not prove buffer-full backpressure.
 
 Stale data:
 

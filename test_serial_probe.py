@@ -56,6 +56,38 @@ def test_receive_completion_detects_complete_eight_bit_payload() -> None:
     assert not serial_probe.receive_completion_detected(payload.data[:-1], payload.data)
 
 
+def test_payload_for_trial_nonces_phase0_payload() -> None:
+    template = serial_probe.generate_phase0_payload()
+
+    trial = serial_probe.payload_for_trial(
+        template=template,
+        settings=serial_probe.dual_phase0_settings(1200, 1200),
+        candidate_index=1,
+        burst_index=1,
+        run_id="DTEST",
+        switch_hash=None,
+    )
+
+    assert trial is not template
+    assert trial.payload_mode == serial_probe.PAYLOAD_MODE_PHASE0
+    assert trial.nonce is not None
+    assert trial.byte_count == template.byte_count
+    assert b"RUN=DTEST" in trial.data
+
+    stale_trial = serial_probe.payload_for_trial(
+        template=template,
+        settings=serial_probe.dual_phase0_settings(1200, 1200),
+        candidate_index=1,
+        burst_index=1,
+        run_id="DOLD",
+        switch_hash=None,
+    )
+    score = serial_probe.score_received(trial.data, stale_trial.data)
+
+    assert score.score == 0.0
+    assert score.classification == "wrong-nonce"
+
+
 def test_serial_write_os_error_is_reported_as_io_error() -> None:
     payload = serial_probe.generate_payload(serial_probe.DEFAULT_PAYLOAD_BYTES)
 
@@ -303,6 +335,25 @@ def test_current_settings_show_option_2_ports_and_bauds(
     assert "ASKED IN START SCAN 1 OR 3" in output
 
 
+def test_scan_validate_setup_uses_operator_friendly_flow_labels(
+    capsys: CaptureFixture[str],
+) -> None:
+    options = serial_probe.default_scan_options()
+
+    serial_probe.print_scan_validate_setup(options)
+    output = capsys.readouterr().out
+
+    assert options.payload_bytes == 512
+    assert options.auto_validate_flow_control
+    assert options.auto_stress_input_backpressure
+    assert options.input_backpressure_stress_bytes == 128 * serial_probe.KIB_BYTES
+    assert "QUICK SCAN MESSAGE BYTES" in output
+    assert "FLOW TRANSFER BYTES" in output
+    assert "BUFFER-FULL STRESS" in output
+    assert "BUFFER-FULL BYTES" in output
+    assert "  9 BUFFER-FULL BYTES" in output
+
+
 def test_configure_ports_updates_ports_and_bauds(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(
         builtins,
@@ -316,6 +367,21 @@ def test_configure_ports_updates_ports_and_bauds(monkeypatch: MonkeyPatch) -> No
     assert options.input_baud == 38400
     assert options.out_port == "COM6"
     assert options.output_baud == 9600
+
+
+def test_configure_payload_updates_buffer_full_stress_settings(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        builtins,
+        "input",
+        fake_input_from(["8", "n", "9", "96000", "0"]),
+    )
+
+    options = serial_probe.configure_payload(serial_probe.default_scan_options())
+
+    assert not options.auto_stress_input_backpressure
+    assert options.input_backpressure_stress_bytes == 96000
 
 
 def test_start_scan_discovery_prompts_for_baud_range(
@@ -841,6 +907,75 @@ def test_known_baud_flow_summary_splits_matrix_and_hold() -> None:
     assert all(len(line) <= serial_probe.REPORT_WIDTH for line in report_lines)
 
 
+def test_known_baud_flow_summary_includes_input_buffer_full_stress() -> None:
+    payload = serial_probe.generate_payload(512)
+    base_frame = serial_probe.SerialSettings(38400, 8, "even", 1, "none")
+    clean_flow = serial_probe.fake_clean_candidate_result(base_frame, payload)
+    stress_row = serial_probe.FlowControlValidationResult(
+        flow_control="xon/xoff",
+        method=serial_probe.INPUT_BACKPRESSURE_METHOD,
+        settings=serial_probe.DualSerialSettings(
+            dataclasses.replace(base_frame, flow_control="xon/xoff"),
+            base_frame,
+        ),
+        bytes_sent=serial_probe.INPUT_BACKPRESSURE_STRESS_BYTES,
+        bytes_received=serial_probe.INPUT_BACKPRESSURE_STRESS_BYTES,
+        bytes_seen_while_held=0,
+        score=100.0,
+        indicator="PASS",
+        status="backpressure-proven",
+        reason="WRITE STALLED AFTER 65536 BYTES; OUTPUT THEN DRAINED CLEANLY.",
+        error=None,
+        elapsed_sec=0.0,
+        metrics=clean_flow.metrics,
+    )
+
+    assert (
+        serial_probe.bank2_flow_input_summary([stress_row])
+        == "INPUT BACKPRESSURE PROVEN: XON/XOFF."
+    )
+    summary = serial_probe.bank2_flow_summary([stress_row])
+    assert "INPUT FULL:" in summary
+    report_lines = serial_probe.bank2_flow_report_lines([stress_row])
+    assert "INPUT BUFFER-FULL STRESS:" in report_lines
+    assert "BUFFER-FULL" in "\n".join(report_lines)
+    assert all(len(line) <= serial_probe.REPORT_WIDTH for line in report_lines)
+
+
+def test_backpressure_output_hold_selection_requires_actual_pause() -> None:
+    payload = serial_probe.generate_payload(512)
+    base_frame = serial_probe.SerialSettings(38400, 8, "even", 1, "none")
+    clean_flow = serial_probe.fake_clean_candidate_result(base_frame, payload)
+    no_pause = serial_probe.FlowControlValidationResult(
+        flow_control="rts/cts",
+        method="rts-hold-release",
+        settings=dataclasses.replace(base_frame, flow_control="rts/cts"),
+        bytes_sent=payload.byte_count,
+        bytes_received=payload.byte_count,
+        bytes_seen_while_held=payload.byte_count,
+        score=100.0,
+        indicator="FAIL",
+        status="no-pause",
+        reason="OUTPUT DID NOT PAUSE.",
+        error=None,
+        elapsed_sec=0.0,
+        metrics=clean_flow.metrics,
+    )
+    paused = dataclasses.replace(
+        no_pause,
+        flow_control="xon/xoff",
+        method="xoff-xon-pause",
+        bytes_seen_while_held=0,
+        indicator="PASS",
+        status="validated",
+        reason="OUTPUT PAUSED DURING HOLD AND CLEANLY RESUMED.",
+    )
+
+    selected = serial_probe.select_backpressure_output_hold([no_pause, paused])
+
+    assert selected is paused
+
+
 def test_known_baud_text_report_includes_split_flow_evidence(tmp_path: Path) -> None:
     payload = serial_probe.generate_payload(512)
     base_frame = serial_probe.SerialSettings(38400, 8, "even", 1, "none")
@@ -871,12 +1006,30 @@ def test_known_baud_text_report_includes_split_flow_evidence(tmp_path: Path) -> 
         elapsed_sec=0.0,
         metrics=matrix_candidate.metrics,
     )
+    stress_row = serial_probe.FlowControlValidationResult(
+        flow_control="xon/xoff",
+        method=serial_probe.INPUT_BACKPRESSURE_METHOD,
+        settings=serial_probe.DualSerialSettings(
+            dataclasses.replace(base_frame, flow_control="xon/xoff"),
+            base_frame,
+        ),
+        bytes_sent=serial_probe.INPUT_BACKPRESSURE_STRESS_BYTES,
+        bytes_received=serial_probe.INPUT_BACKPRESSURE_STRESS_BYTES,
+        bytes_seen_while_held=0,
+        score=100.0,
+        indicator="PASS",
+        status="backpressure-proven",
+        reason="WRITE STALLED AFTER 65536 BYTES; OUTPUT THEN DRAINED CLEANLY.",
+        error=None,
+        elapsed_sec=0.0,
+        metrics=matrix_candidate.metrics,
+    )
     result = serial_probe.Bank2CharacterizationResult(
         switch_note="00000000",
         known_baud_text="38400",
         ascii_results=[ascii_result],
         eight_bit_results=[],
-        flow_results=[matrix_row, hold_row],
+        flow_results=[matrix_row, hold_row, stress_row],
         behavior_results=[],
         etx_ack_results=[],
         stale_data_seen=False,
@@ -891,8 +1044,10 @@ def test_known_baud_text_report_includes_split_flow_evidence(tmp_path: Path) -> 
 
     assert "FLOW MATRIX:" in report_text
     assert "OUTPUT HOLD:" in report_text
+    assert "INPUT FULL:" in report_text
     assert "FLOW TRANSFER MATRIX:" in report_text
     assert "OUTPUT HOLD/RELEASE:" in report_text
+    assert "INPUT BUFFER-FULL STRESS:" in report_text
     assert "INPUT-SIDE BACKPRESSURE IS NOT PROVEN" in report_text
 
 
