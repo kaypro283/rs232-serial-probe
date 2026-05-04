@@ -10,6 +10,15 @@ from pytest import CaptureFixture, MonkeyPatch
 import serial_probe
 
 
+def fake_input_from(values: list[str]):
+    iterator = iter(values)
+
+    def fake_input(_prompt: str) -> str:
+        return next(iterator)
+
+    return fake_input
+
+
 class TypeErrorWriter:
     def write(self, data: bytes) -> int:
         raise TypeError("programming error")
@@ -89,6 +98,74 @@ def test_import_pyserial_missing_reports_install_command_without_install(
         "INSTALL PYSERIAL WITH: PYTHON -M PIP INSTALL PYSERIAL"
         in capsys.readouterr().out
     )
+
+
+def test_configure_ports_updates_ports_and_bauds(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        builtins,
+        "input",
+        fake_input_from(["COM2", "38400", "COM6", "9600"]),
+    )
+
+    options = serial_probe.configure_ports(serial_probe.default_scan_options())
+
+    assert options.in_port == "COM2"
+    assert options.input_baud == 38400
+    assert options.out_port == "COM6"
+    assert options.output_baud == 9600
+
+
+def test_start_scan_discovery_prompts_for_baud_range(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        builtins,
+        "input",
+        fake_input_from(["1", "1", "1200", "9600"]),
+    )
+
+    selection = serial_probe.interactive_menu(serial_probe.default_scan_options())
+
+    assert selection is not None
+    assert selection.action == "scan"
+    assert selection.workflow == "discovery"
+    assert selection.options.min_baud == 1200
+    assert selection.options.max_baud == 9600
+
+
+def test_start_scan_bank2_uses_configured_bauds_without_range_prompt(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    options = dataclasses.replace(
+        serial_probe.default_scan_options(),
+        input_baud=38400,
+        output_baud=19200,
+        min_baud=300,
+        max_baud=9600,
+    )
+    monkeypatch.setattr(builtins, "input", fake_input_from(["1", "2"]))
+
+    selection = serial_probe.interactive_menu(options)
+
+    assert selection is not None
+    assert selection.action == "scan"
+    assert selection.workflow == "bank2"
+    assert selection.options.input_baud == 38400
+    assert selection.options.output_baud == 19200
+    assert selection.options.min_baud == 300
+    assert selection.options.max_baud == 9600
+
+
+def test_memory_test_bauds_use_configured_port_bauds() -> None:
+    options = dataclasses.replace(
+        serial_probe.default_scan_options(),
+        input_baud=38400,
+        output_baud=9600,
+        min_baud=300,
+        max_baud=1200,
+    )
+
+    assert serial_probe.default_memory_test_bauds(options) == (38400, 9600)
 
 
 def test_memory_target_presets_and_64k_defaults() -> None:

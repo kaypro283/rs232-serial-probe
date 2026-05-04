@@ -410,6 +410,8 @@ class ScanOptions:
 
     in_port: str
     out_port: str
+    input_baud: int
+    output_baud: int
     min_baud: int
     max_baud: int
     payload_bytes: int
@@ -440,6 +442,7 @@ class MenuSelection:
 
     action: str
     options: ScanOptions
+    workflow: str = ""
 
 
 @dataclass(frozen=True)
@@ -3168,6 +3171,8 @@ def default_scan_options() -> ScanOptions:
     return ScanOptions(
         in_port="COM1",
         out_port="COM5",
+        input_baud=1200,
+        output_baud=1200,
         min_baud=300,
         max_baud=38400,
         payload_bytes=DEFAULT_PAYLOAD_BYTES,
@@ -3202,6 +3207,8 @@ def ensure_run_id(options: ScanOptions, prefix: str = "R") -> ScanOptions:
 def validate_options(options: ScanOptions) -> None:
     """Validate scan options before launching hardware I/O."""
     ensure_distinct_ports(options.in_port, options.out_port)
+    validate_supported_baud(options.input_baud)
+    validate_supported_baud(options.output_baud)
     validate_supported_baud(options.min_baud)
     validate_supported_baud(options.max_baud)
     if options.payload_bytes < minimum_payload_size():
@@ -4614,12 +4621,8 @@ def parse_memory_test_mode_choice(choice: str, fill_available: bool) -> str | No
 
 
 def default_memory_test_bauds(options: ScanOptions) -> tuple[int, int]:
-    """Return default input/output bauds for the memory test prompts."""
-    try:
-        bauds = available_bauds(options.min_baud, options.max_baud)
-    except ValueError:
-        bauds = BAUD_RATES
-    return max(bauds), min(bauds)
+    """Return configured input/output bauds for the memory test."""
+    return options.input_baud, options.output_baud
 
 
 def prompt_supported_baud_or_menu(label: str, current: int) -> int | None:
@@ -4768,25 +4771,22 @@ def prompt_run_memory_test() -> bool:
 
 def prompt_memory_test_config(options: ScanOptions) -> MemoryTestConfig | None:
     """Prompt for one fixed-frame memory test run."""
-    default_input_baud, default_output_baud = default_memory_test_bauds(options)
+    input_baud, output_baud = default_memory_test_bauds(options)
     print()
     print_report_title("MEMORY TEST")
     print("FIXED FRAME: INPUT 8E1, OUTPUT 8E1, FLOW=NONE.")
     print("STREAM TYPE: PRINTABLE ASCII WITH CHECKSUMS.")
     print(f"DEFAULT BUFFER TARGET: {byte_size_detail(MEMORY_TEST_TARGET_BYTES)}.")
     print("TARGET CAN BE SELECTED IN K-SIZED STEPS.")
-    print(f"VALID BAUDS: {supported_baud_label()}.")
-    print("ENTER 0 AT BAUD OR SIZE PROMPT TO RETURN.")
+    print(
+        f"USING OPTION 2 BAUDS: INPUT {input_baud}, OUTPUT {output_baud}."
+    )
+    print("CHANGE COM PORTS OR BAUDS FROM MAIN MENU OPTION 2.")
+    print("ENTER 0 AT SIZE PROMPT TO RETURN.")
     print(border_line(REPORT_WIDTH))
 
     target_bytes = prompt_memory_test_target_bytes(MEMORY_TEST_TARGET_BYTES)
     if target_bytes is None:
-        return None
-    input_baud = prompt_supported_baud_or_menu("INPUT BAUD", default_input_baud)
-    if input_baud is None:
-        return None
-    output_baud = prompt_supported_baud_or_menu("OUTPUT BAUD", default_output_baud)
-    if output_baud is None:
         return None
     mode = prompt_memory_test_mode(input_baud, output_baud, target_bytes)
     if mode is None:
@@ -4923,6 +4923,11 @@ def prompt_start_scan_workflow() -> str:
     return "discovery"
 
 
+def start_scan_workflow_uses_baud_range(workflow: str) -> bool:
+    """Return whether one start-scan workflow needs a baud range prompt."""
+    return workflow in {"discovery", "phase0"}
+
+
 def print_menu_help(paged: bool = True) -> None:
     """Print short help for the interactive CLI."""
     print_paged_lines(
@@ -4934,34 +4939,35 @@ def print_menu_help(paged: bool = True) -> None:
             "",
             "MAIN MENU",
             "  1 START SCAN:      CHOOSE WORKFLOW 1, 2, 3, OR 4.",
-            "  2 SET COM PORTS:   PC INPUT/TRANSMIT AND OUTPUT/READ PORTS.",
-            "  3 SET BAUD RANGE:  SELECT FROM VALID BAUD TABLE.",
+            "  2 SET COM/BAUD:    INPUT/TRANSMIT AND OUTPUT/READ PORTS PLUS BAUDS.",
+            "  3 SCAN/VALIDATE:   MESSAGE SIZE, COUNT, VALIDATION SCOPE.",
             f"  BAUDS:             {supported_baud_label()}.",
-            "  4 SCAN/VALIDATE:   MESSAGE SIZE, COUNT, VALIDATION SCOPE.",
-            "  5 TIMING/STALE:    READ WAITS AND OLD-OUTPUT CLEARING.",
-            "  6 REPORT FILES:    TEXT REPORT AND DEBUG LOG PATHS.",
-            "  7 RESET REPORTS:   RESTORE DEFAULT REPORT FILE NAMES.",
-            "  8 MEMORY TEST:     SELECT 16K..64K ASCII STREAM, 8E1, NO FLOW.",
+            "  4 TIMING/STALE:    READ WAITS AND OLD-OUTPUT CLEARING.",
+            "  5 REPORT FILES:    TEXT REPORT AND DEBUG LOG PATHS.",
+            "  6 RESET REPORTS:   RESTORE DEFAULT REPORT FILE NAMES.",
+            "  7 MEMORY TEST:     SELECT 16K..64K ASCII STREAM, 8E1, NO FLOW.",
             "  S CURRENT SETTINGS: SHOW ACTIVE SETUP.",
             "  ? HELP:            THIS SCREEN.",
             "  0 QUIT:            END PROGRAM.",
             "",
             "START SCAN WORKFLOW",
             "  1 AUTOMATED DISCOVERY: PHASE 0, FRAME SWEEPS, FULL FALLBACK.",
-            "  2 BANK 2 KNOWN-BAUD:  FRAME, 8-BIT, RAW, ETX/ACK, FLOW.",
-            "  3 PHASE 0 ONLY:       BAUD LIVENESS MATRIX ONLY.",
+            "  2 BANK 2 KNOWN-BAUD:  USE OPTION 2 BAUDS; FRAME, 8-BIT, RAW, FLOW.",
+            "  3 PHASE 0 ONLY:       ASK BAUD RANGE, THEN LIVENESS MATRIX ONLY.",
             "  4 RETURN TO MAIN MENU.",
             "",
             "OPERATOR NOTES",
             "  DEVICE PATH:       COM1 -> BUFFER INPUT -> BUFFER OUTPUT -> COM5.",
             "  PROGRAM SETTINGS:  PROGRAM SETS BAUD, FRAME, AND FLOW ON OPEN.",
-            "  PHASE 0 SETTINGS:  FIXED 8E1 FLOW=NONE; OPTION 4 DOES NOT CHANGE IT.",
+            "  OPTION 2 BAUDS:    USED BY BANK 2 AND MEMORY TEST FIXED-BAUD RUNS.",
+            "  BAUD RANGE:        ASKED BY START SCAN 1 AND 3.",
+            "  PHASE 0 SETTINGS:  FIXED 8E1 FLOW=NONE; OPTION 3 DOES NOT CHANGE IT.",
             "  BAUD PAIRS:        INPUT AND OUTPUT BAUDS MAY DIFFER.",
             "  NO PHASE 0 HIT:    SAME-BAUD FRAME FALLBACK OFFERED FOR NARROW RANGE.",
-            "  START 1 SETUP:     OPTION 4 ITEMS 1-6 CAN AFFECT DISCOVERY.",
-            "  START 2 SETUP:     OPTION 4 ITEMS 1, 6, AND 7 CAN AFFECT BANK 2.",
-            "  START 3 SETUP:     OPTION 4 DOES NOT AFFECT PHASE 0 ONLY.",
-            "  MEMORY TEST:       MAIN MENU 8; FIXED 8E1, NO FLOW, ASCII CHECK.",
+            "  START 1 SETUP:     OPTION 3 ITEMS 1-6 CAN AFFECT DISCOVERY.",
+            "  START 2 SETUP:     OPTION 3 ITEMS 1, 6, AND 7 CAN AFFECT BANK 2.",
+            "  START 3 SETUP:     OPTION 3 DOES NOT AFFECT PHASE 0 ONLY.",
+            "  MEMORY TEST:       MAIN MENU 7; FIXED 8E1, NO FLOW, ASCII CHECK.",
             "  STALE DATA:        OLD BUFFER OUTPUT IS CLEARED BEFORE TESTS.",
             "  NONCES:            EACH TEST PAYLOAD HAS RUN/CANDIDATE/TRIAL IDS.",
             "  8-BIT TEST:        SEPARATE HIGH-BIT CHALLENGE; ASCII IS NOT ENOUGH.",
@@ -4988,6 +4994,11 @@ def print_setting(label: str, value: object) -> None:
 
 def print_configuration(options: ScanOptions) -> None:
     """Print the current interactive menu configuration."""
+    fixed_baud_text = (
+        f"IN {options.input_baud} / OUT {options.output_baud}"
+        if options.input_baud != options.output_baud
+        else str(options.input_baud)
+    )
     try:
         bauds = available_bauds(options.min_baud, options.max_baud)
         baud_order = scan_bauds(options.min_baud, options.max_baud)
@@ -5011,12 +5022,26 @@ def print_configuration(options: ScanOptions) -> None:
     lines.extend(
         setting_lines(
             "MEMORY TEST:",
-            "MAIN MENU 8; SELECT 16K..64K ASCII; FIXED 8E1 FLOW=NONE",
+            (
+                "MAIN MENU 7; USES OPTION 2 BAUDS; "
+                "SELECT 16K..64K ASCII; FIXED 8E1 FLOW=NONE"
+            ),
         )
     )
-    lines.extend(setting_lines("PORTS:", f"{options.in_port} -> {options.out_port}"))
     lines.extend(
-        setting_lines("BAUD RANGE:", f"{options.min_baud}..{options.max_baud}")
+        setting_lines(
+            "PORTS/BAUD:",
+            (
+                f"{options.in_port} @ {options.input_baud} -> "
+                f"{options.out_port} @ {options.output_baud}"
+            ),
+        )
+    )
+    lines.extend(
+        setting_lines(
+            "SCAN BAUD RANGE:",
+            f"{options.min_baud}..{options.max_baud} (ASKED IN START SCAN)",
+        )
     )
     lines.extend(setting_lines("BAUDS:", len(bauds)))
     if baud_order:
@@ -5107,7 +5132,12 @@ def print_configuration(options: ScanOptions) -> None:
         )
     )
     lines.extend(setting_lines("TOP ROWS:", options.top))
-    lines.extend(setting_lines("BANK 2 TEST:", "AVAILABLE INSIDE START SCAN"))
+    lines.extend(
+        setting_lines(
+            "BANK 2 TEST:",
+            f"START SCAN 2; USES OPTION 2 BAUDS: {fixed_baud_text}",
+        )
+    )
     lines.extend(setting_lines("REPORT FILE:", options.text_report))
     lines.extend(
         setting_lines("DIP SETTING NOTE:", options.switch_note or "(ASK AT SCAN START)")
@@ -5117,14 +5147,28 @@ def print_configuration(options: ScanOptions) -> None:
     print_paged_lines(lines)
 
 
-def configure_baud_range(options: ScanOptions) -> ScanOptions:
+def configure_baud_range(
+    options: ScanOptions,
+    *,
+    allow_menu: bool = False,
+) -> ScanOptions | None:
     """Prompt for the baud range."""
     print("AVAILABLE BAUD RATES:")
     print(supported_baud_label())
     print("SCAN ORDER: FASTEST SELECTED BAUD FIRST.")
+    if allow_menu:
+        print("ENTER 0 AT EITHER BAUD PROMPT TO RETURN TO MAIN MENU.")
     while prompt_loop_active():
-        min_baud = prompt_supported_baud("MINIMUM BAUD", options.min_baud)
-        max_baud = prompt_supported_baud("MAXIMUM BAUD", options.max_baud)
+        if allow_menu:
+            min_baud = prompt_supported_baud_or_menu("MINIMUM BAUD", options.min_baud)
+            if min_baud is None:
+                return None
+            max_baud = prompt_supported_baud_or_menu("MAXIMUM BAUD", options.max_baud)
+            if max_baud is None:
+                return None
+        else:
+            min_baud = prompt_supported_baud("MINIMUM BAUD", options.min_baud)
+            max_baud = prompt_supported_baud("MAXIMUM BAUD", options.max_baud)
         try:
             available_bauds(min_baud, max_baud)
         except ValueError as exc:
@@ -5136,17 +5180,33 @@ def configure_baud_range(options: ScanOptions) -> ScanOptions:
 
 
 def configure_ports(options: ScanOptions) -> ScanOptions:
-    """Prompt for validated input/output COM ports."""
+    """Prompt for validated input/output COM ports and fixed port bauds."""
+    print("AVAILABLE BAUD RATES:")
+    print(supported_baud_label())
     while prompt_loop_active():
         in_port = prompt_port("INPUT/TRANSMIT PORT", options.in_port)
+        input_baud = prompt_supported_baud(
+            "INPUT/TRANSMIT BAUD",
+            options.input_baud,
+        )
         out_port = prompt_port("OUTPUT/READ PORT", options.out_port)
+        output_baud = prompt_supported_baud(
+            "OUTPUT/READ BAUD",
+            options.output_baud,
+        )
         try:
             ensure_distinct_ports(in_port, out_port)
         except ValueError as exc:
             print(f"PORT ERROR: {exc}")
             print("RE-ENTER COM PORTS.")
             continue
-        return dataclasses.replace(options, in_port=in_port, out_port=out_port)
+        return dataclasses.replace(
+            options,
+            in_port=in_port,
+            out_port=out_port,
+            input_baud=input_baud,
+            output_baud=output_baud,
+        )
     return options
 
 
@@ -7695,15 +7755,6 @@ def print_bank2_report(
     print(border_line(REPORT_WIDTH))
 
 
-def prompt_bank2_known_baud(default: int) -> tuple[int, int]:
-    """Prompt for known input/output baud values."""
-    print("AVAILABLE BAUD RATES:")
-    print(supported_baud_label())
-    input_baud = prompt_supported_baud("KNOWN INPUT BAUD", default)
-    output_baud = prompt_supported_baud("KNOWN OUTPUT BAUD (BLANK=SAME)", input_baud)
-    return input_baud, output_baud
-
-
 def run_second_bank_characterization(options: ScanOptions) -> None:
     """Run a targeted known-baud switch-state characterization."""
     print()
@@ -7721,8 +7772,12 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
         ),
     )
     print(border_line(REPORT_WIDTH))
-    default_baud = options.min_baud if options.min_baud == options.max_baud else 1200
-    input_baud, output_baud = prompt_bank2_known_baud(default_baud)
+    input_baud = options.input_baud
+    output_baud = options.output_baud
+    print_wrapped_value(
+        "KNOWN BAUDS: ",
+        f"INPUT {input_baud}, OUTPUT {output_baud} (MAIN MENU OPTION 2)",
+    )
     switch_note = prompt_text("DIP SETTING NOTE FOR REPORT", options.switch_note)
     independent_frames = prompt_yes_no("TEST INPUT/OUTPUT FRAMES INDEPENDENTLY", True)
     if input_baud != output_baud:
@@ -8583,10 +8638,10 @@ def print_commands() -> None:
     print_banner()
     print(bordered_text("MAIN MENU", SCREEN_WIDTH))
     print(border_line(SCREEN_WIDTH))
-    menu_line("  1  START SCAN", "  2  SET COM PORTS")
-    menu_line("  3  SET BAUD RANGE", "  4  SCAN / VALIDATE SETUP")
-    menu_line("  5  TIMING / STALE DATA", "  6  SET REPORT FILES")
-    menu_line("  7  RESET REPORT FILES", "  8  MEMORY TEST")
+    menu_line("  1  START SCAN", "  2  SET COM PORTS / BAUD")
+    menu_line("  3  SCAN / VALIDATE SETUP", "  4  TIMING / STALE DATA")
+    menu_line("  5  SET REPORT FILES", "  6  RESET REPORT FILES")
+    menu_line("  7  MEMORY TEST")
     menu_line("  S  CURRENT SETTINGS", "  ?  HELP")
     menu_line("  0  QUIT")
     print(border_line(SCREEN_WIDTH))
@@ -8599,35 +8654,46 @@ def interactive_menu(options: ScanOptions | None = None) -> MenuSelection | None
     while prompt_loop_active():
         print_commands()
         try:
-            choice = read_operator_input("COMMAND (1-8,S,?,0): ").lstrip("\ufeff").strip().lower()
+            choice = read_operator_input("COMMAND (1-7,S,?,0): ").lstrip("\ufeff").strip().lower()
         except EOFError:
             return None
 
         if choice == "1":
+            workflow = prompt_start_scan_workflow()
+            if workflow == "menu":
+                continue
+            scan_options = options
+            if start_scan_workflow_uses_baud_range(workflow):
+                print()
+                print_report_title("START SCAN BAUD RANGE")
+                print("SELECT THE BAUD RANGE FOR THIS SCAN.")
+                configured_options = configure_baud_range(options, allow_menu=True)
+                if configured_options is None:
+                    continue
+                scan_options = configured_options
             try:
-                validate_options(options)
+                validate_options(scan_options)
             except ValueError as exc:
                 print(f"SETTINGS ERROR: {exc}")
                 continue
-            return MenuSelection("scan", options)
+            options = scan_options
+            return MenuSelection("scan", options, workflow)
         if choice == "2":
             options = configure_ports(options)
         elif choice == "3":
-            options = configure_baud_range(options)
-        elif choice == "4":
             options = configure_payload(options)
-        elif choice == "5":
+        elif choice == "4":
             options = configure_timing(options)
-        elif choice == "6":
+        elif choice == "5":
             options = configure_reports(options)
-        elif choice == "7":
+        elif choice == "6":
             default_text_report, default_log = default_report_paths()
             options = dataclasses.replace(
                 options,
                 text_report=default_text_report,
                 log_file=default_log,
             )
-        elif choice == "8":
+        elif choice in {"7", "8"}:
             try:
                 validate_options(options)
             except ValueError as exc:
@@ -8641,7 +8707,7 @@ def interactive_menu(options: ScanOptions | None = None) -> MenuSelection | None
         elif choice in {"0", "q", "quit", "exit"}:
             return None
         else:
-            print("ENTER 1-8, S, ?, OR 0.")
+            print("ENTER 1-7, S, ?, OR 0.")
     return None
 
 
@@ -9196,12 +9262,21 @@ def run_dual_bank_scan(
     return 0
 
 
-def run_scan(options: ScanOptions) -> int:
+def run_scan(options: ScanOptions, workflow: str | None = None) -> int:
     """Prompt for and run the selected start-scan workflow."""
-    validate_options(options)
-    workflow = prompt_start_scan_workflow()
+    if workflow is None:
+        workflow = prompt_start_scan_workflow()
+        if start_scan_workflow_uses_baud_range(workflow):
+            print()
+            print_report_title("START SCAN BAUD RANGE")
+            print("SELECT THE BAUD RANGE FOR THIS SCAN.")
+            configured_options = configure_baud_range(options, allow_menu=True)
+            if configured_options is None:
+                raise ReturnToMainMenu()
+            options = configured_options
     if workflow == "menu":
         raise ReturnToMainMenu()
+    validate_options(options)
     if workflow == "bank2":
         run_second_bank_characterization(options)
         return 0
@@ -9886,7 +9961,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if selection.action == "memory":
                     last_status = run_memory_test(options)
                 else:
-                    last_status = run_scan(options)
+                    last_status = run_scan(options, selection.workflow)
                 scan_started = True
                 action = prompt_after_scan_action(
                     run_again_label=run_again_label,

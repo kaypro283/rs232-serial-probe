@@ -25,7 +25,7 @@ Usage screen:
 python serial_probe.py --help
 ```
 
-The first screen is the command menu. Use `S CURRENT SETTINGS` to view ports, baud range, test message size, repeat count, timing, old-output clearing, Phase 0 liveness settings, report files, and available test workflows. `1 START SCAN` opens the discovery workflow menu. `8 MEMORY TEST` runs the fixed-frame memory test.
+The first screen is the command menu. Use `S CURRENT SETTINGS` to view ports, each port's configured baud, the last scan baud range, test message size, repeat count, timing, old-output clearing, Phase 0 liveness settings, report files, and available test workflows. `1 START SCAN` opens the discovery workflow menu. `7 MEMORY TEST` runs the fixed-frame memory test.
 
 The terminal UI is written for an 80-column by 25-line early terminal style. Long operator screens pause with `PRESS ENTER FOR MORE, Q TO STOP:`. Screens use terse uppercase operator text and bright green text when the console supports ANSI color. PyCharm runs are treated as color-capable. Set `NO_COLOR=1` before running if you want plain console text.
 
@@ -37,7 +37,7 @@ Suggested first run for this COM1-to-COM5 setup:
 python serial_probe.py
 ```
 
-Use the default settings, then select `1. Start scan`.
+Use the default settings or set ports and fixed bauds with `2 SET COM PORTS / BAUD`, then select `1 START SCAN`. Discovery and Phase 0 ask for the baud range inside that start-scan workflow.
 
 After a scan finishes or is interrupted by the operator, the program stays in the terminal UI and asks whether to run the same settings again, return to the main menu, or quit.
 
@@ -45,13 +45,13 @@ During a running scan or validation pass, press `Ctrl+C` for the `OPERATOR BREAK
 
 ## Memory Test
 
-Select `8 MEMORY TEST` from the main menu to send a checked ASCII printer-style stream through the buffer and compare the output byte for byte.
+Select `7 MEMORY TEST` from the main menu to send a checked ASCII printer-style stream through the buffer and compare the output byte for byte.
 
 The memory test is deliberately separate from scan discovery:
 
 - Fixed frame: `8E1`.
 - Flow control: `none`.
-- User-selected input baud and output baud from the supported baud table.
+- Input baud and output baud from `2 SET COM PORTS / BAUD`.
 - Append-only loop blocks and a final summary in the normal text report.
 - Result fields separate exact stream return, returned-data integrity, capacity behavior, and RAM suspicion.
 - In `FILL` mode, dropped excess bytes can be a useful `BUFFER FULL OBSERVED` result rather than a generic problem.
@@ -68,7 +68,7 @@ The memory test first asks for a target size. Presets cover 16K, 32K, 48K, and 6
 
 `CUSTOM` is useful after an overflow-like result: lower the payload and rerun to bracket the largest clean near-fill transfer without forcing another overflow-stress run.
 
-Before starting, the memory test asks for a finite loop count, whether `FULL` counts as `OK`, and whether to stop on the first unexpected result. The default is one loop, counting `FULL` as `OK` for fill-mode tests, and stopping when a loop needs operator review.
+Before starting, the memory test asks for a finite loop count, whether `FULL` counts as `OK`, and whether to stop on the first unexpected result. Baud changes are made once from the main menu in `2 SET COM PORTS / BAUD`. The default is one loop, counting `FULL` as `OK` for fill-mode tests, and stopping when a loop needs operator review.
 
 At low output baud rates this test can take a long time. A full 64K stream at `300` baud with `8E1` framing takes more than 35 minutes to drain, before any safety margin.
 
@@ -95,9 +95,11 @@ Select `1 START SCAN` from the main menu to choose one of the scan workflows:
 4 RETURN TO MAIN MENU
 ```
 
-`AUTOMATED DISCOVERY` starts with Phase 0 baud liveness, then runs staged input/output frame sweeps and a full matrix fallback only when needed. It can validate the top match afterward, depending on `4 SCAN / VALIDATE SETUP`.
+`AUTOMATED DISCOVERY` starts with Phase 0 baud liveness, then runs staged input/output frame sweeps and a full matrix fallback only when needed. It can validate the top match afterward, depending on `3 SCAN / VALIDATE SETUP`.
 
-`BANK 2 SWITCH-STATE TEST USING KNOWN BAUD` is for a switch bank or buffer mode where you already know the input and output baud. It runs targeted ASCII, 8-bit, raw byte behavior, ETX/ACK, and flow validation checks.
+After choosing `AUTOMATED DISCOVERY` or `PHASE 0 BAUD LIVENESS ONLY`, the workflow asks for the baud range for that run.
+
+`BANK 2 SWITCH-STATE TEST USING KNOWN BAUD` is for a switch bank or buffer mode where you already know the input and output baud. It uses the fixed input/output bauds configured in `2 SET COM PORTS / BAUD`, then runs targeted ASCII, 8-bit, raw byte behavior, ETX/ACK, and flow validation checks.
 
 The raw byte behavior phase runs several payload classes after a likely frame is found: CR-only, LF-only, CR/LF, printer-control bytes with TAB/FF/ESC, printable ASCII `0x20..0x7E`, 7-bit controls excluding XON/XOFF, and 7-bit controls including XON/XOFF. Its report compares bytes exactly and records sent/read counts, sent and received hashes, first mismatch offset, and missing/extra byte counts. If the XON/XOFF-free control sweep is exact but the full control sweep changes, the report calls out that XON/XOFF control bytes affected the raw path.
 
@@ -131,7 +133,7 @@ The default baud list is:
 300, 1200, 2400, 4800, 9600, 19200, 38400
 ```
 
-The scan tries the fastest selected baud rate first, then works downward. With the default range, it starts at `38400` and ends at `300`. Automated discovery starts with Phase 0 and staged frame sweeps; it runs the larger full matrix only when the staged checks do not find a strong pair.
+The scan tries the fastest selected baud rate first, then works downward. With the default range, it starts at `38400` and ends at `300`. The range is selected inside `1 START SCAN` for automated discovery and Phase 0 runs. Automated discovery starts with Phase 0 and staged frame sweeps; it runs the larger full matrix only when the staged checks do not find a strong pair.
 
 ## Speed
 
