@@ -326,6 +326,72 @@ def test_memory_loop_status_and_summary_use_neutral_terms() -> None:
     assert serial_probe.memory_test_summary_status(config, [result], False) == "OK"
 
 
+def test_memory_test_high_bit_ascii_output_reports_frame_issue() -> None:
+    nonce = serial_probe.ProbeNonce("RUNTEST", "MEMORY", "L001", None)
+    payload = serial_probe.generate_payload(1024, nonce)
+    received = bytes(byte | 0x80 for byte in payload.data[:768])
+    score = serial_probe.score_received(payload.data, received)
+    trial = serial_probe.TrialResult(
+        burst_index=1,
+        bytes_sent=payload.byte_count,
+        bytes_received=len(received),
+        bytes_drained_before=0,
+        drain_status="quiet",
+        score=score.score,
+        metrics=score.metrics,
+        status="weak",
+        error=None,
+        elapsed_sec=0.0,
+        timing=serial_probe.zero_timing_breakdown(),
+        received_preview_ascii="",
+        received_preview_hex="",
+        score_classification=score.classification,
+        evidence=score.evidence,
+        nonce_summary=nonce.compact(),
+        payload_mode=payload.payload_mode,
+        bytes_received_at_write_done=100,
+    )
+    settings = serial_probe.memory_test_settings(38400, 19200)
+    candidate = serial_probe.aggregate_candidate_result(
+        index=1,
+        total=1,
+        settings=settings,
+        trials=[trial],
+        elapsed_sec=0.0,
+    )
+    result = serial_probe.MemoryTestResult(
+        config=serial_probe.MemoryTestConfig(
+            in_port="COM1",
+            out_port="COM5",
+            input_baud=38400,
+            output_baud=19200,
+            mode=serial_probe.MEMORY_TEST_MODE_FILL,
+            payload_bytes=payload.byte_count,
+            target_bytes=512,
+            loop_count=1,
+            accept_full_result=True,
+            stop_on_unexpected=True,
+            switch_note="",
+            run_id=nonce.run_id,
+        ),
+        settings=settings,
+        payload=payload,
+        purge=serial_probe.DrainResult(0, 0.0, True, "quiet", None),
+        candidate=candidate,
+        loop_index=1,
+        loop_total=1,
+        started_at="",
+        completed_at="",
+        elapsed_sec=0.0,
+    )
+
+    diagnosis = serial_probe.memory_test_diagnosis(result)
+
+    assert diagnosis.code == "probable-frame-mismatch"
+    assert serial_probe.memory_test_loop_status(diagnosis) == "FRAME"
+    assert diagnosis.ram_check == "NOT JUDGED"
+
+
 def test_bank2_behavior_payload_classes_cover_control_ranges() -> None:
     payloads = dict(serial_probe.bank2_behavior_probe_payloads("B2RUN", 1, None))
 

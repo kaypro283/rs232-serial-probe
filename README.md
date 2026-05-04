@@ -54,7 +54,8 @@ The memory test is deliberately separate from scan discovery:
 - Input baud and output baud from `2 SET COM PORTS / BAUD`.
 - Append-only loop blocks and a final summary in the normal text report.
 - Result fields separate exact stream return, returned-data integrity, capacity behavior, and RAM suspicion.
-- In `FILL` mode, dropped excess bytes can be a useful `BUFFER FULL OBSERVED` result rather than a generic problem.
+- In `FILL` mode, dropped excess bytes can be a useful clean-full result rather than a generic problem.
+- If the fixed `8E1` memory frame does not match the buffer output frame, ASCII output may contain high-bit/framing-looking bytes. The report treats that as `CHECK SERIAL FRAME` and does not judge RAM from that run.
 
 The memory test first asks for a target size. Presets cover 16K, 32K, 48K, and 64K, and the custom choice accepts a K-sized target. The size menu then uses that target:
 
@@ -68,14 +69,14 @@ The memory test first asks for a target size. Presets cover 16K, 32K, 48K, and 6
 
 `CUSTOM` is useful after an overflow-like result: lower the payload and rerun to bracket the largest clean near-fill transfer without forcing another overflow-stress run.
 
-Before starting, the memory test asks for a finite loop count, whether `FULL` counts as `OK`, and whether to stop on the first unexpected result. Baud changes are made once from the main menu in `2 SET COM PORTS / BAUD`. The default is one loop, counting `FULL` as `OK` for fill-mode tests, and stopping when a loop needs operator review.
+Before starting, the memory test asks for a finite loop count, whether `CLEAN FULL` counts as `OK`, and whether to stop on the first unexpected result. Baud changes are made once from the main menu in `2 SET COM PORTS / BAUD`. The default is one loop, counting clean `FULL` as `OK` for fill-mode tests, and stopping when a loop needs operator review. `CLEAN FULL OK` applies only to `STATUS: FULL`; `FRAME`, `CHECK`, `STALE`, and `ERROR` still stop when `STOP ON UNEXPECTED` is `YES`.
 
 At low output baud rates this test can take a long time. A full 64K stream at `300` baud with `8E1` framing takes more than 35 minutes to drain, before any safety margin.
 
 Interpretation is part of the memory-test report:
 
 - `RESULT` gives the operator-level outcome, such as `EXACT STREAM RETURNED`, `BUFFER FULL OBSERVED`, or `CHECK DATA`.
-- `STATUS` is terse: `OK`, `FULL`, `SHORT`, `CHANGED`, `STALE`, `ERROR`, or `CHECK`.
+- `STATUS` is terse: `OK`, `FULL`, `SHORT`, `FRAME`, `CHANGED`, `STALE`, `ERROR`, or `CHECK`.
 - `DATA CHECK` says whether returned bytes matched.
 - `CAPACITY CHECK` says whether the run observed full/overflow behavior.
 - `RAM CHECK` says whether the returned bytes suggest a RAM/data-path fault.

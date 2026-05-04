@@ -319,6 +319,7 @@ class ScoreMetrics:
     high_bit_bytes_received: int = 0
     high_bit_exact_ratio: float = 0.0
     high_bit_stripped_count: int = 0
+    seven_bit_masked_match_ratio: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -993,6 +994,19 @@ def eight_bit_footer(
     ).encode("ascii")
 
 
+def seven_bit_masked_match_ratio(expected: bytes, received: bytes) -> float:
+    """Return match ratio after clearing the received high bit."""
+    compared = min(len(expected), len(received))
+    if compared <= 0:
+        return 0.0
+    matches = sum(
+        1
+        for expected_byte, received_byte in zip(expected[:compared], received[:compared])
+        if expected_byte == (received_byte & 0x7F)
+    )
+    return matches / compared
+
+
 def minimum_eight_bit_payload_size(nonce: ProbeNonce | None = None) -> int:
     """Return the smallest useful eight-bit challenge payload size."""
     size_nonce = representative_nonce() if nonce is None else nonce
@@ -1091,6 +1105,7 @@ def score_eight_bit_received(expected: bytes, received: bytes) -> ScoreResult:
     high_received = 0
     high_exact_ratio = 0.0
     high_stripped = 0
+    masked_ratio = seven_bit_masked_match_ratio(expected, received)
     block_slice = eight_bit_payload_slices(expected)
     if block_slice is not None:
         start, stop = block_slice
@@ -1124,6 +1139,7 @@ def score_eight_bit_received(expected: bytes, received: bytes) -> ScoreResult:
         high_bit_bytes_received=high_received,
         high_bit_exact_ratio=high_exact_ratio,
         high_bit_stripped_count=high_stripped,
+        seven_bit_masked_match_ratio=masked_ratio,
     )
 
     if not received:
@@ -1185,6 +1201,9 @@ def score_received(expected: bytes, received: bytes) -> ScoreResult:
     )
     line_ratio = matching_lines / max(len(expected_lines), 1)
     ascii_ratio = printable_ascii_ratio(received)
+    high_sent = sum(1 for byte in expected if byte >= 0x80)
+    high_received = sum(1 for byte in received if byte >= 0x80)
+    masked_ratio = seven_bit_masked_match_ratio(expected, received)
     start_marker = b"<<<SERIAL_PROBE_BEGIN" in received
     end_marker = b"<<<SERIAL_PROBE_END" in received
     marker_ratio = (int(start_marker) + int(end_marker)) / 2
@@ -1236,6 +1255,9 @@ def score_received(expected: bytes, received: bytes) -> ScoreResult:
         valid_probe_line_count=len(received_parsed_lines),
         current_nonce_line_count=current_nonce_lines,
         wrong_nonce_line_count=wrong_nonce_lines,
+        high_bit_bytes_sent=high_sent,
+        high_bit_bytes_received=high_received,
+        seven_bit_masked_match_ratio=masked_ratio,
     )
     return ScoreResult(
         score=max(0.0, min(100.0, confidence)),
@@ -2375,6 +2397,9 @@ def aggregate_metrics(trials: Sequence[TrialResult]) -> ScoreMetrics:
         ),
         high_bit_stripped_count=sum(
             trial.metrics.high_bit_stripped_count for trial in trials
+        ),
+        seven_bit_masked_match_ratio=statistics.fmean(
+            trial.metrics.seven_bit_masked_match_ratio for trial in trials
         ),
     )
 
@@ -4869,7 +4894,7 @@ def prompt_memory_test_config(options: ScanOptions) -> MemoryTestConfig | None:
         maximum=MEMORY_TEST_MAX_LOOPS,
     )
     accept_full_result = prompt_yes_no(
-        "FULL COUNTS AS OK",
+        "CLEAN FULL COUNTS OK",
         mode == MEMORY_TEST_MODE_FILL,
     )
     stop_on_unexpected = prompt_yes_no("STOP ON UNEXPECTED", True)
@@ -4902,7 +4927,7 @@ def prompt_memory_test_config(options: ScanOptions) -> MemoryTestConfig | None:
     print(f"  TARGET:              {byte_size_detail(target_bytes)}")
     print(f"  PAYLOAD:             {payload_bytes} ASCII BYTES")
     print(f"  LOOPS:               {loop_count}")
-    print(f"  FULL COUNTS OK:      {yes_no_text(accept_full_result)}")
+    print(f"  CLEAN FULL OK:       {yes_no_text(accept_full_result)}")
     print(f"  STOP UNEXPECTED:     {yes_no_text(stop_on_unexpected)}")
     print(f"  EST. PEAK BUFFER:    {peak_estimate} BYTES")
     print(f"  INPUT:               {input_baud} 8E1 NONE")
@@ -4919,6 +4944,8 @@ def prompt_memory_test_config(options: ScanOptions) -> MemoryTestConfig | None:
         print("  NOTE:                FILL MODE TRIES TO OVERFILL THE BUFFER.")
         print("                       IF START MATCHES BUT END IS MISSING,")
         print("                       THE BUFFER IS PROBABLY FULL.")
+        print("                       CLEAN FULL OK APPLIES ONLY TO STATUS FULL.")
+        print("                       FRAME, CHECK, STALE, OR ERROR ARE NOT FULL.")
     if mode == MEMORY_TEST_MODE_CUSTOM:
         print("  NOTE:                CUSTOM SIZE IS FOR BRACKETING NEAR-FILL")
         print("                       WITHOUT FORCING THE OVERFLOW-STRESS SIZE.")
@@ -8099,6 +8126,8 @@ def memory_test_loop_status(diagnosis: MemoryTestDiagnosis) -> str:
         return "FULL"
     if diagnosis.code == "clean-prefix-incomplete":
         return "SHORT"
+    if diagnosis.code == "probable-frame-mismatch":
+        return "FRAME"
     if diagnosis.code in {"missing-with-content-errors", "possible-content-corruption"}:
         return "CHANGED"
     if diagnosis.code == "extra-output":
@@ -8143,6 +8172,30 @@ def memory_test_completeness_ratio(
     return min(candidate.bytes_received, payload.byte_count) / payload.byte_count
 
 
+def memory_test_frame_mismatch_likely(
+    candidate: CandidateResult,
+    payload: ProbePayload,
+) -> bool:
+    """Return True when ASCII memory output looks like wrong serial framing."""
+    metrics = candidate.metrics
+    if payload.payload_mode != PAYLOAD_MODE_ASCII:
+        return False
+    if metrics.high_bit_bytes_sent:
+        return False
+    if candidate.bytes_received <= 0:
+        return False
+    high_bit_ratio = metrics.high_bit_bytes_received / max(candidate.bytes_received, 1)
+    enough_high_bits = metrics.high_bit_bytes_received >= max(
+        8,
+        int(candidate.bytes_received * 0.02),
+    )
+    structure_broken = (
+        metrics.line_integrity_ratio < 0.50
+        or metrics.printable_ascii_ratio < 0.95
+    )
+    return enough_high_bits and high_bit_ratio >= 0.02 and structure_broken
+
+
 def memory_test_diagnosis(result: MemoryTestResult) -> MemoryTestDiagnosis:
     """Classify one memory-test result for operator interpretation."""
     candidate = result.candidate
@@ -8161,6 +8214,11 @@ def memory_test_diagnosis(result: MemoryTestResult) -> MemoryTestDiagnosis:
     target_label = byte_size_label(result.config.target_bytes)
     post_write_near_target = (
         delivered_after_write_done >= int(result.config.target_bytes * 0.90)
+    )
+    fill_pressure_seen = (
+        result.config.mode in {MEMORY_TEST_MODE_FILL, MEMORY_TEST_MODE_CUSTOM}
+        and write_pressure >= result.config.target_bytes
+        and post_write_near_target
     )
     peak_estimate = estimated_memory_test_peak_fill_bytes(
         result.config.input_baud,
@@ -8270,13 +8328,27 @@ def memory_test_diagnosis(result: MemoryTestResult) -> MemoryTestDiagnosis:
             "UNKNOWN",
             "CLEAR OLD DATA OR CHECK BAUD/FRAME BEFORE RAM TESTING.",
         )
+    if memory_test_frame_mismatch_likely(candidate, payload):
+        capacity_text = "FULL / OVERFLOW INDICATED" if fill_pressure_seen else "UNKNOWN"
+        return diagnosis(
+            "probable-frame-mismatch",
+            "CHECK SERIAL FRAME",
+            (
+                "ASCII STREAM RETURNED HIGH-BIT/FRAMING-LIKE BYTES; "
+                "DATA CANNOT BE JUDGED."
+            ),
+            "NO",
+            "UNUSABLE UNTIL FRAME MATCHES",
+            capacity_text,
+            "NOT JUDGED",
+            "RUN BANK 2 FRAME TEST OR MATCH THE MEMORY TEST FRAME BEFORE RAM CHECK.",
+        )
     if (
         metrics.missing_bytes
         and clean_prefix
         and trial is not None
         and result.config.mode in {MEMORY_TEST_MODE_FILL, MEMORY_TEST_MODE_CUSTOM}
-        and write_pressure >= result.config.target_bytes
-        and post_write_near_target
+        and fill_pressure_seen
     ):
         return diagnosis(
             "probable-overflow-clean",
@@ -8364,7 +8436,7 @@ def write_memory_test_text_report(path: Path, result: MemoryTestResult) -> None:
         f"MODE:            {mode_label}",
         f"TARGET:          {byte_size_detail(result.config.target_bytes)}",
         (
-            f"POLICY:          FULL OK={yes_no_text(result.config.accept_full_result)} "
+            f"POLICY:          CLEAN FULL OK={yes_no_text(result.config.accept_full_result)} "
             f"STOP={yes_no_text(result.config.stop_on_unexpected)}"
         ),
         f"COM PATH:        {result.config.in_port} -> BUFFER -> {result.config.out_port}",
@@ -8383,6 +8455,7 @@ def write_memory_test_text_report(path: Path, result: MemoryTestResult) -> None:
         f"COMPLETE:        {diagnosis.completeness_ratio:.3f}",
         f"MATCHED START:   {diagnosis.exact_prefix_bytes} BYTE(S)",
         f"LINE CHECKS:     {metrics.valid_probe_line_count}/{payload.line_count}",
+        f"HIGH-BIT TX/RX:  {metrics.high_bit_bytes_sent}/{metrics.high_bit_bytes_received}",
         f"MISSING/EXTRA:   {metrics.missing_bytes}/{metrics.extra_bytes}",
         f"READ/POST/PRESS: {diagnosis.bytes_received_at_write_done}/"
         f"{diagnosis.bytes_delivered_after_write_done}/{diagnosis.write_pressure_bytes}",
@@ -8431,6 +8504,11 @@ def print_memory_test_report(result: MemoryTestResult, report_path: Path) -> Non
         f"COMPLETE: {diagnosis.completeness_ratio:.3f}"
     )
     print(f"  MISS/EXTRA: {metrics.missing_bytes}/{metrics.extra_bytes}")
+    if metrics.high_bit_bytes_sent or metrics.high_bit_bytes_received:
+        print(
+            f"  HIGH-BIT:   SENT={metrics.high_bit_bytes_sent} "
+            f"READ={metrics.high_bit_bytes_received}"
+        )
     print(f"  PEAK EST.:  {peak_estimate} BYTES")
     print(f"  PURGE:      {result.purge.bytes_drained} BYTES, {result.purge.reason.upper()}")
     print(f"  ELAPSED:    {format_duration(result.elapsed_sec)}")
@@ -8457,7 +8535,19 @@ def memory_test_summary_status(
 
 def memory_test_summary_counts(results: Sequence[MemoryTestResult]) -> dict[str, int]:
     """Return counts by terse memory-test loop status."""
-    counts = {status: 0 for status in ("OK", "FULL", "SHORT", "CHANGED", "STALE", "ERROR", "CHECK")}
+    counts = {
+        status: 0
+        for status in (
+            "OK",
+            "FULL",
+            "SHORT",
+            "CHANGED",
+            "FRAME",
+            "STALE",
+            "ERROR",
+            "CHECK",
+        )
+    }
     for result in results:
         status = memory_test_loop_status(memory_test_diagnosis(result))
         counts[status] = counts.get(status, 0) + 1
@@ -8485,13 +8575,13 @@ def write_memory_test_summary_report(
         f"MODE:            {mode_label}",
         f"LOOPS:           {len(results)}/{config.loop_count}",
         (
-            f"POLICY:          FULL OK={yes_no_text(config.accept_full_result)} "
+            f"POLICY:          CLEAN FULL OK={yes_no_text(config.accept_full_result)} "
             f"STOP={yes_no_text(config.stop_on_unexpected)}"
         ),
         f"OK/FULL:         {counts['OK']}/{counts['FULL']}",
         f"SHORT/CHANGED:   {counts['SHORT']}/{counts['CHANGED']}",
+        f"FRAME/CHECK:     {counts['FRAME']}/{counts['CHECK']}",
         f"STALE/ERROR:     {counts['STALE']}/{counts['ERROR']}",
-        f"CHECK:           {counts['CHECK']}",
         f"TOTAL ELAPSED:   {format_duration(total_elapsed)}",
         border_line(REPORT_WIDTH),
     ]
@@ -8515,8 +8605,8 @@ def print_memory_test_summary(
     print(f"  LOOPS:      {len(results)}/{config.loop_count}")
     print(f"  OK/FULL:    {counts['OK']}/{counts['FULL']}")
     print(f"  SHORT/CHG:  {counts['SHORT']}/{counts['CHANGED']}")
+    print(f"  FRAME/CHK:  {counts['FRAME']}/{counts['CHECK']}")
     print(f"  STALE/ERR:  {counts['STALE']}/{counts['ERROR']}")
-    print(f"  CHECK:      {counts['CHECK']}")
     print(f"  TOTAL:      {format_duration(total_elapsed)}")
     print_wrapped_value("  REPORT:     ", f"{report_path} (APPENDED)")
     print(border_line(REPORT_WIDTH))
@@ -8548,9 +8638,12 @@ def run_memory_test(options: ScanOptions) -> int:
     )
     print(
         f"LOOPS: {config.loop_count}; "
-        f"FULL COUNTS OK: {yes_no_text(config.accept_full_result)}."
+        f"CLEAN FULL OK: {yes_no_text(config.accept_full_result)}."
     )
     print(f"STOP ON UNEXPECTED: {yes_no_text(config.stop_on_unexpected)}.")
+    if config.accept_full_result:
+        print("CLEAN FULL OK APPLIES ONLY TO STATUS FULL.")
+        print("FRAME, CHECK, STALE, OR ERROR STILL STOP WHEN STOP=YES.")
     print_wrapped_value(
         "PORTS: ",
         f"{options.in_port} -> BUFFER -> {options.out_port}.",
@@ -8570,7 +8663,7 @@ def run_memory_test(options: ScanOptions) -> int:
         "EXACT STREAM, DATA CHECK, CAPACITY CHECK, AND RAM CHECK.",
     )
     if config.mode == MEMORY_TEST_MODE_FILL:
-        print("FILL MODE MAY REPORT BUFFER FULL WHEN EXCESS BYTES ARE DROPPED.")
+        print("FILL MODE MAY REPORT CLEAN FULL WHEN EXCESS BYTES ARE DROPPED.")
     print_progress_legend()
     print(border_line(REPORT_WIDTH))
 
@@ -8665,8 +8758,14 @@ def run_memory_test(options: ScanOptions) -> int:
         write_memory_test_text_report(options.text_report, result)
         print_memory_test_report(result, options.text_report)
         if config.stop_on_unexpected and not memory_test_result_expected(result):
+            loop_status = memory_test_loop_status(memory_test_diagnosis(result))
             stopped_on_unexpected = True
-            print("STOPPING: LOOP RESULT NEEDS CHECK.")
+            if config.accept_full_result and loop_status != "FULL":
+                print("CLEAN FULL OK APPLIES ONLY TO STATUS FULL.")
+            if loop_status == "FRAME":
+                print("STOPPING: LOOP RESULT NEEDS SERIAL FRAME CHECK.")
+            else:
+                print("STOPPING: LOOP RESULT NEEDS CHECK.")
             break
 
     total_elapsed = time.monotonic() - total_started
@@ -9694,6 +9793,71 @@ def run_self_tests() -> int:
     assert (
         "MISSING" in memory_test_reason(missing_memory, memory_payload)
     ), "missing memory-test byte reason was not clear"
+    frame_payload = generate_payload(1024, nonce_a)
+    frame_received = bytes(byte | 0x80 for byte in frame_payload.data[:768])
+    frame_score = score_received(frame_payload.data, frame_received)
+    frame_trial = TrialResult(
+        burst_index=1,
+        bytes_sent=frame_payload.byte_count,
+        bytes_received=len(frame_received),
+        bytes_drained_before=0,
+        drain_status="quiet",
+        score=frame_score.score,
+        metrics=frame_score.metrics,
+        status="weak",
+        error=None,
+        elapsed_sec=0.0,
+        timing=zero_timing_breakdown(),
+        received_preview_ascii="",
+        received_preview_hex="",
+        score_classification=frame_score.classification,
+        evidence=frame_score.evidence,
+        nonce_summary=nonce_a.compact(),
+        payload_mode=frame_payload.payload_mode,
+        bytes_received_at_write_done=100,
+    )
+    frame_candidate = aggregate_candidate_result(
+        index=1,
+        total=1,
+        settings=memory_test_settings(38400, 19200),
+        trials=[frame_trial],
+        elapsed_sec=0.0,
+    )
+    frame_result = MemoryTestResult(
+        config=MemoryTestConfig(
+            in_port="COM1",
+            out_port="COM5",
+            input_baud=38400,
+            output_baud=19200,
+            mode=MEMORY_TEST_MODE_FILL,
+            payload_bytes=frame_payload.byte_count,
+            target_bytes=512,
+            loop_count=1,
+            accept_full_result=True,
+            stop_on_unexpected=True,
+            switch_note="",
+            run_id=nonce_a.run_id,
+        ),
+        settings=memory_test_settings(38400, 19200),
+        payload=frame_payload,
+        purge=DrainResult(0, 0.0, True, "quiet", None),
+        candidate=frame_candidate,
+        loop_index=1,
+        loop_total=1,
+        started_at="",
+        completed_at="",
+        elapsed_sec=0.0,
+    )
+    frame_diagnosis = memory_test_diagnosis(frame_result)
+    assert (
+        frame_diagnosis.code == "probable-frame-mismatch"
+    ), "high-bit ASCII memory output should be treated as a serial frame issue"
+    assert (
+        memory_test_loop_status(frame_diagnosis) == "FRAME"
+    ), "frame-like memory output should use FRAME loop status"
+    assert (
+        frame_diagnosis.ram_check == "NOT JUDGED"
+    ), "frame-like memory output should not imply RAM trouble"
     overflow_target = 16 * KIB_BYTES
     overflow_payload = generate_payload(overflow_target * 2, nonce_a)
     overflow_received = overflow_payload.data[:26945]
