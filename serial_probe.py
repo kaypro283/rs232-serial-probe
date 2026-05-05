@@ -4069,19 +4069,27 @@ def write_phase0_text_report(
 ) -> None:
     """Write a Phase 0 or early-exit report block to the text report."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    created = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-    switch_note = str(metadata.get("switch_note") or "").strip()
+    created = terminal_text(
+        dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    )
+    switch_note = terminal_text(str(metadata.get("switch_note") or "").strip())
+    started_at = terminal_text(metadata.get("started_at", ""))
+    completed_at = terminal_text(metadata.get("completed_at", ""))
+    run_id = terminal_text(metadata.get("run_id", ""))
+    workflow = terminal_text(metadata.get("workflow", ""))
+    in_port = terminal_text(metadata.get("in_port", ""))
+    out_port = terminal_text(metadata.get("out_port", ""))
     lines = [
         "",
         border_line(REPORT_WIDTH),
         bordered_text("SERIAL PROBE PHASE 0 REPORT", REPORT_WIDTH),
         border_line(REPORT_WIDTH),
         f"WRITTEN:         {created}",
-        f"STARTED UTC:     {metadata.get('started_at', '')}",
-        f"COMPLETED UTC:   {metadata.get('completed_at', '')}",
-        f"RUN ID:          {metadata.get('run_id', '')}",
-        f"WORKFLOW:        {metadata.get('workflow', '')}",
-        f"COM PATH:        {metadata.get('in_port')} >> BUFFER >> {metadata.get('out_port')}",
+        f"STARTED UTC:     {started_at}",
+        f"COMPLETED UTC:   {completed_at}",
+        f"RUN ID:          {run_id}",
+        f"WORKFLOW:        {workflow}",
+        f"COM PATH:        {in_port} >> BUFFER >> {out_port}",
         f"DEVICE NOTE:     {switch_note if switch_note else '(NOT ENTERED)'}",
     ]
     lines.extend(
@@ -4434,8 +4442,14 @@ def write_dual_bank_text_report(
     """Write a compact dual-bank scan report entry."""
     path.parent.mkdir(parents=True, exist_ok=True)
     validation_results = [] if validation_results is None else list(validation_results)
-    created = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-    switch_note = str(metadata.get("switch_note") or "").strip()
+    created = terminal_text(
+        dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    )
+    switch_note = terminal_text(str(metadata.get("switch_note") or "").strip())
+    started_at = terminal_text(metadata.get("started_at", ""))
+    run_id = terminal_text(metadata.get("run_id", ""))
+    in_port = terminal_text(metadata.get("in_port", ""))
+    out_port = terminal_text(metadata.get("out_port", ""))
     selected_pairs = ", ".join(
         f"IN {input_baud}/OUT {output_baud}"
         for input_baud, output_baud in phase0.selected_pairs
@@ -4446,9 +4460,9 @@ def write_dual_bank_text_report(
         bordered_text("SERIAL PROBE DUAL-BANK REPORT", REPORT_WIDTH),
         border_line(REPORT_WIDTH),
         f"WRITTEN:         {created}",
-        f"STARTED UTC:     {metadata.get('started_at', '')}",
-        f"RUN ID:          {metadata.get('run_id', '')}",
-        f"COM PATH:        {metadata.get('in_port')} >> BUFFER >> {metadata.get('out_port')}",
+        f"STARTED UTC:     {started_at}",
+        f"RUN ID:          {run_id}",
+        f"COM PATH:        {in_port} >> BUFFER >> {out_port}",
         f"DEVICE NOTE:     {switch_note if switch_note else '(NOT ENTERED)'}",
         "SCAN MODEL:      INPUT/OUTPUT PAIR TESTED; SWITCH MEANING NOT ASSUMED",
         (
@@ -4547,7 +4561,9 @@ def validate_report_path(path: Path) -> None:
 def prompt_text(label: str, current: str) -> str:
     """Prompt for a string value, preserving current on blank input."""
     try:
-        value = read_operator_input(f"{label.upper()} [{current}]: ").strip()
+        value = read_operator_input(
+            f"{label.upper()} [{terminal_text(current)}]: "
+        ).strip()
     except EOFError:
         return current
     return current if value == "" else value
@@ -4740,48 +4756,95 @@ def start_scan_workflow_uses_baud_range(workflow: str) -> bool:
 
 
 def print_menu_help(paged: bool = True) -> None:
-    """Print short help for the interactive CLI."""
+    """Print first-run operator help for the interactive CLI."""
+    text_report, debug_log = default_report_paths()
     print_paged_lines(
         [
             *banner_lines(),
             "START: PYTHON SERIAL_PROBE.PY",
             "",
-            "HELP",
+            "HELP - OPERATOR BRIEFING",
             "",
-            "MAIN MENU",
-            "  1 START SCAN:      CHOOSE WORKFLOW 1, 2, 3, OR 4.",
-            "  2 SET COM/BAUD:    INPUT/TRANSMIT AND OUTPUT/READ PORTS PLUS BAUDS.",
-            "  3 SCAN/VALIDATE:   MESSAGE SIZE, COUNT, VALIDATION SCOPE.",
-            f"  BAUDS:             {supported_baud_label()}.",
-            "  4 TIMING/STALE:    PER-TEST READ WAITS AND QUICK OLD-OUTPUT CLEARING.",
-            "  5 CURRENT SETTINGS: SHOW ACTIVE SETUP.",
-            "  6 HELP:            THIS SCREEN.",
-            "  0 QUIT:            END PROGRAM.",
+            "WHAT THIS PROGRAM DOES",
+            "  SERIAL PROBE FINDS SERIAL SWITCH SETTINGS FOR A PRINTER BUFFER.",
+            "  IT SENDS KNOWN TEST DATA INTO ONE COM PORT AND READS ANOTHER.",
+            "  THE REPORT RANKS BAUD, DATA BITS, PARITY, STOP BITS, AND FLOW.",
+            "  IT IS A TEST SET, NOT A TERMINAL EMULATOR OR MODEM PROGRAM.",
+            "",
+            "NORMAL HOOK-UP",
+            "  PC COM1 TRANSMITS TO BUFFER INPUT.",
+            "  BUFFER OUTPUT TRANSMITS TO PC COM5.",
+            "  PATH: COM1 >> BUFFER INPUT >> BUFFER OUTPUT >> COM5.",
+            "  SET BOTH BUFFER SWITCH BANKS THE SAME UNLESS THE TEST SAYS OTHERWISE.",
+            "",
+            "FIRST RUN CHECK LIST",
+            "  1 CLEAR OR RESET THE BUFFER SO OLD PRINT DATA IS NOT POURING OUT.",
+            "  2 USE OPTION 5 TO READ THE PRESENT PROGRAM SETUP.",
+            "  3 USE OPTION 2 IF YOUR COM PORTS OR KNOWN BAUDS ARE NOT DEFAULT.",
+            "  4 USE OPTION 1, THEN SELECT AUTOMATED DISCOVERY.",
+            f"  5 SELECT BAUD RANGE. SUPPORTED: {supported_baud_label()}.",
+            "  6 WAIT FOR THE REPORT. CTRL+C OPENS THE OPERATOR BREAK MENU.",
             "",
             "START SCAN WORKFLOW",
-            "  1 AUTOMATED DISCOVERY: PHASE 0, FRAME SWEEPS, FULL FALLBACK.",
-            "  2 KNOWN-BAUD DEVICE:  USE OPTION 2 BAUDS; FRAME, 8-BIT, RAW, FLOW.",
-            "  3 PHASE 0 ONLY:       ASK BAUD RANGE, THEN LIVENESS MATRIX ONLY.",
-            "  4 RETURN TO MAIN MENU.",
+            "  1 AUTOMATED DISCOVERY",
+            "    USE WHEN THE BUFFER SPEED OR FRAME IS UNKNOWN.",
+            "    PHASE 0 FINDS LIVE INPUT/OUTPUT BAUD PAIRS.",
+            "    THEN FRAME SWEEPS AND FLOW CHECKS LOOK FOR A CLEAN TRANSFER.",
+            "    TOP MATCHES MAY BE VERIFIED BEFORE THE FINAL REPORT.",
+            "",
+            "  2 KNOWN-BAUD DEVICE TEST",
+            "    USE WHEN INPUT AND OUTPUT BAUDS ARE ALREADY KNOWN.",
+            "    BAUDS COME FROM OPTION 2 ON THE MAIN MENU.",
+            "    TESTS ASCII, 8-BIT DATA, RAW CONTROL BYTES, ETX/ACK, AND FLOW.",
+            "    BUFFER-FULL STRESS RUNS AFTER OUTPUT HOLD IS PROVEN.",
+            "",
+            "  3 PHASE 0 BAUD LIVENESS ONLY",
+            "    QUICK BAUD-PAIR CHECK USING FIXED 8E1, FLOW NONE.",
+            "    SHOWS WHICH BAUD PAIRS ARE ALIVE; IT IS NOT A FINAL SETTING.",
+            "",
+            "  4 RETURN TO MAIN MENU",
+            "",
+            "MAIN MENU",
+            "  1 START SCAN:          SELECT ONE OF THE TESTS ABOVE.",
+            "  2 SET COM PORTS/BAUD:  INPUT PORT, OUTPUT PORT, FIXED BAUDS.",
+            "  3 SCAN/VALIDATE SETUP: MESSAGE SIZE, TEST COUNT, VERIFY, FLOW.",
+            "  4 TIMING/STALE:        READ WAITS AND OLD-OUTPUT CLEARING.",
+            "  5 CURRENT SETTINGS:    PRINT THE WHOLE ACTIVE SETUP.",
+            "  6 HELP:                THIS OPERATOR BRIEFING.",
+            "  0 QUIT:                END PROGRAM.",
             "",
             "OPERATOR NOTES",
-            "  DEVICE PATH:       COM1 >> BUFFER INPUT >> BUFFER OUTPUT >> COM5.",
-            "  PROGRAM SETTINGS:  PROGRAM SETS BAUD, FRAME, AND FLOW ON OPEN.",
-            "  OPTION 2 BAUDS:    USED BY KNOWN-BAUD DEVICE TEST RUNS.",
-            "  BAUD RANGE:        ASKED BY START SCAN 1 AND 3.",
-            "  PHASE 0 SETTINGS:  FIXED 8E1 FLOW=NONE; OPTION 3 DOES NOT CHANGE IT.",
-            "  BAUD PAIRS:        INPUT AND OUTPUT BAUDS MAY DIFFER.",
-            "  NO PHASE 0 HIT:    SAME-BAUD FRAME FALLBACK OFFERED FOR NARROW RANGE.",
-            "  START 1 SETUP:     OPTION 3 QUICK SCAN AND VERIFY ITEMS AFFECT DISCOVERY.",
-            "  START 2 SETUP:     OPTION 3 FLOW AND BUFFER-FULL ITEMS AFFECT KNOWN-BAUD.",
-            "  START 3 SETUP:     OPTION 3 DOES NOT AFFECT PHASE 0 ONLY.",
-            "  REPORT FILES:      FIXED TXT REPORT AND DEBUG LOG; NEW SESSION OVERWRITES.",
-            "  STALE DATA:        QUICK PER-TEST CLEARING REJECTS OLD OUTPUT.",
-            "  KNOWN-BAUD PURGE:  KNOWN-BAUD AND VALIDATION USE LONG ESTIMATES.",
-            "  NONCES:            EACH TEST PAYLOAD HAS RUN/CANDIDATE/TRIAL IDS.",
-            "  8-BIT TEST:        SEPARATE HIGH-BIT CHALLENGE; ASCII IS NOT ENOUGH.",
-            "  SCAN BREAK:        CTRL+C ASKS RESUME, REPORT, MENU, OR QUIT.",
-            "  AFTER RUN:         RUN AGAIN, MAIN MENU, OR QUIT.",
+            "  PROGRAM SETS BAUD, FRAME, AND FLOW WHEN IT OPENS THE PORTS.",
+            "  DEVICE MANAGER DEFAULTS ARE NOT USED AS TEST SETTINGS.",
+            "  INPUT AND OUTPUT BAUDS MAY DIFFER ON TWO-BANK BUFFERS.",
+            "  AUTOMATED DISCOVERY AND PHASE 0 ASK FOR THE BAUD RANGE AT START.",
+            "  PHASE 0 ALWAYS USES 8 DATA, EVEN PARITY, 1 STOP, FLOW NONE.",
+            "  OPTION 3 DOES NOT CHANGE PHASE 0 ONLY.",
+            "  QUICK STALE CLEARING REJECTS OLD OUTPUT BEFORE EACH TEST.",
+            "  KNOWN-BAUD AND VERIFY RUNS USE LONGER CALCULATED PURGES.",
+            "  EACH TEST PAYLOAD HAS RUN, CANDIDATE, AND TRIAL MARKS.",
+            "  ASCII PASSING IS NOT ENOUGH; 8-BIT AND RAW BYTE TESTS MAY MATTER.",
+            "",
+            "READING THE SCREEN",
+            "  PASS OR GOOD MEANS A USEFUL TRANSFER WAS SEEN.",
+            "  PARTIAL MEANS SOME TEST DATA CAME THROUGH BUT NOT CLEANLY.",
+            "  FAIL OR NO-DATA MEANS THAT SETTING DID NOT CARRY THE TEST.",
+            "  STALE MEANS OLD BUFFER OUTPUT MADE THE TEST UNTRUSTWORTHY.",
+            "  ERROR MEANS THE SERIAL DRIVER OR PORT REJECTED THE OPERATION.",
+            "  SCORE IS 0 THROUGH 100; TRUST THE FINAL REPORT INTERPRETATION.",
+            "",
+            "REPORTS",
+            f"  TEXT REPORT:       {terminal_text(text_report)} (NEW SESSION REPLACES OLD FILE).",
+            f"  DEBUG LOG:         {terminal_text(debug_log)} (NEW SESSION REPLACES OLD FILE).",
+            "  A RECOMMENDED SETTING NEEDS STRONG BYTE TRANSFER EVIDENCE.",
+            "  MULTIPLE TOP SETTINGS MEANS REVIEW TIED ROWS BEFORE SETTING SWITCHES.",
+            "  NO WORKING SETTING MEANS CHECK CABLES, PORTS, BAUDS, POWER, OR RESET.",
+            "",
+            "KEYS",
+            "  ENTER ACCEPTS A DEFAULT WHEN A PROMPT SHOWS ONE IN BRACKETS.",
+            "  0 USUALLY RETURNS TO THE MAIN MENU OR QUITS THE PRESENT MENU.",
+            "  CTRL+C DURING A TEST ASKS RESUME, REPORT, MENU, OR QUIT.",
+            "  AFTER A RUN THE PROGRAM ASKS RUN AGAIN, MAIN MENU, OR QUIT.",
         ],
         page_lines=HELP_BODY_LINES if paged else 0,
         pause_at_end=paged,

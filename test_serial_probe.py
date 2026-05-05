@@ -19,6 +19,10 @@ def fake_input_from(values: list[str]):
     return fake_input
 
 
+def has_lowercase(text: str) -> bool:
+    return any("a" <= character <= "z" for character in text)
+
+
 class TypeErrorWriter:
     def write(self, data: bytes) -> int:
         raise TypeError("programming error")
@@ -205,6 +209,104 @@ def test_main_menu_rejects_letter_shortcuts(
     assert selection is None
     assert output.count("ENTER A NUMBER FROM 0 THROUGH 6.") == 2
     assert "OPTION 2 PORTS" not in output
+
+
+def test_menu_help_orients_first_time_operator(
+    capsys: CaptureFixture[str],
+) -> None:
+    serial_probe.print_menu_help(paged=False)
+
+    output = capsys.readouterr().out
+
+    assert "HELP - OPERATOR BRIEFING" in output
+    assert "WHAT THIS PROGRAM DOES" in output
+    assert "FINDS SERIAL SWITCH SETTINGS FOR A PRINTER BUFFER" in output
+    assert "PATH: COM1 >> BUFFER INPUT >> BUFFER OUTPUT >> COM5." in output
+    assert "FIRST RUN CHECK LIST" in output
+    assert "AUTOMATED DISCOVERY" in output
+    assert "KNOWN-BAUD DEVICE TEST" in output
+    assert "PHASE 0 BAUD LIVENESS ONLY" in output
+    assert "TEXT REPORT:" in output
+    assert "SERIAL_PROBE_REPORT.TXT" in output
+    assert "serial_probe_report.txt" not in output
+    assert "CTRL+C DURING A TEST ASKS RESUME, REPORT, MENU, OR QUIT." in output
+    assert all(len(line) <= serial_probe.SCREEN_WIDTH for line in output.splitlines())
+    assert not has_lowercase(output)
+
+
+def test_reference_operator_screens_are_uppercase(
+    monkeypatch: MonkeyPatch,
+    capsys: CaptureFixture[str],
+) -> None:
+    def eof_input(prompt: str = "") -> str:
+        print(prompt, end="")
+        raise EOFError
+
+    monkeypatch.setattr(builtins, "input", eof_input)
+    options = serial_probe.default_scan_options()
+
+    serial_probe.print_commands()
+    serial_probe.print_configuration(options)
+    serial_probe.print_scan_validate_setup(options)
+    serial_probe.print_progress_legend()
+    serial_probe.prompt_start_scan_workflow()
+    serial_probe.prompt_after_scan_action()
+    serial_probe.prompt_operator_break_action()
+
+    assert not has_lowercase(capsys.readouterr().out)
+
+
+def test_prompt_text_shows_current_value_as_terminal_text(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    prompts: list[str] = []
+
+    def blank_input(prompt: str) -> str:
+        prompts.append(prompt)
+        return ""
+
+    monkeypatch.setattr(builtins, "input", blank_input)
+
+    assert (
+        serial_probe.prompt_text("Device/switch note for report", "bank a")
+        == "bank a"
+    )
+    assert prompts == ["DEVICE/SWITCH NOTE FOR REPORT [BANK A]: "]
+
+
+def test_phase0_text_report_metadata_uses_terminal_text(tmp_path: Path) -> None:
+    report_path = tmp_path / "report.txt"
+    phase0 = serial_probe.DualBaudLivenessReport(
+        ran=True,
+        tested_pairs=[],
+        total_pairs=0,
+        alive_pairs=[],
+        selected_pairs=[],
+        fallback_reason=None,
+        elapsed_sec=0.0,
+        results=[],
+    )
+
+    serial_probe.write_phase0_text_report(
+        report_path,
+        {
+            "workflow": "phase 0",
+            "started_at": "test started",
+            "completed_at": "test complete",
+            "run_id": "r1",
+            "in_port": "com1",
+            "out_port": "com5",
+            "switch_note": "bank a",
+            "outcome": "done",
+        },
+        phase0,
+    )
+
+    report = report_path.read_text(encoding="utf-8")
+
+    assert "WORKFLOW:        PHASE 0" in report
+    assert "DEVICE NOTE:     BANK A" in report
+    assert not has_lowercase(report)
 
 
 def test_session_text_report_replaces_prior_session_then_appends(
