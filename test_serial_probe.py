@@ -45,6 +45,19 @@ class ValueErrorSerialModule:
         raise ValueError("unsupported parity mode")
 
 
+class DummySerialContext:
+    def __enter__(self) -> object:
+        return object()
+
+    def __exit__(
+        self,
+        _exc_type: object,
+        _exc_value: object,
+        _traceback: object,
+    ) -> bool:
+        return False
+
+
 def test_receive_completion_detects_complete_eight_bit_payload() -> None:
     nonce = serial_probe.representative_nonce()
     payload = serial_probe.generate_eight_bit_payload(
@@ -342,6 +355,41 @@ def test_current_settings_show_option_2_ports_and_bauds(
     assert "INPUT 38400 / OUTPUT 9600" in output
     assert "SCAN BAUD RANGE:" in output
     assert "ASKED IN START SCAN 1 OR 3" in output
+
+
+def test_buffer_purge_preserves_non_quiet_drain_status(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    setting = serial_probe.SerialSettings(9600, 8, "none", 1, "none")
+
+    monkeypatch.setattr(
+        serial_probe,
+        "open_serial_port",
+        lambda *_args, **_kwargs: DummySerialContext(),
+    )
+    monkeypatch.setattr(
+        serial_probe,
+        "drain_output_until_quiet",
+        lambda **_kwargs: serial_probe.DrainResult(
+            bytes_drained=serial_probe.BUFFER_PURGE_CAPACITY_BYTES * 2,
+            elapsed_sec=0.25,
+            quiet=False,
+            reason="max-bytes",
+            error=None,
+        ),
+    )
+
+    result = serial_probe.purge_buffer_output(
+        serial_module=object(),
+        options=serial_probe.default_scan_options(),
+        logger=logging.getLogger("test"),
+        reason="TEST PURGE",
+        settings_list=[setting],
+    )
+
+    assert not result.quiet
+    assert result.reason == "max-bytes"
+    assert result.error == f"{setting.label()}: max-bytes"
 
 
 def test_scan_validate_setup_uses_operator_friendly_flow_labels(
@@ -1056,12 +1104,105 @@ def test_known_baud_flow_summary_includes_input_buffer_full_stress() -> None:
         serial_probe.bank2_flow_input_summary([stress_row])
         == "INPUT BACKPRESSURE PROVEN: XON/XOFF."
     )
+    assert (
+        serial_probe.bank2_flow_control_observed_summary([stress_row])
+        == "XON/XOFF OBSERVED"
+    )
     summary = serial_probe.bank2_flow_summary([stress_row])
     assert "INPUT FULL:" in summary
     report_lines = serial_probe.bank2_flow_report_lines([stress_row])
     assert "INPUT BUFFER-FULL STRESS:" in report_lines
     assert "BUFFER-FULL" in "\n".join(report_lines)
     assert all(len(line) <= serial_probe.REPORT_WIDTH for line in report_lines)
+
+
+def test_input_backpressure_detects_dcd_drop_for_printer_dtr_pacing() -> None:
+    before = {"cts": True, "dsr": True, "cd": True}
+
+    assert (
+        serial_probe.input_backpressure_release_reason(
+            "dsr/dtr",
+            before,
+            {"cts": True, "dsr": True, "cd": False},
+            stalled=False,
+        )
+        == "DCD DROPPED"
+    )
+    assert serial_probe.input_backpressure_observed("DCD DROPPED")
+
+
+def test_input_backpressure_still_reports_existing_hardware_drops() -> None:
+    before = {"cts": True, "dsr": True, "cd": True}
+
+    assert (
+        serial_probe.input_backpressure_release_reason(
+            "rts/cts",
+            before,
+            {"cts": False, "dsr": True, "cd": True},
+            stalled=False,
+        )
+        == "CTS DROPPED"
+    )
+    assert (
+        serial_probe.input_backpressure_release_reason(
+            "dsr/dtr",
+            before,
+            {"cts": True, "dsr": False, "cd": True},
+            stalled=False,
+        )
+        == "DSR DROPPED"
+    )
+
+
+def test_input_backpressure_prefers_dcd_when_dcd_and_dsr_drop_together() -> None:
+    before = {"cts": True, "dsr": True, "cd": True}
+
+    assert (
+        serial_probe.input_backpressure_release_reason(
+            "dsr/dtr",
+            before,
+            {"cts": True, "dsr": False, "cd": False},
+            stalled=False,
+        )
+        == "DCD DROPPED"
+    )
+
+
+def test_input_backpressure_summary_reports_observed_dcd_signal() -> None:
+    payload = serial_probe.generate_payload(512)
+    base_frame = serial_probe.SerialSettings(38400, 8, "even", 1, "none")
+    clean_flow = serial_probe.fake_clean_candidate_result(base_frame, payload)
+    stress_row = serial_probe.FlowControlValidationResult(
+        flow_control="dsr/dtr",
+        method=serial_probe.INPUT_BACKPRESSURE_METHOD,
+        settings=serial_probe.DualSerialSettings(
+            dataclasses.replace(base_frame, flow_control="dsr/dtr"),
+            base_frame,
+        ),
+        bytes_sent=serial_probe.INPUT_BACKPRESSURE_STRESS_BYTES,
+        bytes_received=serial_probe.INPUT_BACKPRESSURE_STRESS_BYTES,
+        bytes_seen_while_held=0,
+        score=100.0,
+        indicator="PASS",
+        status="backpressure-proven",
+        reason="DCD DROPPED AFTER 32768 BYTES; OUTPUT THEN DRAINED CLEANLY.",
+        error=None,
+        elapsed_sec=0.0,
+        metrics=clean_flow.metrics,
+    )
+
+    assert (
+        serial_probe.flow_control_validation_recommendation([stress_row])
+        == "INPUT BACKPRESSURE PROVEN: DCD DROPPED."
+    )
+    assert (
+        serial_probe.bank2_flow_input_summary([stress_row])
+        == "INPUT BACKPRESSURE PROVEN: DCD DROPPED."
+    )
+    assert (
+        serial_probe.bank2_flow_control_observed_summary([stress_row])
+        == "DTR-DCD OBSERVED"
+    )
 
 
 def test_backpressure_output_hold_selection_requires_actual_pause() -> None:
@@ -1098,6 +1239,37 @@ def test_backpressure_output_hold_selection_requires_actual_pause() -> None:
     assert selected is paused
 
 
+def test_backpressure_output_hold_prefers_printer_dtr_before_rts() -> None:
+    payload = serial_probe.generate_payload(512)
+    base_frame = serial_probe.SerialSettings(38400, 8, "even", 1, "none")
+    clean_flow = serial_probe.fake_clean_candidate_result(base_frame, payload)
+    rts = serial_probe.FlowControlValidationResult(
+        flow_control="rts/cts",
+        method="rts-hold-release",
+        settings=dataclasses.replace(base_frame, flow_control="rts/cts"),
+        bytes_sent=payload.byte_count,
+        bytes_received=payload.byte_count,
+        bytes_seen_while_held=0,
+        score=100.0,
+        indicator="PASS",
+        status="validated",
+        reason="OUTPUT PAUSED DURING HOLD AND CLEANLY RESUMED.",
+        error=None,
+        elapsed_sec=0.0,
+        metrics=clean_flow.metrics,
+    )
+    dtr = dataclasses.replace(
+        rts,
+        flow_control="dsr/dtr",
+        method="dtr-hold-release",
+        settings=dataclasses.replace(base_frame, flow_control="dsr/dtr"),
+    )
+
+    selected = serial_probe.select_backpressure_output_hold([rts, dtr])
+
+    assert selected is dtr
+
+
 def test_known_baud_text_report_includes_split_flow_evidence(tmp_path: Path) -> None:
     payload = serial_probe.generate_payload(512)
     base_frame = serial_probe.SerialSettings(38400, 8, "even", 1, "none")
@@ -1127,6 +1299,16 @@ def test_known_baud_text_report_includes_split_flow_evidence(tmp_path: Path) -> 
         error=None,
         elapsed_sec=0.0,
         metrics=matrix_candidate.metrics,
+        modem_line_observations=(
+            (
+                "BEFORE HOLD",
+                {"cts": True, "dsr": True, "cd": True, "ri": False, "rts": True, "dtr": True},
+            ),
+            (
+                "AFTER HOLD",
+                {"cts": True, "dsr": True, "cd": True, "ri": False, "rts": True, "dtr": False},
+            ),
+        ),
     )
     stress_row = serial_probe.FlowControlValidationResult(
         flow_control="xon/xoff",
@@ -1167,9 +1349,14 @@ def test_known_baud_text_report_includes_split_flow_evidence(tmp_path: Path) -> 
     assert "FLOW MATRIX:" in report_text
     assert "OUTPUT HOLD:" in report_text
     assert "INPUT FULL:" in report_text
+    assert "BYTE TRANSFER:" in report_text
+    assert "FLOW CONTROL OBSERVED:" in report_text
+    assert "FLOW OBSERVED:" in report_text
     assert "FLOW TRANSFER MATRIX:" in report_text
     assert "OUTPUT HOLD/RELEASE:" in report_text
     assert "INPUT BUFFER-FULL STRESS:" in report_text
+    assert "MODEM-LINE BEHAVIOR:" in report_text
+    assert "DTR=0" in report_text
     assert "INPUT-SIDE BACKPRESSURE IS NOT PROVEN" in report_text
 
 

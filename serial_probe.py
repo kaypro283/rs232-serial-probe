@@ -41,7 +41,7 @@ BAUD_RATES: list[int] = [
 DATA_BITS: list[int] = [8, 7]
 PARITIES: list[str] = ["none", "even", "odd", "mark", "space"]
 STOP_BITS: list[int] = [1, 2]
-FLOW_CONTROLS: list[str] = ["none", "xon/xoff", "rts/cts", "dsr/dtr"]
+FLOW_CONTROLS: list[str] = ["none", "xon/xoff", "dsr/dtr", "rts/cts"]
 KIB_BYTES = 1024
 DEFAULT_BURSTS = 1
 DEFAULT_PAYLOAD_BYTES = 512
@@ -64,10 +64,18 @@ FLOW_VALIDATE_HOLD_SECONDS = 1.0
 FLOW_VALIDATE_RELEASE_SETTLE_SECONDS = 0.15
 INPUT_BACKPRESSURE_STRESS_ENABLED_DEFAULT = True
 INPUT_BACKPRESSURE_STRESS_BYTES = 128 * KIB_BYTES
-INPUT_BACKPRESSURE_FLOW_CONTROLS = ["xon/xoff", "rts/cts", "dsr/dtr"]
+INPUT_BACKPRESSURE_FLOW_CONTROLS = ["xon/xoff", "dsr/dtr", "rts/cts"]
 INPUT_BACKPRESSURE_METHOD = "buffer-full"
 INPUT_BACKPRESSURE_MONITOR_SECONDS = 0.05
 INPUT_BACKPRESSURE_STALL_SECONDS = 1.5
+INPUT_BACKPRESSURE_SIGNAL_REASONS = (
+    "DCD DROPPED",
+    "DSR DROPPED",
+    "CTS DROPPED",
+)
+INPUT_BACKPRESSURE_OBSERVED_REASONS = frozenset(
+    (*INPUT_BACKPRESSURE_SIGNAL_REASONS, "WRITE STALLED")
+)
 RECEIVE_DEADLINE_SAFETY_FACTOR = 2.0
 RECEIVE_DEADLINE_MARGIN_SECONDS = 2.0
 DEFAULT_BANK2_JOB_TIMEOUT_OBSERVE_SECONDS = 10.0
@@ -519,6 +527,7 @@ class FlowControlValidationResult:
     error: str | None
     elapsed_sec: float
     metrics: ScoreMetrics
+    modem_line_observations: tuple[tuple[str, dict[str, bool]], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1395,6 +1404,14 @@ def modem_line_snapshot_label(snapshot: dict[str, bool]) -> str:
         f"{name.upper()}={1 if snapshot.get(name, False) else 0}"
         for name in ("cts", "dsr", "cd", "ri", "rts", "dtr")
     )
+
+
+def modem_line_observation(
+    label: str,
+    snapshot: dict[str, bool],
+) -> tuple[str, dict[str, bool]]:
+    """Return a report-safe modem-line observation."""
+    return label, dict(snapshot)
 
 
 def preview_ascii(data: bytes, limit: int = 96) -> str:
@@ -3402,7 +3419,9 @@ def purge_buffer_output(
     buffer_purge_banner(reason, len(settings))
     started = time.monotonic()
     total_drained = 0
-    errors: list[str] = []
+    all_quiet = True
+    issue_reasons: list[str] = []
+    issues: list[str] = []
     for index, setting in enumerate(settings, start=1):
         prefix = f"[PURGE {index:02d}/{len(settings):02d} OUT {setting.label()}]"
         try:
@@ -3425,7 +3444,9 @@ def purge_buffer_output(
         except SERIAL_IO_ERRORS as exc:
             error = str(exc)
             logger.info("buffer purge failed opening %s: %s", setting.label(), error)
-            errors.append(error)
+            all_quiet = False
+            issue_reasons.append("error")
+            issues.append(f"{setting.label()}: {error}")
             continue
 
         total_drained += drain.bytes_drained
@@ -3438,16 +3459,29 @@ def purge_buffer_output(
             drain.elapsed_sec,
             drain.error,
         )
-        if drain.error:
-            errors.append(drain.error)
+        if not drain.quiet or drain.error:
+            all_quiet = False
+            issue_reasons.append(drain.reason)
+            issue = f"{setting.label()}: {drain.reason}"
+            if drain.error:
+                issue = f"{issue}: {drain.error}"
+            issues.append(issue)
     elapsed = time.monotonic() - started
-    quiet = not errors
+    quiet = all_quiet and not issues
+    unique_issue_reasons = list(dict.fromkeys(issue_reasons))
+    result_reason = "quiet"
+    if not quiet:
+        result_reason = (
+            unique_issue_reasons[0]
+            if len(unique_issue_reasons) == 1
+            else "incomplete"
+        )
     result = DrainResult(
         bytes_drained=total_drained,
         elapsed_sec=elapsed,
         quiet=quiet,
-        reason="quiet" if quiet else "error",
-        error="; ".join(errors) if errors else None,
+        reason=result_reason,
+        error="; ".join(issues) if issues else None,
     )
     print()
     print_report_title("BUFFER PURGE COMPLETE")
@@ -3617,8 +3651,8 @@ def discovery_frame_priority(settings: SerialSettings) -> tuple[int, int, int, i
     flow_rank = {
         "none": 0,
         "xon/xoff": 1,
-        "rts/cts": 2,
-        "dsr/dtr": 3,
+        "dsr/dtr": 2,
+        "rts/cts": 3,
     }.get(settings.flow_control, 9)
     data_rank = 0 if settings.data_bits == 8 else 1
     stop_rank = 0 if settings.stop_bits == 1 else 1
@@ -5916,6 +5950,13 @@ def run_flow_control_pause_validation(
         status = "transfer-partial"
         reason = "OUTPUT PAUSED, BUT RESUMED TRANSFER WAS A POOR MATCH."
 
+    modem_observations = (
+        modem_line_observation("BEFORE HOLD", before_hold_lines),
+        modem_line_observation("AFTER HOLD", after_hold_lines),
+        modem_line_observation("AFTER WRITE", after_write_lines),
+        modem_line_observation("BEFORE RELEASE", before_release_lines),
+        modem_line_observation("AFTER RELEASE", after_release_lines),
+    )
     return FlowControlValidationResult(
         flow_control=flow_control,
         method=method,
@@ -5930,6 +5971,7 @@ def run_flow_control_pause_validation(
         error=error,
         elapsed_sec=time.monotonic() - started,
         metrics=score.metrics,
+        modem_line_observations=modem_observations,
     )
 
 
@@ -5999,11 +6041,12 @@ def flow_control_validation_recommendation(
     if len(proven_backpressure) == 1:
         return (
             "INPUT BACKPRESSURE PROVEN: "
-            f"{flow_control_name(proven_backpressure[0].flow_control)}."
+            f"{input_backpressure_result_label(proven_backpressure[0])}."
         )
     if len(proven_backpressure) > 1:
         flows = ", ".join(
-            flow_control_name(result.flow_control) for result in proven_backpressure
+            input_backpressure_result_label(result)
+            for result in proven_backpressure
         )
         return f"MULTIPLE INPUT BACKPRESSURE MODES: {flows}."
     if stress_results and all(result.status == "stress-skipped" for result in stress_results):
@@ -6044,6 +6087,100 @@ def flow_control_validation_recommendation(
     if results:
         return "NO FLOW CONTROL MODE VALIDATED."
     return "FLOW CONTROL VALIDATION WAS NOT RUN."
+
+
+def input_backpressure_result_label(result: FlowControlValidationResult) -> str:
+    """Return the observed input-backpressure label for summary text."""
+    for reason in INPUT_BACKPRESSURE_SIGNAL_REASONS:
+        if result.reason.startswith(reason):
+            return reason
+    return flow_control_name(result.flow_control)
+
+
+def input_backpressure_observation_label(
+    result: FlowControlValidationResult,
+) -> str | None:
+    """Return operator-facing observed input-flow evidence for one stress row."""
+    if result.status not in {"backpressure-proven", "backpressure-partial"}:
+        return None
+    if result.reason.startswith("DCD DROPPED"):
+        return "DTR-DCD OBSERVED"
+    if result.reason.startswith("DSR DROPPED"):
+        return "DTR-DSR OBSERVED"
+    if result.reason.startswith("CTS DROPPED"):
+        return "CTS OBSERVED"
+    if result.reason.startswith("WRITE STALLED") and result.flow_control == "xon/xoff":
+        return "XON/XOFF OBSERVED"
+    if result.reason.startswith("WRITE STALLED"):
+        return f"{flow_control_name(result.flow_control)} WRITE STALL OBSERVED"
+    return None
+
+
+def bank2_flow_control_observed_summary(
+    results: Sequence[FlowControlValidationResult],
+) -> str:
+    """Return observed flow behavior without treating clean transfer as proof."""
+    stress_labels: list[str] = []
+    for result in flow_input_backpressure_results(results):
+        label = input_backpressure_observation_label(result)
+        if label and label not in stress_labels:
+            stress_labels.append(label)
+    if stress_labels:
+        return compact_label_list(stress_labels, limit=4)
+
+    hold_labels = [
+        flow_control_name(result.flow_control)
+        for result in flow_hold_release_results(results)
+        if result.status == "validated" and result.flow_control != "none"
+    ]
+    if hold_labels:
+        return f"OUTPUT HOLD ONLY: {compact_label_list(hold_labels, limit=4)}"
+
+    if flow_transfer_matrix_results(results):
+        return "FLOW TRANSFER MATRIX ONLY; HANDSHAKE NOT OBSERVED."
+    if results:
+        return "NOT OBSERVED."
+    return "NOT RUN."
+
+
+def bank2_byte_transfer_summary(
+    ascii_results: Sequence[CandidateResult],
+    eight_bit_results: Sequence[CandidateResult],
+) -> str:
+    """Return best observed byte-transfer evidence separate from flow evidence."""
+    target = best_bank2_followup_target(ascii_results, eight_bit_results)
+    if target is None:
+        return "(NONE)"
+    width = (
+        "8-BIT CLEAN"
+        if bank2_eight_bit_clean_results(eight_bit_results)
+        else "ASCII CLEAN ONLY"
+    )
+    return f"{width}; BEST OBSERVED {frame_or_pair_label(target.settings)}"
+
+
+def flow_validation_modem_line_report_lines(
+    results: Sequence[FlowControlValidationResult],
+) -> list[str]:
+    """Return modem-line snapshots captured during flow validation."""
+    rows: list[str] = []
+    for result in results:
+        for event, snapshot in result.modem_line_observations:
+            flow_label = fit_terminal_line(result.flow_control.upper(), 8)
+            method = fit_terminal_line(terminal_text(result.method), 16)
+            event_label = fit_terminal_line(event, 14)
+            rows.append(
+                f"{flow_label:<8} {method:<16} {event_label:<14} "
+                f"{modem_line_snapshot_label(snapshot)}"
+            )
+    if not rows:
+        return []
+    return [
+        "MODEM-LINE BEHAVIOR:",
+        f"{'FLOW':<8} {'METHOD':<16} {'EVENT':<14} LINES",
+        border_line(REPORT_WIDTH),
+        *rows,
+    ]
 
 
 FLOW_VALIDATION_METHOD_WIDTH = 16
@@ -6117,6 +6254,10 @@ def flow_validation_report_lines(
     lines.extend(["", FLOW_VALIDATION_TABLE_HEADER, border_line(REPORT_WIDTH)])
     for result in results:
         lines.extend(flow_validation_table_row_lines(result))
+    modem_lines = flow_validation_modem_line_report_lines(results)
+    if modem_lines:
+        lines.append("")
+        lines.extend(modem_lines)
     lines.extend(flow_validation_note_lines(results))
     lines.append(border_line(REPORT_WIDTH))
     return lines
@@ -6143,6 +6284,11 @@ def print_flow_control_validation_report(
     print(border_line(REPORT_WIDTH))
     for result in results:
         for line in flow_validation_table_row_lines(result):
+            print(line)
+    modem_lines = flow_validation_modem_line_report_lines(results)
+    if modem_lines:
+        print()
+        for line in modem_lines:
             print(line)
     for note in flow_validation_note_lines(results):
         print(note)
@@ -6375,7 +6521,7 @@ def select_backpressure_output_hold(
     candidates = [result for result in hold_results if flow_pause_holds_output(result)]
     if not candidates:
         return None
-    flow_rank = {"xon/xoff": 0, "rts/cts": 1, "dsr/dtr": 2}
+    flow_rank = {"xon/xoff": 0, "dsr/dtr": 1, "rts/cts": 2}
     return sorted(
         candidates,
         key=lambda result: (
@@ -6436,6 +6582,18 @@ def release_input_backpressure_hold(
     hold_released.set()
 
 
+def modem_line_drop_reason(
+    before_snapshot: dict[str, bool],
+    line_snapshot: dict[str, bool],
+    line_name: str,
+    line_label: str,
+) -> str | None:
+    """Return a modem-status drop reason when a line changed from high to low."""
+    if before_snapshot.get(line_name, True) and not line_snapshot.get(line_name, True):
+        return f"{line_label} DROPPED"
+    return None
+
+
 def input_backpressure_release_reason(
     input_flow: str,
     before_snapshot: dict[str, bool],
@@ -6443,21 +6601,32 @@ def input_backpressure_release_reason(
     stalled: bool,
 ) -> str | None:
     """Return the backpressure reason visible at the input adapter."""
-    if (
-        input_flow == "rts/cts"
-        and before_snapshot.get("cts", True)
-        and not line_snapshot.get("cts", True)
-    ):
-        return "CTS DROPPED"
-    if (
-        input_flow == "dsr/dtr"
-        and before_snapshot.get("dsr", True)
-        and not line_snapshot.get("dsr", True)
-    ):
-        return "DSR DROPPED"
+    if input_flow == "rts/cts":
+        reason = modem_line_drop_reason(before_snapshot, line_snapshot, "cts", "CTS")
+        if reason:
+            return reason
+    if input_flow == "dsr/dtr":
+        for line_name, line_label in (
+            ("cd", "DCD"),
+            ("dsr", "DSR"),
+            ("cts", "CTS"),
+        ):
+            reason = modem_line_drop_reason(
+                before_snapshot,
+                line_snapshot,
+                line_name,
+                line_label,
+            )
+            if reason:
+                return reason
     if stalled:
         return "WRITE STALLED"
     return None
+
+
+def input_backpressure_observed(reason: str | None) -> bool:
+    """Return True when a release reason proves input-side throttle was seen."""
+    return reason in INPUT_BACKPRESSURE_OBSERVED_REASONS
 
 
 def run_input_backpressure_stress(
@@ -6771,11 +6940,7 @@ def run_input_backpressure_stress(
     score = score_received(expected, received_bytes)
     error = write_error or (reader_errors[0] if reader_errors else None)
     output_hold_ok = held_bytes_seen <= hold_limit
-    backpressure_observed = release_reason in {
-        "CTS DROPPED",
-        "DSR DROPPED",
-        "WRITE STALLED",
-    }
+    backpressure_observed = input_backpressure_observed(release_reason)
     clean = (
         score.score >= 99.0
         and bytes_sent == payload_bytes
@@ -6813,8 +6978,8 @@ def run_input_backpressure_stress(
     elif clean:
         status = "no-backpressure"
         reason = (
-            "STRESS PAYLOAD WAS ACCEPTED WHILE OUTPUT WAS HELD; "
-            "NO INPUT-SIDE THROTTLE OBSERVED."
+            f"NO INPUT-SIDE THROTTLE OBSERVED WITHIN {bytes_sent} BYTES; "
+            "STRESS PAYLOAD WAS ACCEPTED WHILE OUTPUT WAS HELD."
         )
     elif not received_bytes:
         status = "no-data"
@@ -6830,6 +6995,19 @@ def run_input_backpressure_stress(
             before_input_lines,
             after_input_lines,
         )
+    after_event = (
+        "BUFFER FULL"
+        if input_backpressure_observed(release_reason)
+        else "AFTER STRESS"
+    )
+    modem_observations = tuple(
+        modem_line_observation(label, snapshot)
+        for label, snapshot in (
+            ("IDLE", before_input_lines),
+            (after_event, after_input_lines),
+        )
+        if snapshot
+    )
     return FlowControlValidationResult(
         flow_control=input_flow,
         method=INPUT_BACKPRESSURE_METHOD,
@@ -6844,6 +7022,7 @@ def run_input_backpressure_stress(
         error=error,
         elapsed_sec=time.monotonic() - started,
         metrics=score.metrics,
+        modem_line_observations=modem_observations,
     )
 
 
@@ -8597,14 +8776,20 @@ def write_bank2_text_report(
     flow_matrix_summary = bank2_flow_matrix_summary(result.flow_results)
     flow_hold_summary = bank2_flow_hold_summary(result.flow_results)
     flow_input_summary = bank2_flow_input_summary(result.flow_results)
+    flow_observed = bank2_flow_control_observed_summary(result.flow_results)
     if result.flow_skip_reason:
         flow_summary = f"SKIPPED: {result.flow_skip_reason}"
         flow_matrix_summary = flow_summary
         flow_hold_summary = flow_summary
         flow_input_summary = flow_summary
+        flow_observed = flow_summary
     behavior_summary = bank2_behavior_summary(result.behavior_results)
     etx_ack_summary = bank2_etx_ack_summary(result.etx_ack_results)
     target_label = bank2_followup_target_label(
+        result.ascii_results,
+        result.eight_bit_results,
+    )
+    byte_transfer = bank2_byte_transfer_summary(
         result.ascii_results,
         result.eight_bit_results,
     )
@@ -8639,6 +8824,7 @@ def write_bank2_text_report(
             indent="",
         ),
         *bank2_value_lines("KNOWN BAUD/PAIR:", result.known_baud_text, indent=""),
+        *bank2_value_lines("BYTE TRANSFER:", byte_transfer, indent=""),
         *bank2_value_lines("DATA WIDTH:", data_width, indent=""),
         *bank2_value_lines("USABLE FRAME:", usable_frame, indent=""),
         *bank2_value_lines("PARITY PROOF:", parity_proof, indent=""),
@@ -8646,6 +8832,7 @@ def write_bank2_text_report(
         *bank2_value_lines("ASCII PASS:", ascii_summary, indent=""),
         *bank2_value_lines("8-BIT RESULT:", eight_detail, indent=""),
         *bank2_value_lines("FOLLOW-UP FRAME:", target_label, indent=""),
+        *bank2_value_lines("FLOW CONTROL OBSERVED:", flow_observed, indent=""),
         *bank2_value_lines("FLOW RESULT:", flow_summary, indent=""),
         *bank2_value_lines("FLOW MATRIX:", flow_matrix_summary, indent=""),
         *bank2_value_lines("OUTPUT HOLD:", flow_hold_summary, indent=""),
@@ -8669,6 +8856,7 @@ def write_bank2_text_report(
             indent="  ",
         ),
         *bank2_value_lines("KNOWN:", result.known_baud_text, indent="  "),
+        *bank2_value_lines("BYTE TRANSFER:", byte_transfer, indent="  "),
         *bank2_value_lines("DATA WIDTH:", data_width, indent="  "),
         *bank2_value_lines("USABLE:", usable_frame, indent="  "),
         *bank2_value_lines("PARITY:", parity_proof, indent="  "),
@@ -8677,6 +8865,7 @@ def write_bank2_text_report(
         *bank2_value_lines("8-BIT:", eight_detail, indent="  "),
         *bank2_value_lines("RAW:", behavior_summary, indent="  "),
         *bank2_value_lines("ETX/ACK:", etx_ack_summary, indent="  "),
+        *bank2_value_lines("FLOW OBSERVED:", flow_observed, indent="  "),
         *bank2_value_lines("FLOW:", flow_summary, indent="  "),
         *bank2_value_lines("FLOW MATRIX:", flow_matrix_summary, indent="  "),
         *bank2_value_lines("OUTPUT HOLD:", flow_hold_summary, indent="  "),
@@ -8691,6 +8880,7 @@ def write_bank2_text_report(
         border_line(REPORT_WIDTH),
         "",
         "EVIDENCE:",
+        *bank2_value_lines("BYTE TRANSFER:", byte_transfer),
         *bank2_value_lines("DATA WIDTH:", data_width),
         *bank2_value_lines("USABLE FRAME:", usable_frame),
         *bank2_value_lines("PARITY PROOF:", parity_proof),
@@ -8700,6 +8890,7 @@ def write_bank2_text_report(
         *bank2_value_lines("FOLLOW-UP FRAME:", target_label),
         *bank2_value_lines("RAW BYTES:", behavior_summary),
         *bank2_value_lines("ETX/ACK:", etx_ack_summary),
+        *bank2_value_lines("FLOW OBSERVED:", flow_observed),
         *bank2_value_lines("FLOW:", flow_summary),
         *bank2_value_lines("FLOW MATRIX:", flow_matrix_summary),
         *bank2_value_lines("OUTPUT HOLD:", flow_hold_summary),
@@ -8721,6 +8912,7 @@ def write_bank2_text_report(
         "  FOLLOW-UP FRAME IS THE TEST FRAME CHOSEN FOR MORE PROBES, NOT A UNIQUE PROOF.",
         "  8-BIT CLEAN IS STRONGER EVIDENCE FOR AN 8-BIT DATA PATH.",
         "  ETX/ACK REQUIRES A REVERSE ACK PATH; XON/XOFF DOES NOT PROVE THAT PATH.",
+        "  FLOW OBSERVED IS SEPARATE FROM BYTE TRANSFER UNDER A FLOW SETTING.",
         "  FLOW MATRIX SHOWS WHICH IN/OUT FLOW PAIRS MOVE BYTES CLEANLY.",
         "  OUTPUT HOLD/RELEASE PROVES ONLY OBSERVED OUTPUT-SIDE PAUSE/RESUME.",
         "  INPUT BUFFER-FULL STRESS IS THE INPUT-SIDE BACKPRESSURE PROOF.",
@@ -8745,6 +8937,10 @@ def print_bank2_report(
     target_label = bank2_followup_target_label(
         result.ascii_results,
         result.eight_bit_results,
+    )
+    print_bank2_value(
+        "BYTE TRANSFER:",
+        bank2_byte_transfer_summary(result.ascii_results, result.eight_bit_results),
     )
     print_bank2_value(
         "DATA WIDTH:",
@@ -8772,11 +8968,14 @@ def print_bank2_report(
     flow_matrix_summary = bank2_flow_matrix_summary(result.flow_results)
     flow_hold_summary = bank2_flow_hold_summary(result.flow_results)
     flow_input_summary = bank2_flow_input_summary(result.flow_results)
+    flow_observed = bank2_flow_control_observed_summary(result.flow_results)
     if result.flow_skip_reason:
         flow_summary = f"SKIPPED: {result.flow_skip_reason}"
         flow_matrix_summary = flow_summary
         flow_hold_summary = flow_summary
         flow_input_summary = flow_summary
+        flow_observed = flow_summary
+    print_bank2_value("FLOW OBSERVED:", flow_observed)
     print_bank2_value("FLOW RESULT:", flow_summary)
     print_bank2_value("FLOW MATRIX:", flow_matrix_summary)
     print_bank2_value("OUTPUT HOLD:", flow_hold_summary)
@@ -10328,6 +10527,20 @@ def run_self_tests() -> int:
     )
     assert flow_row.status != "validated", "normal transfer incorrectly proved flow"
     assert "NOT OBSERVED" in flow_row.reason, "flow reason did not mark not observed"
+    before_lines = {"cts": True, "dsr": True, "cd": True}
+    after_dcd_drop = {"cts": True, "dsr": True, "cd": False}
+    assert (
+        input_backpressure_release_reason(
+            "dsr/dtr",
+            before_lines,
+            after_dcd_drop,
+            False,
+        )
+        == "DCD DROPPED"
+    ), "DCD drop should be reported as printer-DTR backpressure evidence"
+    assert input_backpressure_observed(
+        "DCD DROPPED"
+    ), "DCD drop should count as observed input backpressure"
 
     print("SELF-TESTS PASSED")
     return 0
