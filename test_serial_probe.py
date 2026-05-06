@@ -16,13 +16,31 @@ import serial_probe
 
 def fake_input_from(values: list[str]):
     """Return an `input` replacement that yields values in order."""
-    iterator = iter(values)
+    scripted_values = list(values)
+    iterator = iter(scripted_values)
 
-    def fake_input(_prompt: str) -> str:
+    def fake_input(prompt: str = "") -> str:
         """Return the next scripted input value."""
-        return next(iterator)
+        try:
+            return next(iterator)
+        except StopIteration as exc:
+            raise AssertionError(
+                "scripted input exhausted before prompt was satisfied: "
+                f"{prompt!r}; scripted values were {scripted_values!r}"
+            ) from exc
 
     return fake_input
+
+
+def test_fake_input_from_exhaustion_reports_prompt_context() -> None:
+    fake_input = fake_input_from(["first"])
+
+    assert fake_input("FIRST PROMPT: ") == "first"
+    with pytest.raises(AssertionError, match="scripted input exhausted") as exc_info:
+        fake_input("SECOND PROMPT: ")
+
+    assert "SECOND PROMPT: " in str(exc_info.value)
+    assert "first" in str(exc_info.value)
 
 
 def has_lowercase(text: str) -> bool:
@@ -59,6 +77,21 @@ class FlushRecordingWriter:
     def flush(self) -> None:
         """Record that flush was requested."""
         self.flushed = True
+
+
+def test_flow_control_code_maps_supported_values_and_rejects_unknown() -> None:
+    assert {
+        flow_control: serial_probe.flow_control_code(flow_control)
+        for flow_control in serial_probe.FLOW_CONTROLS
+    } == {
+        "none": "NONE",
+        "xon/xoff": "XON",
+        "dsr/dtr": "DSR",
+        "rts/cts": "RTS",
+    }
+
+    with pytest.raises(KeyError):
+        serial_probe.flow_control_code("invalid")
 
 
 class ValueErrorSerialModule:

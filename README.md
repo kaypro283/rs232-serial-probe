@@ -165,7 +165,7 @@ Default settings are tuned for practical bench use:
 - `2.0s` post-send output wait
 - top-match verify enabled (`8K` payload)
 - flow tests enabled
-- quick stale clear cap `131072` bytes (enough for a 64K buffer plus margin)
+- quick stale clear cap `DEFAULT_MAX_DRAIN_BYTES` (`128 KiB`, `131072` bytes; enough for a 64K buffer plus margin)
 - known-baud purge stages use longer calculated drain limits
 
 One pass is usually enough to identify likely settings. For confidence, rerun with larger payloads or more repeats around top candidates.
@@ -199,10 +199,11 @@ SCAN TIME 0001/0480: ELAPSED=2S AVG=2S/SET LEFT=15M58S FINISH=22:26:02
 If buffered old data is still dumping, a score can be misleading. The tool tries to clear old output before tests and waits for the line to go quiet.
 
 - Quick per-test stale handling is controlled in `TIMING / PER-TEST STALE`
+- The default quick stale-clear cap is `DEFAULT_MAX_DRAIN_BYTES` (`128 KiB`, `131072` bytes)
 - Known-baud and specialized workflows use longer calculated purge limits
 - If output does not settle, the test is marked `RESULT STALE`
 
-For the upgraded 64K SS16 scenario, default quick clear (`131072` bytes) is typically sufficient. If much more arrives continuously, you are usually seeing repeat/noise/wrong framing rather than normal stale residue.
+For the upgraded 64K SS16 scenario, default quick clear (`DEFAULT_MAX_DRAIN_BYTES`, `128 KiB` / `131072` bytes) is typically sufficient. If much more arrives continuously, you are usually seeing repeat/noise/wrong framing rather than normal stale residue.
 
 ---
 
