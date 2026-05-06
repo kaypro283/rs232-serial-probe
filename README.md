@@ -1,51 +1,87 @@
 # Serial Probe
 
-`serial_probe.py` is a Windows terminal tool for discovering serial switch settings for a serial-to-serial printer buffer. It sends known ASCII probe data into one COM port, reads the output from another COM port, scores the match, and ranks the likely settings.
+`serial_probe.py` is a Windows terminal utility for identifying workable serial settings through an inline serial buffer. It was built to diagnose a **Consolink Corporation Microspooler (Model SS16)** that was upgraded from **16K to 64K** memory, where switch positions and real behavior did not always line up cleanly with old notes or assumptions.
 
-The intended setup is:
+In plain terms: this tool sends known probe data into one COM port, reads what comes out of another COM port, and scores how closely the output matches the input. It then ranks likely settings and writes a persistent report/log so you can compare runs.
 
-- Input side: `COM1`, where the tool transmits test data.
-- Output side: `COM5`, where the tool reads data from the buffer.
-- Physical path: `COM1 >> buffer input >> buffer output >> COM5`.
-- Switch-mapping assumption: set both buffer switch banks the same way for a scan.
+---
 
-The program sets the COM port baud/data/parity/stop/flow options itself when it opens the ports. Device Manager defaults are not used as fixed test settings.
+## Why this program exists
+
+I wrote this for bench troubleshooting where "try a few settings and hope" was too slow and too ambiguous. The original target was a Consolink microspooler path:
+
+- Input side: `COM1` (probe transmit)
+- Output side: `COM5` (probe receive)
+- Physical chain: `COM1 -> buffer input -> buffer output -> COM5`
+
+For this hardware, one practical assumption during discovery is to set both switch banks the same way and test from there.
+
+Also important: the program applies serial settings directly when it opens each port (baud, bits, parity, stop, flow). It does **not** trust Device Manager defaults as test truth.
+
+---
+
+## Other practical uses beyond the Consolink SS16
+
+Even though the script was created for a specific microspooler scenario, it is broadly useful anywhere serial behavior is uncertain:
+
+- **Unknown legacy device recovery**: find plausible framing/flow combinations when documentation is incomplete.
+- **Post-repair validation**: confirm that a repaired cable path or interface converter still transfers cleanly.
+- **Handshake behavior checks**: separate plain transfer compatibility from actual hold/release and buffer-full backpressure behavior.
+- **Service documentation**: generate repeatable evidence (report + debug log) for future techs.
+- **Lab qualification**: compare multiple switch states or adapters without manual retesting.
+
+If a device speaks RS-232-style serial and you can loop through it with known TX/RX ports, this workflow is usually applicable.
+
+---
+
+## Requirements
+
+- Windows with Python 3
+- Access to the two COM ports in your test path
+- `pyserial` installed (if not already):
+
+```powershell
+pip install pyserial
+```
+
+- No other software actively holding those COM ports open (terminal emulator, driver UI, vendor tool, etc.)
+
+---
 
 ## Run
 
-Start the interactive terminal menu:
+Start the interactive menu:
 
 ```powershell
 python serial_probe.py
 ```
 
-Usage screen:
+Show help:
 
 ```powershell
 python serial_probe.py --help
 ```
 
-The first screen is the command menu. Use `5 CURRENT SETTINGS` to view ports, each port's configured baud, the last scan baud range, test message size, repeat count, timing, old-output clearing, Phase 0 liveness settings, fixed report files, and available test workflows. `1 START SCAN` opens the discovery workflow menu.
+The UI is intentionally old-terminal style (80x25 friendly), with paged screens and compact operator text. ANSI green is used when supported (PyCharm is treated as color-capable). Set `NO_COLOR=1` if you prefer plain text output.
 
-The terminal UI is written for an 80-column by 25-line early terminal style. Long operator screens pause with `PRESS ENTER FOR MORE, Q TO STOP:`. Screens use terse uppercase operator text and bright green text when the console supports ANSI color. PyCharm runs are treated as color-capable. Set `NO_COLOR=1` before running if you want plain console text.
+---
 
-Status screens, setting-change notices, and the final report use `*` borders to match the style of terminal reports from early printer and communications utilities.
+## Quick start (recommended first pass)
 
-Suggested first run for this COM1-to-COM5 setup:
+1. Launch `python serial_probe.py`
+2. In the menu, review `5 CURRENT SETTINGS`
+3. Keep defaults (`COM1` input, `COM5` output, both fixed at `38400`) unless you know you need different ports/bauds
+4. Choose `1 START SCAN`
+5. Run `AUTOMATED DISCOVERY`
+6. Use the generated report to decide whether to validate further or adjust switch state
 
-```powershell
-python serial_probe.py
-```
+During any active scan/test, `Ctrl+C` opens an operator-break menu so you can resume, end and report, return to menu, or quit after writing partial results.
 
-Use the default fixed settings (`COM1` input and `COM5` output at `38400` baud each) or set ports and fixed bauds with `2 SET COM PORTS / BAUD`, then select `1 START SCAN`. Discovery and Phase 0 ask for the baud range inside that start-scan workflow.
+---
 
-After a scan finishes or is interrupted by the operator, the program stays in the terminal UI and asks whether to run the same settings again, return to the main menu, or quit.
+## Start Scan workflows
 
-During a running scan or validation pass, press `Ctrl+C` for the `OPERATOR BREAK` menu. The menu can resume the same test, end the test and write a partial report, return to the main menu after writing the report, or quit after writing the report.
-
-## Start Scan Workflow
-
-Select `1 START SCAN` from the main menu to choose one of the scan workflows:
+From `1 START SCAN`:
 
 ```text
 1 AUTOMATED DISCOVERY
@@ -54,91 +90,97 @@ Select `1 START SCAN` from the main menu to choose one of the scan workflows:
 4 RETURN TO MAIN MENU
 ```
 
-`AUTOMATED DISCOVERY` starts with Phase 0 baud liveness, then runs staged input/output frame sweeps and a full matrix fallback only when needed. It can validate the top match afterward, depending on `3 SCAN / VALIDATE SETUP`.
+### 1) Automated Discovery
 
-After choosing `AUTOMATED DISCOVERY` or `PHASE 0 BAUD LIVENESS ONLY`, the workflow asks for the baud range for that run.
+This is the default path for unknown settings:
 
-`KNOWN-BAUD DEVICE TEST` is for any serial device or switch mode where you already know the input and output baud. It uses the fixed input/output bauds configured in `2 SET COM PORTS / BAUD`, then runs targeted ASCII frame checks, an 8-bit challenge, raw byte behavior probes, ETX/ACK probing, and flow validation checks.
+- Runs Phase 0 baud liveness first
+- Runs staged frame sweeps
+- Falls back to full matrix only when needed
+- Optionally validates top match afterward (based on menu setting)
 
-When known-baud testing finds a clean follow-up frame, flow validation sweeps the 16 input/output flow-control combinations as transfer checks. If the follow-up frame is the same on both sides, it also runs the output-side hold/release handshake proof. When an output hold is proven, the buffer-full stress test holds output, sends a larger input payload, watches for input-side XOFF/CTS/DSR throttling, then releases output and verifies the drain. The report keeps these separate as `FLOW MATRIX`, `OUTPUT HOLD`, and `INPUT FULL` because transfer compatibility, output pause/resume, and input buffer-full backpressure are different evidence.
+### 2) Known-Baud Device Test
 
-The raw byte behavior phase runs several payload classes after a likely frame is found: CR-only, LF-only, CR/LF, printer-control bytes with TAB/FF/ESC, printable ASCII `0x20..0x7E`, 7-bit controls excluding XON/XOFF, and 7-bit controls including XON/XOFF. Its report compares bytes exactly and records sent/read counts, sent and received hashes, first mismatch offset, and missing/extra byte counts. If the XON/XOFF-free control sweep is exact but the full control sweep changes, the report calls out that XON/XOFF control bytes affected the raw path.
+Use this when input/output baud is already known.
 
-Known-baud device reports use `FOLLOW-UP FRAME` only for a clean ASCII or clean 8-bit target. If no clean ASCII transfer is observed, follow-up behavior, ETX/ACK, and flow checks are skipped or marked diagnostic so a weak fallback row is not mistaken for a recommended setting.
+This mode runs targeted checks for:
 
-If the known-baud device test cannot find a clean ASCII transfer for the selected known bauds, the result is `NO WORKING SERIAL SETTING FOUND` for that device/switch state and baud pair. The next step is to check the selected bauds, cabling direction, switch state, and buffer clear/reset state, or run automated discovery instead of assuming the known bauds are correct.
+- clean ASCII frame transfer
+- 8-bit challenge behavior
+- raw byte fidelity classes
+- ETX/ACK behavior
+- flow transfer validation across all 16 in/out flow combinations
+- output hold/release proof (when applicable)
+- input buffer-full stress behavior after proven output hold
 
-`PHASE 0 BAUD LIVENESS ONLY` only tests whether selected input/output baud pairs show a basic signal. It does not use the scan/validate message-size settings.
+Report sections intentionally separate these into `FLOW MATRIX`, `OUTPUT HOLD`, and `INPUT FULL` because they prove different things.
 
-## Phase 0 Baud Liveness Sweep
+### 3) Phase 0 Baud Liveness Only
 
-Phase 0 tests selected baud pairs using fixed baseline settings:
+A fast gate for "is anything alive at these baud pairs?" using fixed baseline framing/flow rules. This mode does not perform full ranking.
 
-- `8` data bits, even parity, `1` stop bit.
-- Flow control off.
-- Compact structural liveness payload.
-- Fixed internal count and timing.
-- Old-output clearing on.
+---
 
-Phase 0 is a boolean gate, not a ranking. A baud pair is marked `ALIVE` only when the received bytes contain valid checked probe structure, no serial error, no stale output, and only limited extra bytes.
+## Phase 0 liveness details
 
-If no baud pair is alive, the program explains the condition. For narrow baud ranges it can offer a same-baud frame fallback so the operator is not silently returned to the main menu.
+Phase 0 uses fixed baseline serial settings:
 
-## How Many Combinations?
+- 8 data bits
+- even parity
+- 1 stop bit
+- flow off
+- compact structural payload
+- fixed timing/count rules
+- old-output clearing enabled
 
-With the default printer-buffer baud range, the complete same-frame matrix is:
+A pair is marked `ALIVE` only when structure checks pass and output quality is acceptable (no stale contamination/serial error, limited tolerated extras).
 
-```text
-7 baud rates x 2 data-bit choices x 5 parity choices x 2 stop-bit choices x 4 flow-control choices = 560 combinations
-```
+---
 
-The default baud list is:
+## Matrix size and baud order
+
+With default baud list:
 
 ```text
 300, 1200, 2400, 4800, 9600, 19200, 38400
 ```
 
-The scan tries the fastest selected baud rate first, then works downward. With the default range, it starts at `38400` and ends at `300`. The range is selected inside `1 START SCAN` for automated discovery and Phase 0 runs. Automated discovery starts with Phase 0 and staged frame sweeps; it runs the larger full matrix only when the staged checks do not find a strong pair.
+Full same-frame matrix:
 
-## Speed
+```text
+7 baud x 2 data-bit choices x 5 parity choices x 2 stop choices x 4 flow modes = 560 combinations
+```
 
-The default menu settings are tuned for a practical scan:
+Scan order is highest selected baud to lowest (default: `38400` down to `300`).
 
-- `512` quick-scan bytes per setting.
-- `1` test per setting.
-- Automated discovery uses Phase 0 and staged frame sweeps before any full matrix fallback.
-- Output wait after send is `2.0` seconds by default.
-- `Ask on top match` is off by default. If enabled, a `PASS` result pauses the scan and asks whether to continue looking for possible ties.
-- `Top-match verify` is on by default. It retests the top-score setting or settings with an 8K payload. The menu can turn this off or change the size.
-- `Flow tests` are on by default. Known-baud flow transfer still uses a short 1K payload, while `BUFFER-FULL STRESS` uses 128K by default to test input-side backpressure after output hold is proven.
-- Quick per-test old-output clearing stops after `131072` bytes by default, which is enough for a 64K buffer plus margin.
-- Known-baud purge stages use calculated long drain limits instead of the quick per-test clear time.
-- No early stop.
+---
 
-Three repeated tests are not required for the first scan. One test is enough to rank settings. If you want more certainty afterward, rerun with a larger test message or more tests around the suspected setting range.
+## Performance notes
 
-Lower baud rates are still physically slower because the serial line can only move a limited number of bytes per second.
+Default settings are tuned for practical bench use:
 
-The menu estimates scan time in plain terms:
+- `512` quick-scan bytes per setting
+- `1` test per setting
+- `2.0s` post-send output wait
+- top-match verify enabled (`8K` payload)
+- flow tests enabled
+- quick stale clear cap `131072` bytes (enough for a 64K buffer plus margin)
+- known-baud purge stages use longer calculated drain limits
 
-- `Time sending data`: time spent sending the test messages.
-- `Time waiting`: short pauses while the tool waits for the ports or buffer.
-- `Estimated total`: rough total scan time.
+One pass is usually enough to identify likely settings. For confidence, rerun with larger payloads or more repeats around top candidates.
 
-## Live Output
+---
 
-The console shows:
+## Live output behavior
 
-- A `SETTING` banner for each new setting.
-- The active setting, such as `9600 8N1 FLOW=NONE`.
-- Test number.
-- Write progress.
-- Bytes received.
-- Old bytes cleared before sending.
-- Result indicator: `PASS`, `GOOD`, `PARTIAL`, `FAIL`, `STALE`, or `ERROR`.
-- Score from `0` to `100`.
-- A `SCAN TIME` line with elapsed time, average time per setting, remaining time, and approximate finish clock.
-- If `Ask on top match` is enabled, a `TOP MATCH FOUND` prompt after a `PASS` result.
+During scans, the console shows:
+
+- current setting banner (e.g., `9600 8N1 FLOW=NONE`)
+- per-test progress
+- bytes read and pre-test stale-clear count
+- result class (`PASS`, `GOOD`, `PARTIAL`, `FAIL`, `STALE`, `ERROR`)
+- numeric score (`0` to `100`)
+- running scan-time estimate
 
 Example:
 
@@ -149,71 +191,66 @@ Example:
 SCAN TIME 0001/0480: ELAPSED=2S AVG=2S/SET LEFT=15M58S FINISH=22:26:02
 ```
 
-## Stale Output
+---
 
-If the buffer is already dumping old data, the scan cannot reliably score the current test. The tool clears old output before each test and waits for the output side to go quiet.
+## Stale output handling
 
-The `TIMING / PER-TEST STALE` menu controls the quick stale-data check that happens before individual tests. Its `MAX QUICK CLEAR TIME BEFORE TEST` setting is not meant to empty a full low-baud buffer.
+If buffered old data is still dumping, a score can be misleading. The tool tries to clear old output before tests and waits for the line to go quiet.
 
-When the output baud and frame are known, the tool uses calculated long purge limits instead. Known-baud device tests, flow validation, dual validation, and post-Phase-0 frame scans use those known-baud purge paths.
+- Quick per-test stale handling is controlled in `TIMING / PER-TEST STALE`
+- Known-baud and specialized workflows use longer calculated purge limits
+- If output does not settle, the test is marked `RESULT STALE`
 
-If the output does not go quiet, the test is marked:
+For the upgraded 64K SS16 scenario, default quick clear (`131072` bytes) is typically sufficient. If much more arrives continuously, you are usually seeing repeat/noise/wrong framing rather than normal stale residue.
 
-```text
-RESULT STALE
-```
+---
 
-That means the physical buffer should be cleared, reset, or allowed to finish dumping old content before the probe result can be trusted.
+## Reports and logs
 
-## Reports
+Every run appends to fixed files:
 
-At the end, the tool prints:
+- `serial_probe_report.txt`
+- `serial_probe_debug.log`
 
-- Ranked table of top observed results.
-- Recommended switch setting with baud rate, data bits, parity, stop bits, and flow control, but only when the result is strong enough.
-- A `MULTIPLE TOP SETTINGS FOUND` report when two or more strong results are effectively tied.
-- A clear `NO WORKING SETTING FOUND` report when the current buffer switch setup fails every test.
-- Scan duration.
-- Number of settings tested.
-- Result counts.
-- Best match and interpretation.
-- Exact-byte, line-integrity, printable-ASCII, missing-byte, and extra-byte metrics.
+The files are intentionally append-only across restarts so you keep historical evidence unless you manually rotate/clear them.
 
-It also writes:
+Report output includes:
 
-- One fixed text report, `serial_probe_report.txt`.
-- One fixed debug log, `serial_probe_debug.log`.
+- ranked top results
+- recommended setting (when evidence is strong enough)
+- tie reporting for effectively equal top candidates
+- explicit no-working-setting outcomes
+- phase summaries, validation notes, and interpretation guidance
 
-The report paths are not menu-configurable. Report and debug-log writes always append, including across program restarts, so prior session evidence is preserved unless you archive or clear files yourself.
+---
 
-Each test workflow writes a compact run block with the switch/jumper note, selected workflow, phase summary, top results or liveness rows, validation results when run, and interpretation notes. Phase 0-only runs and early no-baud-pair exits write a text report block even though no later frame scan ran.
+## Safety
 
-## Safety Notes
+Before testing, disconnect live equipment that could print, actuate, move, or queue real jobs. Probe only through the intended buffer path. Confirm electrical compatibility and cabling for your RS-232 hardware.
 
-Disconnect real printers or equipment that could print, move, actuate, or store jobs. Use the buffer only. Confirm voltage levels and cabling are appropriate for RS-232 serial hardware.
+---
 
 ## Troubleshooting
 
-No data:
+### No data
 
-- Confirm `COM1` is connected to the buffer input and `COM5` to the buffer output.
-- Close terminal programs, printer drivers, or vendor tools using the COM ports.
-- Check Device Manager for the actual COM numbers.
+- Verify physical direction (`COM1` into buffer input, `COM5` from buffer output)
+- Close applications that may be holding either COM port
+- Confirm COM numbering in Device Manager
 
-Gibberish data:
+### Garbled data
 
-- The baud rate may be close but framing may be wrong.
-- Compare the top rows by baud, data bits, parity, stop bits, and flow control.
+- Baud may be close, but framing is likely wrong
+- Compare top rows across bits/parity/stop/flow, not baud alone
 
-Flow-control problems:
+### Flow-control confusion
 
-- Compare `none`, `xon/xoff`, `rts/cts`, and `dsr/dtr`; those are the flow-control modes in the scan.
-- For input-side buffer-full handshake mapping, use `KNOWN-BAUD DEVICE TEST` and check the `INPUT FULL` result. A clean transfer matrix alone does not prove buffer-full backpressure.
+- Compare `none`, `xon/xoff`, `rts/cts`, `dsr/dtr`
+- Use known-baud testing and read `INPUT FULL` if you need evidence of actual backpressure behavior
 
-Stale data:
+### Persistent stale
 
-- Clear/reset the physical buffer.
-- Let it finish dumping old data.
-- Increase the quick per-test clear time from the menu if you want normal scan tests to wait longer before marking a setting `STALE`.
-- Known-baud purge stages already use calculated long limits for the selected output baud/frame.
-- For a 64K buffer, the default quick max clear value of `131072` bytes should usually be enough. If more than that keeps arriving, the output is probably repeating, noisy, or not really stale buffer contents.
+- Clear/reset the physical buffer
+- Let buffered output finish
+- Increase quick clear time if needed for regular scan mode
+- Remember known-baud purge stages already apply longer drain logic
