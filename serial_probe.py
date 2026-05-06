@@ -3172,24 +3172,21 @@ def session_file_key(path: Path) -> Path:
 
 
 def session_file_mode(path: Path, initialized_paths: set[Path]) -> str:
-    """Return the write mode for a session-scoped report or log file.
+    """Return append mode for report/log files so history is preserved.
 
-    The first open for a resolved path in this process uses write mode so the
-    previous program session is replaced. Later opens append additional report
-    blocks from the same interactive session.
+    Reports and logs are now always appended across program restarts. This
+    preserves prior evidence and avoids accidental loss from truncation.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     key = session_file_key(path)
-    # WHY: Operators can run several workflows before quitting. Truncating once
-    # per process keeps the current session together without mixing in old runs.
-    if key in initialized_paths:
-        return "a"
+    # WHY: preserve prior sessions by default; callers can archive/rotate files
+    # externally when they want fresh files.
     initialized_paths.add(key)
-    return "w"
+    return "a"
 
 
 def open_session_text_report(path: Path) -> TextIO:
-    """Open a text report block, replacing prior sessions on first write."""
+    """Open a text report block in append mode."""
     return path.open(
         session_file_mode(path, SESSION_TEXT_REPORT_PATHS),
         encoding="utf-8",

@@ -397,7 +397,7 @@ def test_phase0_text_report_metadata_uses_terminal_text(tmp_path: Path) -> None:
     assert not has_lowercase(report)
 
 
-def test_session_text_report_replaces_prior_session_then_appends(
+def test_session_text_report_appends_across_sessions(
     tmp_path: Path,
 ) -> None:
     report_path = tmp_path / "serial_probe_report.txt"
@@ -413,10 +413,10 @@ def test_session_text_report_replaces_prior_session_then_appends(
         serial_probe.SESSION_TEXT_REPORT_PATHS.clear()
         serial_probe.SESSION_TEXT_REPORT_PATHS.update(original_paths)
 
-    assert report_path.read_text(encoding="utf-8") == "FIRST BLOCK\nSECOND BLOCK\n"
+    assert report_path.read_text(encoding="utf-8") == "OLD SESSION\nFIRST BLOCK\nSECOND BLOCK\n"
 
 
-def test_phase0_text_report_replaces_old_report(tmp_path: Path) -> None:
+def test_phase0_text_report_appends_to_existing_report(tmp_path: Path) -> None:
     report_path = tmp_path / "serial_probe_report.txt"
     report_path.write_text("OLD SESSION\n", encoding="utf-8")
     metrics = serial_probe.score_received(b"abc", b"abc").metrics
@@ -469,7 +469,7 @@ def test_phase0_text_report_replaces_old_report(tmp_path: Path) -> None:
 
     output = report_path.read_text(encoding="utf-8")
 
-    assert "OLD SESSION" not in output
+    assert "OLD SESSION" in output
     assert "SERIAL PROBE PHASE 0 REPORT" in output
     assert "PHASE 0 BAUD LIVENESS" in output
     assert "INBAUD OUTBAUD" in output
@@ -480,7 +480,7 @@ def test_phase0_text_report_replaces_old_report(tmp_path: Path) -> None:
     )
 
 
-def test_session_log_replaces_prior_session_then_appends(tmp_path: Path) -> None:
+def test_session_log_appends_across_sessions(tmp_path: Path) -> None:
     log_path = tmp_path / "serial_probe_debug.log"
     log_path.write_text("OLD SESSION\n", encoding="utf-8")
     original_paths = set(serial_probe.SESSION_LOG_FILE_PATHS)
@@ -500,7 +500,7 @@ def test_session_log_replaces_prior_session_then_appends(tmp_path: Path) -> None
 
     output = log_path.read_text(encoding="utf-8")
 
-    assert "OLD SESSION" not in output
+    assert "OLD SESSION" in output
     assert "first block" in output
     assert "second block" in output
 
