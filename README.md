@@ -26,6 +26,7 @@ Also important: the program applies serial settings directly when it opens each 
 
 Even though the script was created for a specific microspooler scenario, it is broadly useful anywhere serial behavior is uncertain:
 
+- **Cable and port baseline checks**: prove that a null-modem cable, USB-to-RS232 adapter, serial card, or driver path can move bytes before adding the real device.
 - **Unknown legacy device recovery**: find plausible framing/flow combinations when documentation is incomplete.
 - **Post-repair validation**: confirm that a repaired cable path or interface converter still transfers cleanly.
 - **Handshake behavior checks**: separate plain transfer compatibility from actual hold/release and buffer-full backpressure behavior.
@@ -33,6 +34,30 @@ Even though the script was created for a specific microspooler scenario, it is b
 - **Lab qualification**: compare multiple switch states or adapters without manual retesting.
 
 If a device speaks RS-232-style serial and you can loop through it with known TX/RX ports, this workflow is usually applicable.
+
+---
+
+## Direct null-modem vs. device-path testing
+
+A direct null-modem connection:
+
+```text
+COM1 -> null-modem cable -> COM5
+```
+
+is a **baseline test**. It proves that the selected PC ports, adapters, drivers, and cable wiring can transmit and receive at the tested settings. It does not discover hidden settings from the cable itself; the program controls both ends and applies each baud/frame/flow candidate when it opens the ports.
+
+The discovery workflow is most useful when the unknown device is in the middle:
+
+```text
+COM1 -> device input -> device output -> COM5
+```
+
+In that setup, the program can rank which baud rate, data bits, parity, stop bits, and flow-control combinations actually survive through the device path.
+
+Examples that can be tested this way include printer buffers/spoolers, serial switch boxes, line drivers, isolators, RS-232 extenders, protocol converters in transparent mode, serial-over-IP tunnels, RS-232 to RS-422/RS-485 converters, and legacy equipment that echoes or forwards data.
+
+Endpoint-only devices that merely consume commands and do not echo or forward the probe data usually need a device-specific protocol test instead.
 
 ---
 
@@ -226,7 +251,7 @@ This program uses **PC perspective** for direction labels.
 
 - **PC TX / Output**: bytes leaving the computer toward the device path.
 - **PC RX / Input**: bytes entering the computer from the device path.
-- **Device/Bufer IN** corresponds to **PC TX / Output**.
+- **Device/Buffer IN** corresponds to **PC TX / Output**.
 - **Device/Buffer OUT** corresponds to **PC RX / Input**.
 
 For the default setup:
