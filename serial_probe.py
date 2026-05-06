@@ -1896,7 +1896,7 @@ def receive_completion_detected(received: bytes, expected: bytes) -> bool:
         return False
     if end_marker not in received:
         return False
-    if len(received) == len(expected):
+    if received == expected:
         return True
     score = score_received(expected, received)
     return (
@@ -3621,11 +3621,16 @@ def classify_phase0_liveness(
         return Phase0LivenessDecision(False, "EXTRA OUTPUT")
     if result.metrics.line_integrity_ratio < PHASE0_MIN_LINE_INTEGRITY:
         return Phase0LivenessDecision(False, "NO VALID PROBE LINE")
-    if not (
-        result.metrics.start_marker_present
-        or result.metrics.end_marker_present
+    if (
+        not result.metrics.start_marker_present
+        and not result.metrics.end_marker_present
     ):
         return Phase0LivenessDecision(False, "NO PROBE MARKER")
+    if (
+        not result.metrics.start_marker_present
+        or not result.metrics.end_marker_present
+    ):
+        return Phase0LivenessDecision(False, "INCOMPLETE PROBE MARKER")
     if result.score < PHASE0_MIN_ALIVE_SCORE:
         return Phase0LivenessDecision(False, f"LOW SCORE {result.score:.1f}")
     return Phase0LivenessDecision(True, "VALID PROBE STRUCTURE")
@@ -5357,6 +5362,7 @@ def write_payload_only(
                     f"({percent:5.1f}%)"
                 )
                 next_progress_at = now + max(progress_interval, 0.1)
+        in_serial.flush()
     except SERIAL_IO_ERRORS as exc:
         error = str(exc)
         logger.debug("%s write failed: %s", prefix, error)

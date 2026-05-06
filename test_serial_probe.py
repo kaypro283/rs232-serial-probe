@@ -33,6 +33,19 @@ class OSErrorWriter:
         raise OSError("serial device unavailable")
 
 
+class FlushRecordingWriter:
+    def __init__(self) -> None:
+        self.written = bytearray()
+        self.flushed = False
+
+    def write(self, data: bytes) -> int:
+        self.written.extend(data)
+        return len(data)
+
+    def flush(self) -> None:
+        self.flushed = True
+
+
 class ValueErrorSerialModule:
     SEVENBITS = 7
     EIGHTBITS = 8
@@ -73,6 +86,20 @@ def test_receive_completion_detects_complete_eight_bit_payload() -> None:
     assert not serial_probe.receive_completion_detected(payload.data[:-1], payload.data)
 
 
+def test_receive_completion_rejects_same_length_wrong_nonce_payload() -> None:
+    expected = serial_probe.generate_payload(
+        serial_probe.DEFAULT_PAYLOAD_BYTES,
+        serial_probe.ProbeNonce("RUNTEST", "CAND_A", "TRIAL_1"),
+    )
+    stale = serial_probe.generate_payload(
+        serial_probe.DEFAULT_PAYLOAD_BYTES,
+        serial_probe.ProbeNonce("RUNTEST", "CAND_B", "TRIAL_1"),
+    )
+
+    assert len(stale.data) == len(expected.data)
+    assert not serial_probe.receive_completion_detected(stale.data, expected.data)
+
+
 def test_payload_for_trial_nonces_phase0_payload() -> None:
     template = serial_probe.generate_phase0_payload()
 
@@ -105,6 +132,27 @@ def test_payload_for_trial_nonces_phase0_payload() -> None:
     assert score.classification == "wrong-nonce"
 
 
+def test_phase0_liveness_requires_complete_probe_markers() -> None:
+    payload = serial_probe.generate_phase0_payload()
+    received = payload.data.removesuffix(serial_probe.phase0_end_marker(payload.nonce))
+    score = serial_probe.score_received(payload.data, received)
+    result = dataclasses.replace(
+        serial_probe.fake_clean_candidate_result(
+            serial_probe.dual_phase0_settings(9600, 9600),
+            payload,
+        ),
+        bytes_received=len(received),
+        score=score.score,
+        status="strong",
+        metrics=score.metrics,
+    )
+
+    decision = serial_probe.classify_phase0_liveness(result, payload.byte_count)
+
+    assert not decision.alive
+    assert decision.reason == "INCOMPLETE PROBE MARKER"
+
+
 def test_serial_write_os_error_is_reported_as_io_error() -> None:
     payload = serial_probe.generate_payload(serial_probe.DEFAULT_PAYLOAD_BYTES)
 
@@ -120,6 +168,26 @@ def test_serial_write_os_error_is_reported_as_io_error() -> None:
     assert bytes_sent == 0
     assert error == "serial device unavailable"
     assert elapsed >= 0.0
+
+
+def test_write_payload_only_flushes_after_successful_write() -> None:
+    payload = serial_probe.generate_payload(serial_probe.DEFAULT_PAYLOAD_BYTES)
+    writer = FlushRecordingWriter()
+
+    bytes_sent, error, elapsed = serial_probe.write_payload_only(
+        in_serial=writer,
+        settings=serial_probe.SerialSettings(9600, 8, "none", 1, "none"),
+        payload=payload,
+        progress_interval=1.0,
+        prefix="[TEST]",
+        logger=logging.getLogger("test"),
+    )
+
+    assert bytes_sent == payload.byte_count
+    assert error is None
+    assert elapsed >= 0.0
+    assert bytes(writer.written) == payload.data
+    assert writer.flushed
 
 
 def test_serial_open_value_error_is_reported_as_configuration_error() -> None:
