@@ -8,10 +8,17 @@ import datetime as dt
 import logging
 from pathlib import Path
 
+try:
+    import tomllib
+except ModuleNotFoundError:
+    tomllib = None
+
 import pytest
 from pytest import CaptureFixture, MonkeyPatch
 
 import serial_probe
+
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 def fake_input_from(values: list[str]):
@@ -30,6 +37,35 @@ def fake_input_from(values: list[str]):
             ) from exc
 
     return fake_input
+
+
+def test_project_metadata_matches_public_repo_name_and_entry_point() -> None:
+    if tomllib is None:
+        pytest.skip("tomllib requires Python 3.11+; install tomli for Python 3.10")
+
+    with (PROJECT_ROOT / "pyproject.toml").open("rb") as config_file:
+        config = tomllib.load(config_file)
+
+    project = config["project"]
+    description = project["description"]
+
+    assert project["name"] == "rs232-serial-probe"
+    assert description.startswith("Windows RS-232 serial settings discovery")
+    assert "legacy devices" in description
+    assert "printer buffers" in description
+    assert project["requires-python"] == ">=3.10"
+    assert "pyserial>=3.5" in project["dependencies"]
+    assert project["scripts"]["serial-probe"] == "serial_probe:main"
+    assert config["tool"]["setuptools"]["py-modules"] == ["serial_probe"]
+    assert callable(serial_probe.main)
+
+
+def test_readme_uses_public_project_name() -> None:
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert readme.startswith("# RS-232 Serial Probe\n")
+    assert "`rs232-serial-probe` is a Windows Python terminal utility" in readme
+    assert "Useful search terms for the project:" in readme
 
 
 def test_fake_input_from_exhaustion_reports_prompt_context() -> None:
