@@ -184,7 +184,7 @@ It also writes:
 - One fixed text report, `serial_probe_report.txt`.
 - One fixed debug log, `serial_probe_debug.log`.
 
-The report paths are not menu-configurable. The first report/log write in a program session overwrites the previous session's file, then additional blocks in the same open session are added to that current-session file. Closing the program and starting it again starts a fresh report and debug log.
+The report paths are not menu-configurable. Report and debug-log writes always append, including across program restarts, so prior session evidence is preserved unless you archive or clear files yourself.
 
 Each test workflow writes a compact run block with the switch/jumper note, selected workflow, phase summary, top results or liveness rows, validation results when run, and interpretation notes. Phase 0-only runs and early no-baud-pair exits write a text report block even though no later frame scan ran.
 
