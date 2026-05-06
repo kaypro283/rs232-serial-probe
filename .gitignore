@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
+*.egg-info/
 
 serial_probe_*.log
 serial_probe_report.txt

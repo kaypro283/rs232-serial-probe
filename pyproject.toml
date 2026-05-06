@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rs232-serial-probe"
+version = "0.1.0"
+description = "Windows RS-232 serial settings discovery and validation tool for legacy devices and printer buffers."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["pyserial>=3.5"]
+keywords = [
+    "rs-232",
+    "serial",
+    "com-port",
+    "baud-rate",
+    "flow-control",
+    "pyserial",
+    "legacy-hardware",
+    "printer-buffer",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Manufacturing",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: System :: Hardware",
+    "Topic :: Utilities",
+]
+
+[project.scripts]
+serial-probe = "serial_probe:main"
+
+[tool.setuptools]
+py-modules = ["serial_probe"]

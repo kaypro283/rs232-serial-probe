@@ -1,8 +1,10 @@
-# Serial Probe
+# RS-232 Serial Probe
 
-`serial_probe.py` is a Windows terminal utility for identifying workable serial settings through an inline serial buffer. It was built to diagnose a **Consolink Corporation Microspooler (Model SS16)** that was upgraded from **16K to 64K** memory, where switch positions and real behavior did not always line up cleanly with old notes or assumptions.
+`rs232-serial-probe` is a Windows Python terminal utility for identifying workable RS-232 serial settings through an inline serial buffer, printer buffer, or other legacy device path. It was built to diagnose a **Consolink Corporation Microspooler (Model SS16)** that was upgraded from **16K to 64K** memory, where switch positions and real behavior did not always line up cleanly with old notes or assumptions.
 
 In plain terms: this tool sends known probe data into one COM port, reads what comes out of another COM port, and scores how closely the output matches the input. It then ranks likely settings and writes a persistent report/log so you can compare runs.
+
+Useful search terms for the project: RS-232, serial port, COM port, baud rate, framing, parity, stop bits, flow control, XON/XOFF, RTS/CTS, DSR/DTR, pyserial, printer buffer, legacy hardware.
 
 ---
 
