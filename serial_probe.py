@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
-"""Discover likely serial settings for a serial-to-serial printer buffer.
+"""serial_probe.py
 
-The script assumes a device under test sits between the transmit and receive
-ports. It opens both PC serial ports with matching candidate settings, sends
-deterministic probe payloads into the buffer input, scores what is received
-from the buffer output, and writes a compact text report for the session.
+Interactive serial-port discovery and validation for printer-buffer devices.
+
+The program treats the PC transmit port as the buffer input side and the PC
+receive port as the buffer output side. It sends deterministic probe payloads,
+scores the bytes returned by the device under test, and writes operator-facing
+reports for baud, frame, flow-control, raw-byte, and ETX/ACK observations.
+
+Terminology used throughout this module:
+    * A candidate is one serial setting or one independent input/output pair.
+    * Phase 0 is a fixed-frame baud-liveness gate, not a final ranking.
+    * A nonce identifies one run/candidate/trial so stale buffer output can be
+      separated from data produced by the current test.
 """
 
 from __future__ import annotations
@@ -154,7 +162,17 @@ BEST_EFFORT_PLATFORM_ERRORS: tuple[type[Exception], ...] = (
 
 
 def flow_control_code(flow_control: str) -> str:
-    """Return a short flow-control code for compact dual-bank displays."""
+    """Return the short flow-control code used in compact result displays.
+
+    Args:
+        flow_control: Program-level flow-control name.
+
+    Returns:
+        The fixed-width-ish display code for known flow-control values.
+
+    Raises:
+        KeyError: If `flow_control` is outside the configured flow-control set.
+    """
     return {
         "none": "NONE",
         "xon/xoff": "XON",
@@ -181,7 +199,13 @@ class QuitProgramAfterReport(Exception):
 
 @dataclass(frozen=True)
 class SerialSettings:
-    """A complete serial configuration candidate."""
+    """One concrete baud/frame/flow profile for a serial side.
+
+    Notes:
+        Instances are frozen and hashable because candidate lists are de-duped
+        by value. Values stay in program terminology until `serial_constants`
+        maps them to pyserial constants at the I/O boundary.
+    """
 
     baud: int
     data_bits: int
@@ -210,7 +234,13 @@ class SerialSettings:
 
 @dataclass(frozen=True)
 class DualSerialSettings:
-    """Independent input and output serial settings for a dual-bank buffer."""
+    """Independent input-side and output-side serial settings.
+
+    Dual settings are used when a buffer may expose separate switch banks for
+    the input path and output path. Compatibility properties intentionally
+    return input-side values so shared timing and progress helpers can accept
+    either `SerialSettings` or `DualSerialSettings`.
+    """
 
     input_settings: SerialSettings
     output_settings: SerialSettings
@@ -269,7 +299,12 @@ class DualSerialSettings:
 
 @dataclass(frozen=True)
 class ProbeNonce:
-    """Identity fields embedded in a probe payload."""
+    """Run/candidate/trial identity embedded in generated probe payloads.
+
+    The nonce is part of the checksum-covered payload text. Scoring treats
+    mismatched nonces as stale or wrong-candidate data rather than as a weak
+    partial match.
+    """
 
     run_id: str
     candidate_id: str
@@ -294,7 +329,13 @@ class ProbeNonce:
 
 @dataclass(frozen=True)
 class ProbePayload:
-    """Generated probe bytes and expected line metadata."""
+    """Generated probe bytes plus metadata needed by scoring.
+
+    Notes:
+        `data` is the exact byte stream to send. `payload_mode` determines how
+        `score_received` interprets structure, line checksums, and high-bit
+        challenge bytes.
+    """
 
     data: bytes
     line_count: int
@@ -307,7 +348,12 @@ class ProbePayload:
 
 @dataclass(frozen=True)
 class ScoreMetrics:
-    """Quality metrics for one received burst."""
+    """Byte, structure, nonce, and high-bit metrics for one received burst.
+
+    Ratios are computed against the expected payload where applicable. Counts
+    such as `missing_bytes` and `extra_bytes` use byte-count deltas, while
+    checksum line counts only include structurally valid probe lines.
+    """
 
     exact_byte_match_ratio: float
     line_integrity_ratio: float
@@ -330,7 +376,7 @@ class ScoreMetrics:
 
 @dataclass(frozen=True)
 class ParsedProbeLine:
-    """One structurally valid checksum-protected probe line from received bytes."""
+    """One checksum-valid probe line parsed from received bytes."""
 
     line_number: int
     checksum: int
@@ -340,7 +386,12 @@ class ParsedProbeLine:
 
 @dataclass(frozen=True)
 class ScoreResult:
-    """Score and metrics for one received burst."""
+    """Score, metrics, classification, and evidence for one received burst.
+
+    The score is a bounded 0..100 confidence value, not a probability.
+    `classification` carries the operational reason used later for status
+    precedence and reporting.
+    """
 
     score: float
     metrics: ScoreMetrics
@@ -350,7 +401,7 @@ class ScoreResult:
 
 @dataclass(frozen=True)
 class DrainResult:
-    """Result from draining stale output before sending a burst."""
+    """Outcome from draining stale output before a probe or validation stage."""
 
     bytes_drained: int
     elapsed_sec: float
@@ -361,7 +412,13 @@ class DrainResult:
 
 @dataclass(frozen=True)
 class TrialResult:
-    """Result from one payload burst under one candidate setting."""
+    """Result from one payload burst under one candidate setting.
+
+    Notes:
+        The object is immutable after construction. It records both transfer
+        evidence and timing slices so candidate-level aggregation can preserve
+        stale-output and serial-error precedence.
+    """
 
     burst_index: int
     bytes_sent: int
@@ -385,7 +442,7 @@ class TrialResult:
 
 @dataclass(frozen=True)
 class TimingBreakdown:
-    """Wall-clock stage timing for one candidate or burst."""
+    """Wall-clock stage timing for one candidate, burst, or validation step."""
 
     open_setup_sec: float
     drain_sec: float
@@ -396,7 +453,12 @@ class TimingBreakdown:
 
 @dataclass(frozen=True)
 class CandidateResult:
-    """Aggregated result for one serial settings candidate."""
+    """Aggregated result for one serial-settings candidate.
+
+    A candidate may be a same-setting scan row or an independent input/output
+    pair. `trials` are preserved because report interpretation depends on
+    repeatability, stale nonces, and per-burst errors.
+    """
 
     index: int
     total: int
@@ -417,7 +479,12 @@ class CandidateResult:
 
 @dataclass(frozen=True)
 class ScanOptions:
-    """Runtime options that drive a scan."""
+    """Runtime configuration shared by discovery, validation, and reports.
+
+    The interactive menu mutates configuration by creating replacement
+    instances. Functions that need a run id should call `ensure_run_id` or
+    explicitly replace `run_id` before payload generation.
+    """
 
     in_port: str
     out_port: str
@@ -451,7 +518,7 @@ class ScanOptions:
 
 @dataclass(frozen=True)
 class MenuSelection:
-    """The main-menu action selected by the operator."""
+    """Main-menu action, active options, and optional workflow key."""
 
     action: str
     options: ScanOptions
@@ -460,7 +527,7 @@ class MenuSelection:
 
 @dataclass(frozen=True)
 class EffectiveTiming:
-    """Effective phase-1 timing after applying discovery speed policy."""
+    """Timing values after discovery speed and low-baud policies are applied."""
 
     read_timeout: float
     settle_ms: int
@@ -471,7 +538,7 @@ class EffectiveTiming:
 
 @dataclass(frozen=True)
 class Phase0LivenessDecision:
-    """Boolean liveness decision for one Phase 0 baud probe."""
+    """Boolean Phase 0 liveness decision plus the operator-facing reason."""
 
     alive: bool
     reason: str
@@ -479,7 +546,7 @@ class Phase0LivenessDecision:
 
 @dataclass(frozen=True)
 class DualBaudLivenessResult:
-    """Phase 0 result for one input/output baud pair."""
+    """Phase 0 result for one independently tested input/output baud pair."""
 
     input_baud: int
     output_baud: int
@@ -498,7 +565,12 @@ class DualBaudLivenessResult:
 
 @dataclass(frozen=True)
 class DualBaudLivenessReport:
-    """Run summary for the dual-bank Phase 0 baud matrix."""
+    """Run summary for the dual-bank Phase 0 baud matrix.
+
+    `selected_pairs` is the subset that later frame sweeps expand. It may come
+    from alive pairs or from the same-baud fallback path when the operator
+    chooses to continue after no Phase 0 signal.
+    """
 
     ran: bool
     tested_pairs: list[tuple[int, int]]
@@ -512,7 +584,12 @@ class DualBaudLivenessReport:
 
 @dataclass(frozen=True)
 class FlowControlValidationResult:
-    """Result from one post-scan flow-control validation."""
+    """Result from one flow-control validation method.
+
+    The `method` field distinguishes transfer-only sweeps, output hold/release
+    checks, and input-side buffer-full stress. Those methods prove different
+    things and must not be collapsed into one generic "flow works" result.
+    """
 
     flow_control: str
     method: str
@@ -532,7 +609,7 @@ class FlowControlValidationResult:
 
 @dataclass(frozen=True)
 class Bank2BehaviorProbeResult:
-    """Byte-level printer-job behavior observation for one known-baud probe."""
+    """Byte-level raw printer-job observation for one known-baud probe."""
 
     name: str
     settings: SerialSettings | DualSerialSettings
@@ -556,7 +633,7 @@ class Bank2BehaviorProbeResult:
 
 @dataclass(frozen=True)
 class Bank2EtxAckProbeResult:
-    """ETX/ACK byte-path observation for one known-baud probe frame."""
+    """Forward ETX and reverse ACK observation for one known-baud frame."""
 
     settings: SerialSettings | DualSerialSettings
     forward_bytes_sent: int
@@ -579,7 +656,12 @@ class Bank2EtxAckProbeResult:
 
 @dataclass(frozen=True)
 class Bank2CharacterizationResult:
-    """Report result block for one known-baud device/switch state."""
+    """Report block for one known-baud device or switch state.
+
+    This groups evidence from targeted frame checks, high-bit tests, raw byte
+    behavior, ETX/ACK probing, and flow-control validation. The conclusion is a
+    compact operator summary, not a claim about DIP-switch semantics.
+    """
 
     switch_note: str
     known_baud_text: str
@@ -595,7 +677,14 @@ class Bank2CharacterizationResult:
 
 
 def fnv1a32(data: bytes) -> int:
-    """Return a deterministic FNV-1a 32-bit hash for bytes."""
+    """Return the deterministic FNV-1a 32-bit hash for bytes.
+
+    Args:
+        data: Byte sequence to hash.
+
+    Returns:
+        Unsigned 32-bit FNV-1a hash value.
+    """
     value = FNV_OFFSET_32
     for byte in data:
         value ^= byte
@@ -604,7 +693,16 @@ def fnv1a32(data: bytes) -> int:
 
 
 def sanitize_nonce_value(value: object, fallback: str = "NA") -> str:
-    """Return a compact printable token safe for one probe line field."""
+    """Return a compact printable token safe for one probe-line field.
+
+    Args:
+        value: Value to convert into a marker token.
+        fallback: Token used when `value` is blank or sanitizes to nothing.
+
+    Returns:
+        A token of at most 48 ASCII characters containing only marker-safe
+        letters, digits, underscores, periods, colons, or hyphens.
+    """
     text = str(value).strip()
     if not text:
         text = fallback
@@ -613,14 +711,23 @@ def sanitize_nonce_value(value: object, fallback: str = "NA") -> str:
 
 
 def make_run_id(prefix: str = "R") -> str:
-    """Return a short run id for nonce-bearing payloads."""
+    """Return a short process-local run id for nonce-bearing payloads.
+
+    The value includes UTC time, `time_ns`, and process id hash input. It is
+    intended to distinguish runs for stale-output detection, not to be a secure
+    or reproducible identifier.
+    """
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S")
     entropy = fnv1a32(f"{stamp}:{time.time_ns()}:{os.getpid()}".encode("ascii"))
     return sanitize_nonce_value(f"{prefix}{stamp}{entropy:08X}"[-24:])
 
 
 def switch_note_hash(switch_note: str | None) -> str | None:
-    """Return a stable compact hash for an operator switch-note string."""
+    """Return a stable compact hash for an operator switch-note string.
+
+    Blank notes return `None`; non-blank notes return an eight-character
+    uppercase FNV-1a hash used in payload nonces and reports.
+    """
     note = (switch_note or "").strip()
     if not note:
         return None
@@ -631,7 +738,13 @@ def candidate_nonce_id(
     _settings: SerialSettings | DualSerialSettings,
     candidate_index: int,
 ) -> str:
-    """Return a candidate id that is unique within the current run."""
+    """Return the candidate id embedded in nonce-bearing payloads.
+
+    Notes:
+        `_settings` is accepted for call-site symmetry with candidate execution
+        helpers. The current payload format uses the candidate index to keep
+        marker lines short and stable within one run.
+    """
     return sanitize_nonce_value(f"C{candidate_index:04d}")
 
 
@@ -663,7 +776,12 @@ def make_probe_line(
     data: str,
     nonce: ProbeNonce | None = None,
 ) -> bytes:
-    """Build one checksum-protected ASCII line for the probe payload."""
+    """Build one checksum-protected ASCII line for a probe payload.
+
+    The checksum covers the line text to the left of `HASH=`. Received lines
+    are accepted only when that checksum verifies, which makes line-integrity
+    scoring insensitive to unrelated serial noise before or after the line.
+    """
     block_number = (line_number - 1) % 32
     nonce_text = nonce_field_text(nonce)
     left = (
@@ -729,10 +847,26 @@ def generate_payload(
     payload_bytes: int,
     nonce: ProbeNonce | None = None,
 ) -> ProbePayload:
-    """Generate an ASCII-only probe payload of exactly payload_bytes bytes.
+    """Generate an ASCII-only probe payload of exactly `payload_bytes` bytes.
 
     The payload contains fixed-width start/end markers and checksum-bearing line
     records. Supplying a nonce makes the payload candidate/trial specific.
+
+    Args:
+        payload_bytes: Exact byte count to generate, including markers.
+        nonce: Optional run/candidate/trial identity embedded in markers and
+            every checksum-covered probe line.
+
+    Returns:
+        A `ProbePayload` whose `data` length equals `payload_bytes`.
+
+    Raises:
+        ValueError: If the requested size cannot hold the required structure.
+        AssertionError: If the generator's internal sizing invariants fail.
+
+    Notes:
+        All payload bytes are printable ASCII plus CR/LF so normal serial text
+        paths can be evaluated before the raw high-bit challenge is attempted.
     """
     min_size = minimum_payload_size(nonce)
     if payload_bytes < min_size:
@@ -781,7 +915,9 @@ def generate_payload(
         pad_suffix_len = len(b" HASH=00000000\r\n")
         pad_data_len = remaining_for_pad - pad_prefix_len - pad_suffix_len
         if pad_data_len < 0:
-            # Remove one regular line, then fill the larger remaining space.
+            # WHY: Backing out one DATA line gives the final PAD line enough room
+            # to preserve the exact requested byte count without shortening fixed
+            # markers or weakening per-line checksums.
             if not lines:
                 raise ValueError(f"payload-bytes must be at least {min_size}")
             removed = lines.pop()
@@ -798,7 +934,8 @@ def generate_payload(
         break
 
     if not lines:
-        # Defensive fallback; normal control flow always emits at least one line.
+        # WATCHOUT: Normal control flow emits at least one line; this protects the
+        # structural invariant if future size logic changes.
         lines.append(sample_full_line)
         current_len += len(sample_full_line)
         line_number += 1
@@ -972,7 +1109,21 @@ def generate_eight_bit_payload(
     payload_bytes: int,
     nonce: ProbeNonce | None = None,
 ) -> ProbePayload:
-    """Generate an eight-bit challenge payload with nonce-bearing ASCII metadata."""
+    """Generate an eight-bit challenge payload with ASCII nonce metadata.
+
+    Args:
+        payload_bytes: Exact byte count to generate.
+        nonce: Optional run/candidate/trial identity in ASCII header/footer text.
+
+    Returns:
+        A `ProbePayload` with an ASCII header, raw high-bit block, and ASCII
+        footer describing the high-bit count and hash.
+
+    Raises:
+        ValueError: If the requested size cannot hold the header, one high-bit
+            byte, and footer.
+        AssertionError: If internal byte-count accounting fails.
+    """
     min_size = minimum_eight_bit_payload_size(nonce)
     if payload_bytes < min_size:
         raise ValueError(f"eight-bit payload must be at least {min_size} bytes")
@@ -1039,7 +1190,21 @@ def exact_prefix_byte_count(expected: bytes, received: bytes) -> int:
 
 
 def score_eight_bit_received(expected: bytes, received: bytes) -> ScoreResult:
-    """Score a raw eight-bit challenge payload."""
+    """Score received bytes for a raw eight-bit challenge payload.
+
+    Args:
+        expected: Exact payload bytes sent by the test.
+        received: Bytes read back from the output side.
+
+    Returns:
+        Score and metrics for exact high-bit preservation, stripped high bits,
+        header/footer presence, byte length, and stale-nonce detection.
+
+    Notes:
+        A path that strips high bits is capped below a recommendable score even
+        when ASCII framing survives. That keeps printable transfer evidence
+        separate from proof of an 8-bit-clean data path.
+    """
     expected_len = len(expected)
     received_len = len(received)
     missing = max(expected_len - received_len, 0)
@@ -1123,7 +1288,20 @@ def score_eight_bit_received(expected: bytes, received: bytes) -> ScoreResult:
 
 
 def score_received(expected: bytes, received: bytes) -> ScoreResult:
-    """Score received bytes against the expected probe payload."""
+    """Score received bytes against the expected probe payload.
+
+    Args:
+        expected: Exact payload bytes sent into the buffer input side.
+        received: Bytes read from the buffer output side.
+
+    Returns:
+        Bounded score, metrics, classification, and evidence labels.
+
+    Notes:
+        Byte ratios are position-aligned from offset zero. Probe-line integrity
+        is checksum-based and keyed by line number. Nonce mismatches are treated
+        as stale output, not as partial credit for the current candidate.
+    """
     if b"<<<SERIAL_PROBE_8BIT_BEGIN" in expected:
         return score_eight_bit_received(expected, received)
 
@@ -1279,7 +1457,20 @@ def import_pyserial() -> Any:
 
 # noinspection SpellCheckingInspection
 def serial_constants(serial_module: Any, settings: SerialSettings) -> dict[str, Any]:
-    """Map plain settings values to pyserial constants and flow flags."""
+    """Map program-level settings to pyserial constructor arguments.
+
+    Args:
+        serial_module: Imported pyserial module or a test double with matching
+            constants.
+        settings: Concrete serial setting to convert.
+
+    Returns:
+        Keyword arguments accepted by `serial.Serial`.
+
+    Raises:
+        KeyError: If a setting contains a data-bit, parity, or stop-bit value
+        outside this program's configured candidate space.
+    """
     bytesize = {
         7: serial_module.SEVENBITS,
         8: serial_module.EIGHTBITS,
@@ -1340,7 +1531,18 @@ def estimated_buffer_drain_seconds(
     buffer_bytes: int = BUFFER_PURGE_CAPACITY_BYTES,
     safety_factor: float = 1.2,
 ) -> float:
-    """Estimate full FIFO drain time for a byte count at the selected frame."""
+    """Estimate full FIFO drain time for a byte count at the output frame.
+
+    Args:
+        settings: Same-side or dual-side settings. Dual settings use the output
+            side because the drain is observed on the receive port.
+        buffer_bytes: Number of buffered bytes to drain.
+        safety_factor: Multiplicative margin applied after the physical line
+            estimate.
+
+    Returns:
+        Estimated seconds needed to drain the requested byte count.
+    """
     receive_settings = receive_side_settings(settings)
     seconds = (
         buffer_bytes * serial_frame_bits(receive_settings)
@@ -1365,7 +1567,23 @@ def open_serial_port(
     settings: SerialSettings,
     read_timeout: float,
 ) -> Any:
-    """Open a serial port for one candidate setting."""
+    """Open a serial port for one candidate setting.
+
+    Args:
+        serial_module: Imported pyserial module or test double.
+        port: Windows COM port name.
+        settings: Concrete serial settings for the opened side.
+        read_timeout: Candidate read timeout; clamped for the pyserial polling
+            timeout and used as a lower bound for write timeout.
+
+    Returns:
+        An open pyserial-compatible serial object.
+
+    Raises:
+        SerialConfigurationError: If pyserial rejects the requested setting
+        with `ValueError`.
+        OSError: If the port cannot be opened by the serial driver.
+    """
     constants = serial_constants(serial_module, settings)
     try:
         return serial_module.Serial(
@@ -1382,13 +1600,23 @@ def open_serial_port(
 
 
 def reset_serial_buffers(serial_port: Any) -> None:
-    """Best-effort reset of serial input and output buffers."""
+    """Reset pyserial input and output buffers on an open port.
+
+    Raises:
+        OSError: If the serial driver rejects either reset operation.
+        RuntimeError: If a pyserial-compatible test double raises one.
+    """
     serial_port.reset_input_buffer()
     serial_port.reset_output_buffer()
 
 
 def modem_line_snapshot(serial_port: Any) -> dict[str, bool]:
-    """Best-effort modem-control and status line snapshot for a serial port."""
+    """Return a best-effort modem-control and status snapshot.
+
+    Missing attributes and platform I/O failures are recorded as `False` so
+    flow-validation reports can still be produced on adapters that do not expose
+    every modem line.
+    """
     snapshot: dict[str, bool] = {}
     for name in ("cts", "dsr", "cd", "ri", "rts", "dtr"):
         try:
@@ -1434,7 +1662,12 @@ def preview_hex(data: bytes, limit: int = 32) -> str:
 
 
 def enable_terminal_style() -> None:
-    """Use green ANSI text for an early terminal look when stdout is a terminal."""
+    """Enable green ANSI terminal styling when the current console supports it.
+
+    The function has process-wide stdout side effects: it prints the ANSI start
+    sequence and registers an `atexit` reset when color is enabled. `NO_COLOR`
+    disables this path.
+    """
     if os.environ.get("NO_COLOR"):
         return
     wants_color = (
@@ -1511,7 +1744,19 @@ def print_paged_lines(
     pause_at_end: bool = True,
     return_label: str = "RETURN",
 ) -> None:
-    """Print lines with a simple 80x25-friendly page pause."""
+    """Print lines with a simple 80x25-friendly page pause.
+
+    Args:
+        lines: Lines to print.
+        page_lines: Number of body lines before prompting. Non-positive values
+            print the whole sequence without mid-page pauses.
+        pause_at_end: Whether to prompt after the last printed page.
+        return_label: Prompt text used by the final pause.
+
+    Notes:
+        `EOFError` is treated as non-interactive output and prints the remaining
+        lines without asking for more input.
+    """
     all_lines = list(lines)
     if page_lines <= 0:
         page_lines = len(all_lines)
@@ -1547,7 +1792,11 @@ def print_paged_lines(
 
 
 def read_operator_input(prompt: str) -> str:
-    """Read terminal input, tolerating occasional bad console bytes."""
+    """Read terminal input, tolerating occasional bad console bytes.
+
+    A `UnicodeDecodeError` returns an empty string so prompts fall back to their
+    documented defaults instead of aborting the interactive menu.
+    """
     try:
         return input(prompt)
     except UnicodeDecodeError:
@@ -1713,7 +1962,7 @@ def timing_with_other(
     write_sec: float,
     read_wait_sec: float,
 ) -> TimingBreakdown:
-    """Return timing with unassigned time folded into the other bucket."""
+    """Return timing with unassigned elapsed time folded into `other_sec`."""
     known = open_setup_sec + drain_sec + write_sec + read_wait_sec
     return TimingBreakdown(
         open_setup_sec=open_setup_sec,
@@ -1740,7 +1989,22 @@ def effective_discovery_timing(
     settings: SerialSettings,
     payload_bytes: int,
 ) -> EffectiveTiming:
-    """Return phase-1 timing for one setting after turbo/adaptive policy."""
+    """Return phase-1 timing after turbo and low-baud policies.
+
+    Args:
+        options: Active scan options.
+        settings: Candidate output-side timing context.
+        payload_bytes: Payload size used to estimate physical transmit/receive
+            duration for adaptive cleanup windows.
+
+    Returns:
+        Effective read, settle, pre-drain, and completion-quiet values.
+
+    Notes:
+        Low-baud cleanup can expand pre-drain windows even when turbo discovery
+        is off. Phase 0 has a separate low-baud path because its compact payload
+        otherwise looks fast enough to under-wait at 300/1200 baud.
+    """
     if not options.turbo_discovery_enabled:
         timing = EffectiveTiming(
             read_timeout=options.read_timeout,
@@ -1771,7 +2035,11 @@ def low_baud_pre_drain_values(
     pre_drain_timeout: float,
     pre_drain_quiet: float,
 ) -> tuple[float, float]:
-    """Return pre-drain timeout/quiet values sized for slow output bauds."""
+    """Return pre-drain timeout and quiet values sized for slow output bauds.
+
+    The receive side controls stale-output cleanup because old data is observed
+    on the output port, even when the input side uses a different baud.
+    """
     receive_settings = receive_side_settings(settings)
     if receive_settings.baud >= LOW_BAUD_THRESHOLD:
         return pre_drain_timeout, pre_drain_quiet
@@ -1886,7 +2154,13 @@ def effective_timing_range_label(options: ScanOptions, candidates: Sequence[Seri
 
 
 def receive_completion_detected(received: bytes, expected: bytes) -> bool:
-    """Return True when a received payload has enough structure to stop early."""
+    """Return True when a received payload has enough structure to stop early.
+
+    Notes:
+        Completion is conservative: the received byte count must reach the
+        expected count and include the proper end marker. Non-exact payloads are
+        accepted only when checksum scoring still meets the top-match threshold.
+    """
     end_marker = (
         b"<<<SERIAL_PROBE_8BIT_END"
         if b"<<<SERIAL_PROBE_8BIT_BEGIN" in expected
@@ -1954,7 +2228,29 @@ def drain_output_until_quiet(
     prefix: str,
     logger: logging.Logger,
 ) -> DrainResult:
-    """Drain output bytes until the output side is quiet or a limit is reached."""
+    """Drain output bytes until the output side is quiet or a limit is reached.
+
+    Args:
+        out_serial: Open output-side serial object.
+        quiet_seconds: Required silence window before the drain is considered
+            successful.
+        max_seconds: Hard elapsed-time limit. Non-positive values disable the
+            drain and return a successful `disabled` result.
+        max_bytes: Maximum bytes to consume before reporting stale output.
+        progress_interval: Minimum interval between progress messages.
+        progress: Optional progress callback.
+        prefix: Prefix included in progress output.
+        logger: Logger used for serial read errors.
+
+    Returns:
+        Drain result with byte count, elapsed time, quiet flag, reason, and
+        optional error string.
+
+    Notes:
+        The function resets the output port input buffer before reading. That
+        intentionally discards bytes already queued at the PC adapter so the
+        quiet test reflects device output observed after the drain begins.
+    """
     started = time.monotonic()
     last_data_time = started
     next_progress_at = started + max(progress_interval, 0.1)
@@ -2014,7 +2310,20 @@ def payload_for_trial(
     run_id: str,
     switch_hash: str | None,
 ) -> ProbePayload:
-    """Return a nonce-bearing payload for the current candidate/trial."""
+    """Return a nonce-bearing payload for the current candidate and trial.
+
+    Args:
+        template: Payload shape and mode selected for the stage.
+        settings: Candidate settings used only for candidate nonce construction.
+        candidate_index: One-based candidate index within the current stage.
+        burst_index: One-based burst index for repeated tests.
+        run_id: Current run identifier.
+        switch_hash: Optional hash of the operator switch note.
+
+    Returns:
+        `template` unchanged when it already has a nonce; otherwise a new
+        payload with the same byte count and mode plus current nonce fields.
+    """
     if template.nonce is not None:
         return template
     nonce = ProbeNonce(
@@ -2048,7 +2357,41 @@ def execute_burst(
     run_id: str = "",
     switch_hash: str | None = None,
 ) -> TrialResult:
-    """Send one probe burst and score the received bytes."""
+    """Send one probe burst and score the received bytes.
+
+    Args:
+        in_serial: Open input-side serial object used for writes.
+        out_serial: Open output-side serial object used for reads.
+        settings: Same-side or dual-side candidate settings.
+        payload: Probe payload template for this stage.
+        burst_index: One-based burst number.
+        burst_total: Total bursts planned for this candidate.
+        candidate_index: One-based candidate number.
+        candidate_total: Total candidates planned for this stage.
+        read_timeout: Silence window used after writes complete.
+        completion_quiet: Shorter silence window allowed after structural
+            completion has been detected.
+        settle_ms: Post-reset pause before optional stale-output drain.
+        progress_interval: Minimum interval between progress messages.
+        no_pre_drain: If true, skip stale-output cleanup before sending.
+        pre_drain_timeout: Maximum stale-output drain time.
+        pre_drain_quiet: Silence window required by stale-output drain.
+        max_drain_bytes: Maximum stale bytes allowed before marking stale.
+        logger: Logger for diagnostic details.
+        progress: Optional progress callback.
+        run_id: Current run id for nonce generation.
+        switch_hash: Optional switch-note hash for nonce generation.
+
+    Returns:
+        A `TrialResult` containing transfer metrics, status, previews, timing,
+        and any serial I/O error.
+
+    Notes:
+        The reader thread starts before the writer so data emitted immediately
+        by a low-latency buffer is not missed. Stale output prevents the send
+        entirely, because mixing old bytes with the current nonce would make the
+        candidate score misleading.
+    """
     started = time.monotonic()
     payload = payload_for_trial(
         template=payload,
@@ -2085,6 +2428,9 @@ def execute_burst(
 
     drain = DrainResult(0, 0.0, True, "disabled", None)
     if not no_pre_drain:
+        # WHY: A noisy or still-draining buffer can produce checksum-valid data
+        # from a previous trial. We fail the burst as stale before sending rather
+        # than mix old output into the current candidate score.
         drain = drain_output_until_quiet(
             out_serial=out_serial,
             quiet_seconds=pre_drain_quiet,
@@ -2171,6 +2517,8 @@ def execute_burst(
                     stop_event.set()
                     break
 
+    # WHY: Start the reader before writing so fast loopback-style hardware cannot
+    # fill the adapter buffer before the read loop is active.
     reader_thread = threading.Thread(target=reader, name="serial-probe-reader", daemon=True)
     reader_thread.start()
 
@@ -2233,6 +2581,8 @@ def execute_burst(
         ),
         2.0,
     )
+    # WATCHOUT: The join deadline is larger than the quiet timeout because the
+    # physical line may still be draining at low baud after the write call returns.
     wait_deadline = time.monotonic() + wait_limit
     next_wait_progress_at = time.monotonic() + progress_interval
     read_wait_started = time.monotonic()
@@ -2321,7 +2671,11 @@ def execute_burst(
 
 
 def aggregate_metrics(trials: Sequence[TrialResult]) -> ScoreMetrics:
-    """Aggregate burst metrics into one candidate metric object."""
+    """Aggregate burst metrics into one candidate metric object.
+
+    Ratios are arithmetic means across trials. Byte and line counts are summed
+    so reports show the total missing/extra/stale evidence across repeats.
+    """
     if not trials:
         return ScoreMetrics(
             exact_byte_match_ratio=0.0,
@@ -2389,7 +2743,13 @@ def aggregate_candidate_result(
     elapsed_sec: float,
     opening_error: str | None = None,
 ) -> CandidateResult:
-    """Aggregate one candidate's burst trials into a candidate result."""
+    """Aggregate one candidate's burst trials into a candidate result.
+
+    Notes:
+        Status precedence is intentionally conservative: stale nonce/output
+        beats serial errors, errors beat no-data, and high-bit failures remain
+        failures even when ASCII markers were visible.
+    """
     if opening_error is not None:
         return CandidateResult(
             index=index,
@@ -2417,6 +2777,8 @@ def aggregate_candidate_result(
     stale_trials = [trial for trial in trials if trial.status in STALE_STATUSES]
     metrics = aggregate_metrics(trials)
 
+    # WHY: Stale or wrong-nonce data invalidates the candidate score more than a
+    # weak byte match does, so it wins status precedence during aggregation.
     if stale_trials:
         status = stale_trials[0].status
     elif errors:
@@ -2791,7 +3153,11 @@ def run_dual_candidate(
 
 
 def result_sort_key(result: CandidateResult) -> tuple[float, float, float, int]:
-    """Return descending sort key fields for ranking candidates."""
+    """Return descending sort key fields for candidate ranking.
+
+    Ranking prioritizes overall score, line integrity, exact byte ratio, then
+    received byte count. Callers sort this key with `reverse=True`.
+    """
     return (
         result.score,
         result.metrics.line_integrity_ratio,
@@ -2806,9 +3172,16 @@ def session_file_key(path: Path) -> Path:
 
 
 def session_file_mode(path: Path, initialized_paths: set[Path]) -> str:
-    """Return write mode that truncates only on first use this program session."""
+    """Return the write mode for a session-scoped report or log file.
+
+    The first open for a resolved path in this process uses write mode so the
+    previous program session is replaced. Later opens append additional report
+    blocks from the same interactive session.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     key = session_file_key(path)
+    # WHY: Operators can run several workflows before quitting. Truncating once
+    # per process keeps the current session together without mixing in old runs.
     if key in initialized_paths:
         return "a"
     initialized_paths.add(key)
@@ -2844,7 +3217,12 @@ def setup_logging(log_file: Path) -> logging.Logger:
 
 
 def bytes_to_jsonable(value: bytes | bytearray | memoryview) -> str | dict[str, Any]:
-    """Return a JSON-safe representation of raw bytes."""
+    """Return a JSON-safe representation of raw bytes.
+
+    Printable ASCII bytes are emitted as text for readable diagnostics. Any
+    non-printable payload is base64-wrapped with its byte count so raw probes can
+    be serialized without data loss.
+    """
     data = bytes(value)
     try:
         text = data.decode("ascii")
@@ -2949,7 +3327,11 @@ def append_status_to_progress(base: str, status: str) -> str:
 
 
 def clean_ascii_transfer(result: CandidateResult) -> bool:
-    """Return True when a result proves byte transfer but not necessarily frame."""
+    """Return True when a result proves useful ASCII byte transfer.
+
+    This does not prove raw 8-bit cleanliness, parity uniqueness, stop-bit
+    uniqueness, or flow-control behavior.
+    """
     if result.error or result.status in STALE_STATUSES:
         return False
     if result.status in {"error", "no-data", "partial-write", "weak", "eight-bit-not-clean"}:
@@ -2958,7 +3340,12 @@ def clean_ascii_transfer(result: CandidateResult) -> bool:
 
 
 def frame_ambiguity_lines(results: Sequence[CandidateResult]) -> list[str]:
-    """Return report lines explaining byte-level frame ambiguity."""
+    """Return report lines explaining byte-level frame ambiguity.
+
+    ASCII payloads can pass under more than one parity/stop interpretation. The
+    report calls out those ties so clean byte transfer is not over-read as a
+    unique hardware switch mapping.
+    """
     clean = [result for result in results if clean_ascii_transfer(result)]
     if not clean:
         return []
@@ -3043,7 +3430,11 @@ def format_scan_eta(
 
 
 def is_recommendable_result(result: CandidateResult | None) -> bool:
-    """Return True when a result is strong enough to call a recommendation."""
+    """Return True when a result is strong enough to call a recommendation.
+
+    Stale, wrong-nonce, error, no-data, weak, and high-bit-not-clean rows are
+    never recommendable regardless of their numeric score.
+    """
     if result is None or result.error:
         return False
     if result.status in {
@@ -3194,7 +3585,12 @@ def default_report_paths() -> tuple[Path, Path]:
 
 
 def default_scan_options() -> ScanOptions:
-    """Return practical defaults for the interactive scan."""
+    """Return practical defaults for the interactive scan.
+
+    Defaults are tuned for the documented COM1-to-COM5 printer-buffer setup:
+    quick 512-byte discovery, one burst per candidate, stale-output clearing on,
+    top-match validation on, and flow/backpressure validation enabled.
+    """
     default_text_report, default_log = default_report_paths()
     return ScanOptions(
         in_port="COM1",
@@ -3235,7 +3631,12 @@ def ensure_run_id(options: ScanOptions, prefix: str = "R") -> ScanOptions:
 
 
 def validate_options(options: ScanOptions) -> None:
-    """Validate scan options before launching hardware I/O."""
+    """Validate scan options before launching hardware I/O.
+
+    Raises:
+        ValueError: If ports, baud values, payload sizes, timing values, drain
+        limits, or report paths are outside the supported operating envelope.
+    """
     ensure_distinct_ports(options.in_port, options.out_port)
     validate_supported_baud(options.input_baud)
     validate_supported_baud(options.output_baud)
@@ -3318,7 +3719,17 @@ def generate_phase0_payload(
     payload_bytes: int | None = None,
     nonce: ProbeNonce | None = None,
 ) -> ProbePayload:
-    """Generate a compact structural probe payload for baud liveness."""
+    """Generate the compact structural payload used by Phase 0 liveness.
+
+    Args:
+        payload_bytes: Optional exact byte count. `None` uses the fixed internal
+            Phase 0 size and undersized values are raised to the structural
+            minimum.
+        nonce: Optional run/candidate/trial identity.
+
+    Returns:
+        Phase 0 `ProbePayload` with one checksum-protected `LIVE` line.
+    """
     byte_count = phase0_payload_bytes() if payload_bytes is None else payload_bytes
     byte_count = max(byte_count, phase0_minimum_payload_size(nonce))
     start = phase0_start_marker(nonce)
@@ -3358,7 +3769,11 @@ def phase0_fixed_settings_label() -> str:
 
 
 def phase0_scan_options(options: ScanOptions) -> ScanOptions:
-    """Return fixed internal options for the Phase 0 baud liveness sweep."""
+    """Return fixed internal options for the Phase 0 baud-liveness sweep.
+
+    Phase 0 ignores the operator's normal payload size, burst count, turbo mode,
+    and top-match prompt because it is a boolean gate over baud pairs.
+    """
     return dataclasses.replace(
         options,
         payload_bytes=phase0_payload_bytes(),
@@ -3409,7 +3824,23 @@ def purge_buffer_output(
     reason: str,
     settings_list: Sequence[SerialSettings] | None = None,
 ) -> DrainResult:
-    """Drain a stateful serial printer buffer before a test stage."""
+    """Drain a stateful serial printer buffer before a test stage.
+
+    Args:
+        serial_module: Imported pyserial module or test double.
+        options: Active scan options.
+        logger: Logger for purge diagnostics.
+        reason: Operator-facing explanation printed before purge attempts.
+        settings_list: Optional output-side settings to purge. When omitted,
+            Phase 0 baseline settings across the scan baud range are used.
+
+    Returns:
+        Combined drain outcome across all attempted output settings.
+
+    Notes:
+        The purge is intentionally output-side only. It is meant to clear the
+        device FIFO before scoring, not to validate input-side transmit settings.
+    """
     if not BUFFER_PURGE_ENABLED:
         return DrainResult(0, 0.0, True, "disabled", None)
     settings = list(settings_list) if settings_list is not None else buffer_purge_settings(options)
@@ -3503,7 +3934,11 @@ def run_known_baud_purge(
     reason: str,
     capacity_bytes: int = BUFFER_PURGE_CAPACITY_BYTES,
 ) -> DrainResult:
-    """Run an explicit known-baud purge using the operator-selected frame."""
+    """Run an explicit long-limit purge using a known output-side frame.
+
+    The time limit is based on output baud, frame width, and a safety factor so
+    known-baud validation can wait long enough for a full buffer to drain.
+    """
     base_estimate = estimated_buffer_drain_seconds(
         settings,
         capacity_bytes,
@@ -3604,7 +4039,12 @@ def classify_phase0_liveness(
     result: CandidateResult,
     expected_byte_count: int,
 ) -> Phase0LivenessDecision:
-    """Return a conservative boolean liveness decision for one baud result."""
+    """Return the conservative Phase 0 liveness decision for one baud result.
+
+    A pair is alive only when it has current-run probe structure, complete
+    markers, enough score, no serial error, no stale output, and only limited
+    extra bytes.
+    """
     if result.error or result.status == "error":
         return Phase0LivenessDecision(False, "SERIAL ERROR")
     if result.status == "partial-write":
@@ -3645,7 +4085,11 @@ def dual_phase0_settings(input_baud: int, output_baud: int) -> DualSerialSetting
 
 
 def discovery_frame_priority(settings: SerialSettings) -> tuple[int, int, int, int]:
-    """Return a conservative frame-test priority for one baud."""
+    """Return the frame-test priority used during staged discovery.
+
+    Common byte-transfer frames are tried before unusual mark/space or two-stop
+    variants, and flow remains off until a likely frame is known.
+    """
     parity_rank = {
         "none": 0,
         "even": 1,
@@ -3673,7 +4117,7 @@ def discovery_frame_priority(settings: SerialSettings) -> tuple[int, int, int, i
 
 
 def frame_candidates_for_baud(baud: int) -> list[SerialSettings]:
-    """Return frame candidates for one baud in discovery order."""
+    """Return frame candidates for one baud in deterministic discovery order."""
     frames = [
         SerialSettings(baud, data_bits, parity, stop_bits, "none")
         for data_bits in DATA_BITS
@@ -3716,7 +4160,11 @@ def dual_output_frame_sweep_for_pair(
     input_baud: int,
     output_baud: int,
 ) -> list[DualSerialSettings]:
-    """Hold Phase 0 input framing and sweep output frames."""
+    """Hold Phase 0 input framing and sweep output frames.
+
+    The staged scan first asks whether the output side can be decoded while the
+    input side stays at the Phase 0 baseline. This narrows the later input sweep.
+    """
     seed = dual_phase0_settings(input_baud, output_baud)
     return unique_dual_candidates(
         [
@@ -3742,7 +4190,11 @@ def dual_input_frame_sweep_for_pair(
 def dual_flow_candidates_for_frame(
     settings: DualSerialSettings,
 ) -> list[DualSerialSettings]:
-    """Return all input/output flow combinations for one dual-bank frame pair."""
+    """Return all input/output flow combinations for one dual-bank frame pair.
+
+    Flow is expanded after frame evidence because the 16 flow combinations are
+    meaningful only once byte transfer can already be decoded.
+    """
     return unique_dual_candidates(
         [
             DualSerialSettings(
@@ -3854,7 +4306,11 @@ def format_dual_phase0_progress(
 def select_dual_phase0_pairs(
     results: Sequence[DualBaudLivenessResult],
 ) -> tuple[list[tuple[int, int]], str | None]:
-    """Return baud pairs to expand into dual-bank frame testing."""
+    """Return baud pairs to expand into dual-bank frame testing.
+
+    Alive pairs are selected in score order with a fixed cap. If no pair is
+    alive, selection is deferred to the explicit no-signal fallback prompt.
+    """
     alive = [result for result in results if result.alive]
     if alive:
         alive.sort(
@@ -5333,7 +5789,20 @@ def write_payload_only(
     prefix: str,
     logger: logging.Logger,
 ) -> tuple[int, str | None, float]:
-    """Write a payload without reading the output port."""
+    """Write a payload without reading the output port.
+
+    Args:
+        in_serial: Open input-side serial object.
+        settings: Transmit-side settings used for chunk sizing and estimates.
+        payload: Payload to write.
+        progress_interval: Minimum interval between progress messages.
+        prefix: Progress/log prefix.
+        logger: Logger for serial write errors.
+
+    Returns:
+        Tuple of bytes sent, optional serial I/O error string, and elapsed
+        seconds. Programming errors such as `TypeError` are not swallowed.
+    """
     started = time.monotonic()
     chunk_size = write_chunk_size(settings)
     bytes_sent = 0
@@ -5378,7 +5847,11 @@ def read_until_quiet(
     prefix: str,
     logger: logging.Logger,
 ) -> tuple[bytes, str | None, float]:
-    """Read output bytes until the line goes quiet."""
+    """Read output bytes until the line goes quiet.
+
+    The absolute deadline scales with estimated output-side line time so low
+    baud validation has room to drain after a large payload.
+    """
     started = time.monotonic()
     received = bytearray()
     last_data_time = time.monotonic()
@@ -5437,7 +5910,11 @@ def read_serial_until_quiet(
     logger: logging.Logger,
     direction_label: str,
 ) -> tuple[bytes, str | None, float]:
-    """Read bytes from a named direction until the line goes quiet."""
+    """Read bytes from a named direction until the line goes quiet.
+
+    This is the directional variant used by ETX/ACK probing, where the same
+    physical serial objects are read in both forward and reverse-path tests.
+    """
     started = time.monotonic()
     received = bytearray()
     last_data_time = time.monotonic()
@@ -5496,7 +5973,7 @@ def read_for_fixed_window(
     prefix: str,
     logger: logging.Logger,
 ) -> tuple[bytes, str | None, float]:
-    """Read any output that arrives during a fixed observation window."""
+    """Read output that arrives during a fixed observation window."""
     started = time.monotonic()
     deadline = started + max(seconds, 0.1)
     next_progress_at = started + max(progress_interval, 0.1)
@@ -5561,6 +6038,7 @@ def flow_validation_indicator(status: str, score: float, error: str | None) -> s
 def dual_flow_control_code(settings: DualSerialSettings) -> str:
     """Return a compact input/output flow-control code for validation tables."""
     def side_code(flow_control: str) -> str:
+        """Return OFF for disabled flow, otherwise the compact flow code."""
         if flow_control == "none":
             return "OFF"
         return flow_control_code(flow_control)
@@ -5596,7 +6074,11 @@ def flow_validation_result_from_candidate(
     result: CandidateResult,
     payload: ProbePayload,
 ) -> FlowControlValidationResult:
-    """Convert a normal transfer candidate result into a flow validation row."""
+    """Convert a normal transfer candidate result into a flow-validation row.
+
+    Transfer-only rows can prove that bytes move under a flow setting, but they
+    do not prove that a device honors pause/resume or input-side backpressure.
+    """
     clean = (
         result.score >= 99.0
         and result.bytes_sent == payload.byte_count
@@ -5648,7 +6130,14 @@ def flow_validation_result_from_candidate(
 
 
 def apply_flow_control_hold(control_serial: Any, flow_control: str) -> None:
-    """Assert a receive-side hold for one flow-control mode."""
+    """Assert a receive-side hold for one flow-control mode.
+
+    XON/XOFF sends XOFF, RTS/CTS lowers RTS, and DSR/DTR lowers DTR on the
+    receive-side adapter.
+
+    Raises:
+        ValueError: If `flow_control` cannot express an output-side hold.
+    """
     if flow_control == "xon/xoff":
         control_serial.write(b"\x13")
         control_serial.flush()
@@ -5663,7 +6152,11 @@ def apply_flow_control_hold(control_serial: Any, flow_control: str) -> None:
 
 
 def release_flow_control_hold(control_serial: Any, flow_control: str) -> None:
-    """Release a receive-side hold for one flow-control mode."""
+    """Release a receive-side hold for one flow-control mode.
+
+    Raises:
+        ValueError: If `flow_control` cannot express an output-side hold.
+    """
     if flow_control == "xon/xoff":
         control_serial.write(b"\x11")
         control_serial.flush()
@@ -5713,7 +6206,13 @@ def run_flow_control_transfer_validation(
     payload: ProbePayload,
     logger: logging.Logger,
 ) -> FlowControlValidationResult:
-    """Validate a flow mode with a clean large transfer."""
+    """Validate transfer compatibility for one same-frame flow mode.
+
+    Notes:
+        A clean transfer with flow enabled is useful evidence, but only
+        `run_flow_control_pause_validation` observes an output-side hold and
+        release.
+    """
     validation_options = dataclasses.replace(
         options,
         payload_bytes=payload.byte_count,
@@ -5751,7 +6250,7 @@ def run_dual_flow_control_transfer_validation(
     payload: ProbePayload,
     logger: logging.Logger,
 ) -> FlowControlValidationResult:
-    """Validate one dual input/output flow pair with a clean transfer check."""
+    """Validate transfer compatibility for one dual input/output flow pair."""
     validation_options = dataclasses.replace(
         options,
         payload_bytes=payload.byte_count,
@@ -5789,7 +6288,12 @@ def run_flow_control_pause_validation(
     payload: ProbePayload,
     logger: logging.Logger,
 ) -> FlowControlValidationResult:
-    """Validate an output-side pause/release handshake behavior."""
+    """Validate output-side pause/release handshake behavior.
+
+    The receive-side adapter asserts a hold before the input-side payload is
+    written. A passing row requires little output while held, a clean drain after
+    release, and no serial error.
+    """
     started = time.monotonic()
     flow_control = settings.flow_control
     payload = payload_for_trial(
@@ -5811,6 +6315,9 @@ def run_flow_control_pause_validation(
         f"{flow_control.upper()}]"
     )
     control_settings = dataclasses.replace(settings, flow_control="none")
+    # WHY: The output port is the control surface for the hold. Its own flow
+    # mode is disabled so XOFF or modem-line changes are produced deliberately by
+    # this test rather than by pyserial's automatic handshake handling.
     read_timeout = max(options.read_timeout, FLOW_VALIDATE_READ_TIMEOUT)
     hold_applied = False
     payload_bytes = payload.byte_count
@@ -5892,6 +6399,8 @@ def run_flow_control_pause_validation(
                     f"{modem_line_snapshot_label(before_hold_lines)}"
                 )
                 console_progress(f"{prefix}: ASSERT {flow_control.upper()} HOLD")
+                # WHY: Holding before the write separates "can transfer with this
+                # flow option" from "device honors an output-side pause."
                 apply_flow_control_hold(out_serial, flow_control)
                 hold_applied = True
                 time.sleep(FLOW_VALIDATE_RELEASE_SETTLE_SECONDS)
@@ -6371,7 +6880,11 @@ def run_flow_control_validation(
     validation_results: Sequence[CandidateResult],
     logger: logging.Logger,
 ) -> tuple[list[FlowControlValidationResult], str | None]:
-    """Run post-scan validation for all flow-control modes on the best frame."""
+    """Run post-scan flow validation for all modes on the best same-side frame.
+
+    Returns:
+        A list of validation rows plus an optional operator-break action.
+    """
     frame = select_flow_validation_frame(results, validation_results)
     if frame is None:
         print()
@@ -6474,7 +6987,12 @@ def run_dual_flow_control_validation(
     target: CandidateResult,
     logger: logging.Logger,
 ) -> tuple[list[FlowControlValidationResult], str | None]:
-    """Run known-baud flow validation for an independent input/output frame pair."""
+    """Run known-baud flow validation for an independent frame pair.
+
+    The dual sweep tests the 16 input/output flow combinations as transfer
+    checks only. Output hold/release is skipped for asymmetric pairs because the
+    same serial frame is not available on both sides.
+    """
     if not isinstance(target.settings, DualSerialSettings):
         raise ValueError("dual flow validation requires dual serial settings")
 
@@ -6586,7 +7104,11 @@ def flow_pause_holds_output(result: FlowControlValidationResult) -> bool:
 def select_backpressure_output_hold(
     hold_results: Sequence[FlowControlValidationResult],
 ) -> FlowControlValidationResult | None:
-    """Return the best proven output hold mode for buffer-fill stress."""
+    """Return the best proven output hold mode for buffer-fill stress.
+
+    Validated rows are preferred, then rows with fewer bytes leaked while held.
+    XON/XOFF is preferred over modem-line holds when evidence is otherwise tied.
+    """
     candidates = [result for result in hold_results if flow_pause_holds_output(result)]
     if not candidates:
         return None
@@ -6669,7 +7191,11 @@ def input_backpressure_release_reason(
     line_snapshot: dict[str, bool],
     stalled: bool,
 ) -> str | None:
-    """Return the backpressure reason visible at the input adapter."""
+    """Return the backpressure reason visible at the input adapter.
+
+    For DSR/DTR-style printer pacing, DCD is checked before DSR/CTS because many
+    adapters expose printer DTR as carrier-detect rather than as DSR.
+    """
     if input_flow == "rts/cts":
         reason = modem_line_drop_reason(before_snapshot, line_snapshot, "cts", "CTS")
         if reason:
@@ -6709,7 +7235,12 @@ def run_input_backpressure_stress(
     payload: ProbePayload,
     logger: logging.Logger,
 ) -> FlowControlValidationResult:
-    """Fill the buffer with output held and watch input-side flow control."""
+    """Fill the buffer with output held and watch input-side flow control.
+
+    The test writes a large payload while output is held, monitors input-side
+    modem lines and write progress for throttle evidence, releases output, and
+    then scores the drained bytes.
+    """
     started = time.monotonic()
     input_settings = dataclasses.replace(
         frame.input_settings,
@@ -7206,7 +7737,12 @@ def run_input_backpressure_validation(
 
 
 def bank2_frame_serial_settings(baud: int) -> list[SerialSettings]:
-    """Return the targeted frame list used for second-bank characterization."""
+    """Return the targeted frame list used for known-baud characterization.
+
+    The order favors common printer-buffer frames first, then expands into
+    parity and stop-bit variants. Flow is held at `none`; flow behavior is tested
+    in a later validation phase.
+    """
     frame_specs = [
         (8, "none", 1),
         (7, "even", 1),
@@ -7246,7 +7782,12 @@ def bank2_frame_candidates(
     output_baud: int,
     independent_frames: bool = True,
 ) -> list[SerialSettings | DualSerialSettings]:
-    """Return targeted frame candidates for known same-baud or baud-pair tests."""
+    """Return targeted frame candidates for known same-baud or baud-pair tests.
+
+    Same-baud tests can use single settings when independent frames are disabled.
+    Different input/output bauds always force dual settings because each side
+    must be opened at its own physical line speed.
+    """
     input_frames = bank2_frame_serial_settings(input_baud)
     independent_frames = independent_frames or input_baud != output_baud
     if not independent_frames and input_baud == output_baud:
@@ -7305,7 +7846,7 @@ def ascii_pass_frame_labels(results: Sequence[CandidateResult]) -> list[str]:
 
 
 def likely_bank2_ascii_results(results: Sequence[CandidateResult]) -> list[CandidateResult]:
-    """Return likely frames for the eight-bit challenge."""
+    """Return clean ASCII frames close enough to retest with high-bit bytes."""
     clean = [result for result in results if clean_ascii_transfer(result)]
     if not clean:
         return []
@@ -7316,7 +7857,12 @@ def likely_bank2_ascii_results(results: Sequence[CandidateResult]) -> list[Candi
 
 
 def eight_bit_result_summary(results: Sequence[CandidateResult]) -> str:
-    """Return a concise high-bit challenge conclusion."""
+    """Return a concise high-bit challenge conclusion.
+
+    A clean result requires high-bit bytes to arrive unchanged. Rows where high
+    bits are stripped are reported as a 7-bit/masked path even if ASCII framing
+    looks otherwise healthy.
+    """
     if not results:
         return "NOT RUN"
     clean = [
@@ -7339,7 +7885,11 @@ def eight_bit_result_summary(results: Sequence[CandidateResult]) -> str:
 
 
 def bank2_flow_summary(results: Sequence[FlowControlValidationResult]) -> str:
-    """Return a concise flow validation summary for bank-2 reports."""
+    """Return a concise flow-validation summary for known-baud reports.
+
+    Matrix, output-hold, and input-full results are kept separate because each
+    method proves a different operational property.
+    """
     if not results:
         return "NOT RUN"
     matrix_results = flow_transfer_matrix_results(results)
@@ -7720,7 +8270,12 @@ def best_bank2_followup_target(
     ascii_results: Sequence[CandidateResult],
     eight_bit_results: Sequence[CandidateResult],
 ) -> CandidateResult | None:
-    """Return the best proven known-baud target for follow-up probes."""
+    """Return the best proven known-baud target for follow-up probes.
+
+    Clean high-bit rows are preferred over ASCII-only rows. When evidence ties,
+    same-frame and 8E1-compatible rows are preferred so later flow and raw-byte
+    probes run against the most conservative target.
+    """
     sources = [
         bank2_eight_bit_clean_results(eight_bit_results),
         likely_bank2_ascii_results(ascii_results),
@@ -7762,7 +8317,11 @@ def bank2_behavior_targets(
     ascii_results: Sequence[CandidateResult],
     eight_bit_results: Sequence[CandidateResult],
 ) -> list[CandidateResult]:
-    """Return a small target set for optional raw behavior probes."""
+    """Return a small target set for optional raw behavior probes.
+
+    The target set is capped so a known-baud run remains practical even when
+    several frames tie under ASCII scoring.
+    """
     clean_8bit = bank2_eight_bit_clean_results(eight_bit_results)
     if clean_8bit:
         ranked = sorted(clean_8bit, key=bank2_target_sort_key, reverse=True)
@@ -7838,7 +8397,12 @@ def bank2_behavior_probe_payloads(
     target_index: int,
     switch_hash: str | None,
 ) -> list[tuple[str, bytes]]:
-    """Return raw byte payload classes for known-baud behavior probing."""
+    """Return raw byte payload classes for known-baud behavior probing.
+
+    Payloads are intentionally grouped by byte class so reports can distinguish
+    line-ending conversion, printable ASCII handling, printer controls, 7-bit
+    controls, XON/XOFF-sensitive controls, and timeout/form-feed behavior.
+    """
     payloads: list[tuple[str, bytes]] = []
     for name, separator in (
         ("CR_ONLY", b"\r"),
@@ -7888,6 +8452,8 @@ def bank2_behavior_probe_payloads(
     payloads.append(("ASCII_SWEEP", marker + b"\r\n" + bytes(range(0x20, 0x7F)) + b"\r\n"))
 
     marker = bank2_behavior_marker(run_id, target_index, "CTL7_SAFE", switch_hash)
+    # WHY: The safe control sweep excludes XON/XOFF so a later full sweep can
+    # isolate whether software flow-control bytes are being interpreted.
     payloads.append(
         (
             "CTL7_SAFE",
@@ -7947,7 +8513,12 @@ def classify_bank2_behavior_bytes(
     received: bytes,
     error: str | None = None,
 ) -> tuple[bool, bool, bool, str, str]:
-    """Classify one raw behavior probe without assigning DIP-switch meaning."""
+    """Classify one raw behavior probe without assigning switch meaning.
+
+    Returns:
+        Tuple of exact-match flag, form-feed-inserted flag, CR/LF-changed flag,
+        status, and operator-facing reason.
+    """
     exact_match = received == sent
     form_feed_inserted = b"\x0c" in received and b"\x0c" not in sent
     cr_lf_changed = cr_lf_change_observed(sent, received)
@@ -8040,7 +8611,12 @@ def run_bank2_behavior_probe(
     observe_seconds: float,
     logger: logging.Logger,
 ) -> Bank2BehaviorProbeResult:
-    """Run one raw known-baud printer-job behavior probe."""
+    """Run one raw known-baud printer-job behavior probe.
+
+    Raw probes bypass structured payload scoring and compare sent/received bytes
+    directly. They are meant to characterize transformations, not to discover a
+    new frame.
+    """
     started = time.monotonic()
     transmit_settings = transmit_side_settings(settings)
     receive_settings = receive_side_settings(settings)
@@ -8416,7 +8992,12 @@ def classify_etx_ack_bytes(
     reverse_received: bytes,
     error: str | None = None,
 ) -> tuple[bool, bool, bool, bool, str, str]:
-    """Classify ETX forward and ACK reverse byte observations."""
+    """Classify ETX forward and ACK reverse byte observations.
+
+    Returns:
+        Tuple of ETX-seen flag, exact-forward flag, ACK-seen flag,
+        reverse-path-observed flag, status, and operator-facing reason.
+    """
     etx_forward_seen = b"\x03" in forward_received
     etx_forward_exact = forward_received == forward_payload
     ack_reverse_seen = b"\x06" in reverse_received
@@ -8483,7 +9064,12 @@ def run_bank2_etx_ack_probe(
     observe_seconds: float,
     logger: logging.Logger,
 ) -> Bank2EtxAckProbeResult:
-    """Run a selected-frame ETX forward and simulated ACK reverse-path probe."""
+    """Run a selected-frame ETX forward and simulated ACK reverse-path probe.
+
+    The reverse check injects ACK from the printer side and reads the computer
+    side. It observes byte path directionality; it does not emulate printer
+    protocol state.
+    """
     started = time.monotonic()
     transmit_settings = transmit_side_settings(settings)
     receive_settings = receive_side_settings(settings)
@@ -8731,7 +9317,12 @@ def bank2_conclusion(
     behavior_results: Sequence[Bank2BehaviorProbeResult],
     etx_ack_results: Sequence[Bank2EtxAckProbeResult],
 ) -> str:
-    """Return compact conclusion text for a second-bank switch state."""
+    """Return compact conclusion text for a known-baud switch state.
+
+    The conclusion summarizes observed evidence in priority order. It does not
+    assign semantic meaning to a switch bank, because the code only observes byte
+    transfer, transformations, flow behavior, and ETX/ACK path evidence.
+    """
     stale_seen = stale_nonce_seen(ascii_results) or stale_nonce_seen(eight_bit_results)
 
     def with_stale_warning(message: str) -> str:
@@ -9083,7 +9674,13 @@ def print_bank2_report(
 
 
 def run_second_bank_characterization(options: ScanOptions) -> None:
-    """Run a targeted known-baud device characterization."""
+    """Run a targeted known-baud device characterization.
+
+    The workflow uses the operator-configured input/output bauds, purges the
+    known output frames, runs targeted ASCII frame checks, retests likely frames
+    with a high-bit payload, optionally probes raw behavior and ETX/ACK, and
+    runs flow validation only when a clean follow-up frame exists.
+    """
     print()
     print_report_title("KNOWN-BAUD DEVICE TEST")
     print("USES OPTION 2 BAUDS TO TEST FRAME, BYTES, AND DEVICE BEHAVIOR.")
@@ -9158,6 +9755,9 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
         output_baud,
         independent_frames=independent_frames,
     )
+    # WHY: Known-baud mode limits the search to frame behavior at the selected
+    # baud or baud pair. A weak fallback row is not promoted into behavior or
+    # flow probing unless the ASCII/high-bit evidence produces a clean target.
     run_known_output_purges(
         serial_module=serial_module,
         options=bank_options,
@@ -9201,6 +9801,9 @@ def run_second_bank_characterization(options: ScanOptions) -> None:
         likely_results = likely_bank2_ascii_results(ascii_results)
         eight_targets = likely_results or sorted(ascii_results, key=result_sort_key, reverse=True)[:1]
         eight_targets_clean = bool(likely_results)
+        # TRADEOFF: Running the high-bit challenge against the best non-clean row
+        # keeps diagnostics useful, but follow-up probes still require a clean
+        # target so reports do not recommend a fallback frame.
         eight_payload_bytes = max(
             DEFAULT_EIGHT_BIT_PAYLOAD_BYTES,
             payload_bytes,
@@ -9536,7 +10139,25 @@ def run_dual_bank_scan(
     logger: logging.Logger,
     phase0_only: bool = False,
 ) -> int:
-    """Run a dual-bank scan where input and output settings may differ."""
+    """Run automated dual-bank discovery where input and output may differ.
+
+    Args:
+        serial_module: Imported pyserial module or test double.
+        options: Active scan options.
+        logger: Logger for scan diagnostics.
+        phase0_only: When true, run only the fixed-frame baud-liveness matrix
+            and write the Phase 0 report.
+
+    Returns:
+        Process-style status code: zero for completed workflow, one for no
+        selected baud pairs, or `OPERATOR_BREAK_EXIT_CODE` when interrupted and
+        reported.
+
+    Notes:
+        Full frame-pair expansion is a fallback. The normal path is Phase 0
+        baud-pair liveness, output-frame sweep, input-frame sweep, and optional
+        flow expansion around the best observed frame pair.
+    """
     workflow_started_at = dt.datetime.now(dt.timezone.utc).isoformat()
     if not phase0_only:
         turbo_enabled = prompt_yes_no_question(
@@ -9588,6 +10209,9 @@ def run_dual_bank_scan(
 
     selected_pairs = phase0_report.selected_pairs
     if not selected_pairs:
+        # WHY: Phase 0 is deliberately conservative. For a narrow baud range, the
+        # operator may still choose a same-baud frame fallback rather than lose a
+        # useful manual diagnostic path.
         selected_pairs, fallback_reason = prompt_phase0_no_signal_fallback(
             options,
             phase0_report,
@@ -9637,6 +10261,9 @@ def run_dual_bank_scan(
                 0,
                 len(dual_flow_candidates_for_frame(seed)) - 1,
             )
+    # TRADEOFF: The full matrix remains the correctness fallback, but staged
+    # candidates are estimated and run first because the Cartesian frame-pair
+    # space is expensive on real low-baud hardware.
     full_candidates = unique_dual_candidates(full_candidates)
     staged_preview_candidates = unique_dual_candidates(staged_preview_candidates)
     candidate_total = len(full_candidates) + staged_flow_candidate_count
@@ -9839,6 +10466,9 @@ def run_dual_bank_scan(
         if early_stopped or operator_break_action is not None:
             break
         seed = dual_phase0_settings(input_baud, output_baud)
+        # WHY: Decode output first while the input side stays at Phase 0 framing,
+        # then sweep input against the best output frame. This cuts most obvious
+        # misses before falling back to the full matrix.
         seed_results = run_dual_sequence(
             "DUAL SEED CONFIRM",
             "DUAL SEED CONFIRM",

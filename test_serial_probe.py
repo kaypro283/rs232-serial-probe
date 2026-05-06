@@ -1,3 +1,7 @@
+"""test_serial_probe.py
+
+Regression tests for serial_probe.py formatting, scoring, and workflow helpers.
+"""
 import builtins
 import dataclasses
 import datetime as dt
@@ -11,42 +15,54 @@ import serial_probe
 
 
 def fake_input_from(values: list[str]):
+    """Return an `input` replacement that yields values in order."""
     iterator = iter(values)
 
     def fake_input(_prompt: str) -> str:
+        """Return the next scripted input value."""
         return next(iterator)
 
     return fake_input
 
 
 def has_lowercase(text: str) -> bool:
+    """Return whether text contains any lowercase ASCII character."""
     return any("a" <= character <= "z" for character in text)
 
 
 class TypeErrorWriter:
+    """Writer test double that raises a programming error from `write`."""
     def write(self, data: bytes) -> int:
+        """Raise the configured `TypeError` regardless of input data."""
         raise TypeError("programming error")
 
 
 class OSErrorWriter:
+    """Writer test double that raises a serial-style I/O error from `write`."""
     def write(self, data: bytes) -> int:
+        """Raise the configured `OSError` regardless of input data."""
         raise OSError("serial device unavailable")
 
 
 class FlushRecordingWriter:
+    """Writer test double that records bytes and whether `flush` was called."""
     def __init__(self) -> None:
+        """Initialize an empty write buffer and flush flag."""
         self.written = bytearray()
         self.flushed = False
 
     def write(self, data: bytes) -> int:
+        """Record bytes and report a full successful write."""
         self.written.extend(data)
         return len(data)
 
     def flush(self) -> None:
+        """Record that flush was requested."""
         self.flushed = True
 
 
 class ValueErrorSerialModule:
+    """Minimal pyserial-module test double whose constructor rejects settings."""
     SEVENBITS = 7
     EIGHTBITS = 8
     PARITY_NONE = "N"
@@ -59,11 +75,14 @@ class ValueErrorSerialModule:
 
     @staticmethod
     def Serial(**_kwargs: object) -> object:
+        """Raise the same exception shape pyserial uses for bad settings."""
         raise ValueError("unsupported parity mode")
 
 
 class DummySerialContext:
+    """Context-manager test double for serial-port open calls."""
     def __enter__(self) -> object:
+        """Return a placeholder serial object."""
         return object()
 
     def __exit__(
@@ -72,6 +91,7 @@ class DummySerialContext:
         _exc_value: object,
         _traceback: object,
     ) -> bool:
+        """Do not suppress exceptions from the context body."""
         return False
 
 
