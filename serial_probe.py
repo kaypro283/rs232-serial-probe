@@ -5239,9 +5239,11 @@ def print_menu_help(paged: bool = True) -> None:
             "  IT IS A TEST SET, NOT A TERMINAL EMULATOR OR MODEM PROGRAM.",
             "",
             "NORMAL HOOK-UP",
-            "  PC COM1 TRANSMITS TO BUFFER INPUT.",
-            "  BUFFER OUTPUT TRANSMITS TO PC COM5.",
+            "  PORT DIRECTION IS ALWAYS FROM PC PERSPECTIVE (TX/RX).",
+            "  PC TX/OUTPUT (COM1) TRANSMITS TO BUFFER INPUT.",
+            "  BUFFER OUTPUT TRANSMITS TO PC RX/INPUT (COM5).",
             "  PATH: COM1 >> BUFFER INPUT >> BUFFER OUTPUT >> COM5.",
+            "  MAP: DEVICE INPUT = PC OUTPUT (TX), DEVICE OUTPUT = PC INPUT (RX).",
             "  SET BOTH BUFFER SWITCH BANKS THE SAME UNLESS THE TEST SAYS OTHERWISE.",
             "",
             "FIRST RUN CHECK LIST",
@@ -5273,7 +5275,7 @@ def print_menu_help(paged: bool = True) -> None:
             "",
             "MAIN MENU",
             "  1 START SCAN:          SELECT ONE OF THE TESTS ABOVE.",
-            "  2 SET COM PORTS/BAUD:  INPUT PORT, OUTPUT PORT, FIXED BAUDS.",
+            "  2 SET COM PORTS/BAUD:  PC TX/OUTPUT PORT, PC RX/INPUT PORT, BAUDS.",
             "  3 SCAN/VALIDATE SETUP: MESSAGE SIZE, TEST COUNT, VERIFY, FLOW.",
             "  4 TIMING/STALE:        READ WAITS AND OLD-OUTPUT CLEARING.",
             "  5 CURRENT SETTINGS:    PRINT THE WHOLE ACTIVE SETUP.",
@@ -5283,7 +5285,7 @@ def print_menu_help(paged: bool = True) -> None:
             "OPERATOR NOTES",
             "  PROGRAM SETS BAUD, FRAME, AND FLOW WHEN IT OPENS THE PORTS.",
             "  DEVICE MANAGER DEFAULTS ARE NOT USED AS TEST SETTINGS.",
-            "  INPUT AND OUTPUT BAUDS MAY DIFFER ON TWO-BANK BUFFERS.",
+            "  TX/OUTPUT AND RX/INPUT BAUDS MAY DIFFER ON TWO-BANK BUFFERS.",
             "  AUTOMATED DISCOVERY AND PHASE 0 ASK FOR THE BAUD RANGE AT START.",
             "  PHASE 0 ALWAYS USES 8 DATA, EVEN PARITY, 1 STOP, FLOW NONE.",
             "  OPTION 3 DOES NOT CHANGE PHASE 0 ONLY.",
@@ -5361,7 +5363,7 @@ def print_configuration(options: ScanOptions) -> None:
     lines.extend(
         setting_lines(
             "OPTION 2 PORTS:",
-            f"{options.in_port} INPUT >> {options.out_port} OUTPUT",
+            f"{options.in_port} PC TX/OUTPUT >> {options.out_port} PC RX/INPUT",
         )
     )
     lines.extend(

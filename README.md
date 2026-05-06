@@ -12,8 +12,8 @@ Useful search terms for the project: RS-232, serial port, COM port, baud rate, f
 
 I wrote this for bench troubleshooting where "try a few settings and hope" was too slow and too ambiguous. The original target was a Consolink microspooler path:
 
-- Input side: `COM1` (probe transmit)
-- Output side: `COM5` (probe receive)
+- PC TX/output side: `COM1` (feeds the buffer input)
+- PC RX/input side: `COM5` (reads from the buffer output)
 - Physical chain: `COM1 -> buffer input -> buffer output -> COM5`
 
 For this hardware, one practical assumption during discovery is to set both switch banks the same way and test from there.
@@ -72,7 +72,7 @@ The UI is intentionally old-terminal style (80x25 friendly), with paged screens 
 
 1. Launch `python serial_probe.py`
 2. In the menu, review `5 CURRENT SETTINGS`
-3. Keep defaults (`COM1` input, `COM5` output, both fixed at `38400`) unless you know you need different ports/bauds
+3. Keep defaults (`COM1` as PC TX/output, `COM5` as PC RX/input, both fixed at `38400`) unless you know you need different ports/bauds
 4. Default scan range is `75` through `115200`
 5. Choose `1 START SCAN`
 6. Run `AUTOMATED DISCOVERY`
@@ -217,6 +217,22 @@ Every run appends to fixed files:
 - `serial_probe_debug.log`
 
 The files are intentionally append-only across restarts so you keep historical evidence unless you manually rotate/clear them.
+
+---
+
+## Port-direction map (important)
+
+This program uses **PC perspective** for direction labels.
+
+- **PC TX / Output**: bytes leaving the computer toward the device path.
+- **PC RX / Input**: bytes entering the computer from the device path.
+- **Device/Bufer IN** corresponds to **PC TX / Output**.
+- **Device/Buffer OUT** corresponds to **PC RX / Input**.
+
+For the default setup:
+
+- `COM1` = **PC TX/Output** -> buffer input.
+- `COM5` = **PC RX/Input** <- buffer output.
 
 Report output includes:
 
