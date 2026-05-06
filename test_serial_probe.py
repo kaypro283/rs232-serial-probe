@@ -609,7 +609,7 @@ def test_current_settings_show_option_2_ports_and_bauds(
     output = "\n".join(captured_lines)
 
     assert "OPTION 2 PORTS:" in output
-    assert "COM2 INPUT >> COM6 OUTPUT" in output
+    assert "COM2 PC TX/OUTPUT >> COM6 PC RX/INPUT" in output
     assert "OPTION 2 BAUDS:" in output
     assert "INPUT 38400 / OUTPUT 9600" in output
     assert "SCAN BAUD RANGE:" in output
