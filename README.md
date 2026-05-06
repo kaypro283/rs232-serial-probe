@@ -71,9 +71,10 @@ The UI is intentionally old-terminal style (80x25 friendly), with paged screens 
 1. Launch `python serial_probe.py`
 2. In the menu, review `5 CURRENT SETTINGS`
 3. Keep defaults (`COM1` input, `COM5` output, both fixed at `38400`) unless you know you need different ports/bauds
-4. Choose `1 START SCAN`
-5. Run `AUTOMATED DISCOVERY`
-6. Use the generated report to decide whether to validate further or adjust switch state
+4. Default scan range is `75` through `115200`
+5. Choose `1 START SCAN`
+6. Run `AUTOMATED DISCOVERY`
+7. Use the generated report to decide whether to validate further or adjust switch state
 
 During any active scan/test, `Ctrl+C` opens an operator-break menu so you can resume, end and report, return to menu, or quit after writing partial results.
 
@@ -142,16 +143,16 @@ A pair is marked `ALIVE` only when structure checks pass and output quality is a
 With default baud list:
 
 ```text
-300, 1200, 2400, 4800, 9600, 19200, 38400
+75, 110, 134, 150, 300, 600, 1200, 1800, 2400, 4800, 9600, 19200, 38400, 57600, 115200
 ```
 
 Full same-frame matrix:
 
 ```text
-7 baud x 2 data-bit choices x 5 parity choices x 2 stop choices x 4 flow modes = 560 combinations
+15 baud x 2 data-bit choices x 5 parity choices x 2 stop choices x 4 flow modes = 1200 combinations
 ```
 
-Scan order is highest selected baud to lowest (default: `38400` down to `300`).
+Scan order is highest selected baud to lowest (default: `115200` down to `75`).
 
 ---
 

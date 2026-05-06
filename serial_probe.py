@@ -38,13 +38,21 @@ from pathlib import Path
 from typing import Any, Callable, Sequence, TextIO
 
 BAUD_RATES: list[int] = [
+    75,
+    110,
+    134,
+    150,
     300,
+    600,
     1200,
+    1800,
     2400,
     4800,
     9600,
     19200,
     38400,
+    57600,
+    115200,
 ]
 DATA_BITS: list[int] = [8, 7]
 PARITIES: list[str] = ["none", "even", "odd", "mark", "space"]
@@ -3594,8 +3602,8 @@ def default_scan_options() -> ScanOptions:
         out_port="COM5",
         input_baud=38400,
         output_baud=38400,
-        min_baud=300,
-        max_baud=38400,
+        min_baud=75,
+        max_baud=115200,
         payload_bytes=DEFAULT_PAYLOAD_BYTES,
         read_timeout=DEFAULT_READ_TIMEOUT,
         settle_ms=DEFAULT_SETTLE_MS,
@@ -5240,7 +5248,7 @@ def print_menu_help(paged: bool = True) -> None:
             "  2 USE OPTION 5 TO READ THE PRESENT PROGRAM SETUP.",
             "  3 USE OPTION 2 IF YOUR COM PORTS OR KNOWN BAUDS ARE NOT DEFAULT.",
             "  4 USE OPTION 1, THEN SELECT AUTOMATED DISCOVERY.",
-            f"  5 SELECT BAUD RANGE. SUPPORTED: {supported_baud_label()}.",
+            "  5 SELECT BAUD RANGE. SUPPORTS 75 THROUGH 115200 (SEE OPTION 5).",
             "  6 WAIT FOR THE REPORT. CTRL+C OPENS THE OPERATOR BREAK MENU.",
             "",
             "START SCAN WORKFLOW",
